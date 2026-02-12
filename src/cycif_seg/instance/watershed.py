@@ -9,15 +9,31 @@ from skimage.measure import label as cc_label
 
 from scipy.ndimage import gaussian_filter
 
+def _relabel_instances(lbl: np.ndarray) -> np.ndarray:
+    """
+    Relabel an instance-labeled image to 1..N WITHOUT merging touching instances.
+    (Do NOT use connected-components on a binary mask; that merges touching objects.)
+    """
+    lbl = lbl.astype(np.int32, copy=False)
+    ids = np.unique(lbl)
+    ids = ids[ids != 0]
+    if ids.size == 0:
+        return np.zeros_like(lbl, dtype=np.int32)
+    out = np.zeros_like(lbl, dtype=np.int32)
+    for new_id, old_id in enumerate(ids, start=1):
+       out[lbl == int(old_id)] = int(new_id)
+    return out
+
 def nuclei_markers_from_prob(
     p_nuc: np.ndarray,
     *,
     nuc_thresh: float = 0.35,
     min_nucleus_area: int = 30,
-    peak_min_distance: int = 7,
-    peak_footprint: int = 11,
+    peak_min_distance: int = 4,
+    peak_footprint: int = 7,
     smooth_sigma: float = 1.0,
     seed_percentile: float = 99.5,
+    dist_percentile: float = 70.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Create nucleus instance markers from nucleus probability.
@@ -44,20 +60,16 @@ def nuclei_markers_from_prob(
         markers = np.zeros_like(p_nuc, dtype=np.int32)
         return markers, nuc_mask
 
-    # Seed threshold: use a high percentile inside nuc_mask so we pick only confident peaks,
-    # even if absolute probabilities are low.
-    vals = p[nuc_mask]
-    if vals.size == 0:
-        markers = np.zeros_like(p_nuc, dtype=np.int32)
-        return markers, nuc_mask
+    # Seeds from peaks of the distance transform inside the nucleus mask.
+    # This is typically more robust than probability peaks for touching/overlapping nuclei.
+    dist = ndi.distance_transform_edt(nuc_mask)
+    if dist_percentile is not None:
+        dp = float(np.percentile(dist[nuc_mask], float(dist_percentile)))
+        dist = np.where(dist >= dp, dist, 0.0).astype(np.float32, copy=False)
 
-    hi = float(np.percentile(vals, float(seed_percentile)))
-    seed_thresh = max(hi, float(nuc_thresh))
-
-    # Seeds = local maxima of smoothed probability, constrained to nuc_mask and above seed_thresh
     coords = peak_local_max(
-        p,
-        labels=(nuc_mask & (p >= seed_thresh)).astype(np.uint8),
+        dist,
+        labels=nuc_mask.astype(np.uint8),
         min_distance=int(peak_min_distance),
         footprint=np.ones((int(peak_footprint), int(peak_footprint)), dtype=bool),
         exclude_border=False,
@@ -73,7 +85,6 @@ def nuclei_markers_from_prob(
     seed_markers = cc_label(seed_img > 0).astype(np.int32)
 
     # Split touching nuclei using watershed on distance inside nuc_mask
-    dist = ndi.distance_transform_edt(nuc_mask)
     nuclei_labels = watershed(-dist, markers=seed_markers, mask=nuc_mask).astype(np.int32)
 
     # Remove tiny nuclei after splitting and relabel
@@ -84,7 +95,7 @@ def nuclei_markers_from_prob(
         keep[np.where(counts >= int(min_nucleus_area))[0]] = True
         keep[0] = False
         nuclei_labels = np.where(keep[nuclei_labels], nuclei_labels, 0).astype(np.int32)
-        nuclei_labels = cc_label(nuclei_labels > 0).astype(np.int32)
+        nuclei_labels = _relabel_instances(nuclei_labels)
 
     markers = nuclei_labels
     return markers, nuc_mask
@@ -126,6 +137,8 @@ def cells_from_probs(
         peak_footprint=peak_footprint,
     )
 
+    print(f"markers.max() after nuclei_markers_from_prob = {markers.max()}")
+
     cyto_mask = p_cyto >= cyto_thresh
 
     # Ensure markers are inside the watershed mask.
@@ -147,6 +160,8 @@ def cells_from_probs(
         mask=ws_mask,
     ).astype(np.int32)
 
+    print(f"cell_labels.max() after watershed: {cell_labels.max()}")
+
     # Remove tiny cells (often noise from tiny markers)
     if min_cell_area and min_cell_area > 0:
         # remove_small_objects expects boolean per label; easiest: relabel after filtering
@@ -157,7 +172,9 @@ def cells_from_probs(
         keep[0] = False
         filtered = np.where(keep[cell_labels], cell_labels, 0).astype(np.int32)
         # Relabel to make ids compact
-        cell_labels = cc_label(filtered > 0).astype(np.int32)
+        cell_labels = _relabel_instances(filtered)
+
+    print(f"cell_labels.max() after filter and relabel: {cell_labels.max()}")
 
     debug = {
         "markers": markers,

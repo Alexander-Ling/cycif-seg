@@ -125,6 +125,14 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.prog.setVisible(False)
         layout.addWidget(self.prog)
 
+        # Throttle probability layer refresh during tile prediction.
+        # Writing into self._P happens per-tile; refreshing napari layers per tile can be expensive
+        # and can cause sawtooth CPU usage. We refresh at a fixed cadence instead.
+        self._prob_dirty = False
+        self._prob_refresh_timer = QtCore.QTimer(self)
+        self._prob_refresh_timer.setInterval(100)  # ms (10 Hz)
+        self._prob_refresh_timer.timeout.connect(self._refresh_prob_layers_if_dirty)
+
         # Signals
         self.btn_load.clicked.connect(self.on_load)
         self.btn_all.clicked.connect(lambda: self.set_all_channels(True))
@@ -146,10 +154,27 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         except Exception:
             pass
         self._rf_worker = None
+        try:
+            self._prob_refresh_timer.stop()
+            self.prog.setVisible(False)
+        except Exception:
+            pass
 
     def set_status(self, msg: str):
         self.status.setText(msg)
         show_info(msg)
+
+    def _refresh_prob_layers_if_dirty(self):
+        if not getattr(self, "_prob_dirty", False):
+            return
+        self._prob_dirty = False
+        try:
+            if "P(nucleus)" in self.viewer.layers:
+                self.viewer.layers["P(nucleus)"].refresh()
+            if "P(cytoplasm)" in self.viewer.layers:
+                self.viewer.layers["P(cytoplasm)"].refresh()
+        except Exception:
+            pass
 
     def on_alpha_change(self, v):
         a = float(v) / 100.0
@@ -379,6 +404,12 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             center_yx=center_yx,
             run_id=my_run_id,
             is_cancelled=is_cancelled,
+            progress_every=2,
+            batch_tiles=4,
+            # Feature prefetch to keep CPU busy while RF predicts
+            feature_workers=3,
+            prefetch_tiles=16,
+            rf_n_jobs=12,
         )
         self._rf_worker = worker
 
@@ -386,6 +417,10 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         def _on_err(e):
             show_warning(f"Prediction failed: {e}")
             self.status.setText(f"Prediction failed: {e}")
+            try:
+                self._prob_refresh_timer.stop()
+            except Exception:
+                pass
             self.prog.setVisible(False)
 
         @worker.yielded.connect
@@ -405,6 +440,10 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                     return
                 self.prog.setRange(0, int(n_tiles))
                 self.prog.setValue(0)
+                try:
+                    self._prob_refresh_timer.start()
+                except Exception:
+                    pass
                 return
 
             if kind == "progress":
@@ -421,11 +460,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                     return
                 # write probabilities
                 self._P[y0:y1, x0:x1, :] = P_tile
-                # refresh views
-                if "P(nucleus)" in self.viewer.layers:
-                    self.viewer.layers["P(nucleus)"].refresh()
-                if "P(cytoplasm)" in self.viewer.layers:
-                    self.viewer.layers["P(cytoplasm)"].refresh()
+                # refresh is throttled by a QTimer to avoid per-tile repaint cost
+                self._prob_dirty = True
                 return
             # Unknown message type; ignore safely.
             return            
@@ -435,6 +471,13 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             if my_run_id != self._rf_run_id:
                 # stale/cancelled run
                 return
+            try:
+                self._prob_refresh_timer.stop()
+            except Exception:
+                pass
+            # Final refresh
+            self._prob_dirty = True
+            self._refresh_prob_layers_if_dirty()
             self.prog.setValue(self.prog.maximum())
             self.prog.setVisible(False)
             self.set_status("Prediction complete.")

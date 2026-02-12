@@ -13,6 +13,7 @@ def train_rf(X_train: np.ndarray, y_train: np.ndarray) -> RandomForestClassifier
         class_weight="balanced_subsample",
     )
     rf.fit(X_train, y_train)
+    print("[RF] n_jobs =", rf.n_jobs)
     return rf
 
 

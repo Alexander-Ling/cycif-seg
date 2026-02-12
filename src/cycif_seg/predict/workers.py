@@ -1,5 +1,8 @@
 from __future__ import annotations
 from time import time
+import time as _time
+import os
+import concurrent.futures as cf
 
 import numpy as np
 from napari.qt.threading import thread_worker
@@ -22,12 +25,17 @@ def predict_rf_worker(
     train_pad: int = 256,
     max_per_class: int = 200_000,
     rng_seed: int = 0,
+    progress_every: int = 1,
+    batch_tiles: int = 1,
+    feature_workers: int | None = None,
+    prefetch_tiles: int = 0,
+    rf_n_jobs: int | None = None,
 ):
     """
     Background worker:
     1) Train RF
     2) Predict in tiles prioritized by distance to center_yx
-    3) Yield tagged tuples
+    3) Predict in tiles (optionally batched) and yield tagged tuples
     """
    
     if is_cancelled is None:
@@ -95,18 +103,109 @@ def predict_rf_worker(
     tiles = sort_tiles_by_point(tiles, center_yx)
     n_tiles = len(tiles)
     yield ("progress_init", run_id, n_tiles)
+    # ---- Timing instrumentation ----
+    t_features_total = 0.0
+    t_predict_total = 0.0
+    n_feature_tiles = 0
+    n_predict_tiles = 0
 
-    for i, (y0, y1, x0, x1) in enumerate(tiles, start=1):
-        if is_cancelled():
-            return
+    progress_every = max(1, int(progress_every))
+    batch_tiles = max(1, int(batch_tiles))
+    if feature_workers is None:
+        # Feature computation is often the bottleneck and is mostly numpy/scipy (releases GIL).
+        # Use a small thread pool by default to precompute features while RF predicts.
+        feature_workers = min(4, max(1, (os.cpu_count() or 4) // 4))
+    feature_workers = max(1, int(feature_workers))
+    if prefetch_tiles is None:
+        prefetch_tiles = 0
+    prefetch_tiles = int(prefetch_tiles)
+    if prefetch_tiles <= 0:
+        prefetch_tiles = max(batch_tiles * 2, 4)
+    # Avoid oversubscription when feature extraction is threaded.
+    if rf_n_jobs is None and feature_workers > 1:
+        try:
+            rf.n_jobs = 1
+        except Exception:
+            pass
+    elif rf_n_jobs is not None:
+        try:
+            rf.n_jobs = int(rf_n_jobs)
+        except Exception:
+            pass
 
-        # Build features for THIS TILE ONLY (memory + speed win)
+    i = 0
+
+    def _compute_tile_features(y0, y1, x0, x1):
         tile_img = img[y0:y1, x0:x1, :]
+        t0 = _time.perf_counter()
         X_tile = build_features_fn(tile_img, use_channels)
-        Xt = X_tile.reshape(-1, X_tile.shape[-1])
-        Pt = rf.predict_proba(Xt).astype(np.float32)
-        P_tile = Pt.reshape((y1 - y0, x1 - x0, 3))
-        # Include run_id so UI can ignore stale updates
-        yield ("tile", run_id, y0, y1, x0, x1, P_tile)
-        # Determinate progress update (cheap)
-        yield ("progress", run_id, i, n_tiles)
+        dt = _time.perf_counter() - t0
+        return (y0, y1, x0, x1, X_tile.reshape(-1, X_tile.shape[-1]), dt)
+
+    tiles_iter = iter(tiles)
+    pending: list[cf.Future] = []
+
+    with cf.ThreadPoolExecutor(max_workers=feature_workers) as ex:
+        # Prime the pipeline
+        for _ in range(min(prefetch_tiles, n_tiles)):
+            y0, y1, x0, x1 = next(tiles_iter)
+            pending.append(ex.submit(_compute_tile_features, y0, y1, x0, x1))
+
+        while pending:
+            if is_cancelled():
+                return
+
+            batch_futs = pending[:batch_tiles]
+            pending = pending[batch_tiles:]
+
+            batch_items = []
+            for f in batch_futs:
+                y0, y1, x0, x1, Xt, dt_feat = f.result()
+                t_features_total += dt_feat
+                n_feature_tiles += 1
+                batch_items.append((y0, y1, x0, x1, Xt))
+
+            # Top up pipeline
+            while len(pending) < prefetch_tiles:
+                try:
+                    y0, y1, x0, x1 = next(tiles_iter)
+                except StopIteration:
+                    break
+                pending.append(ex.submit(_compute_tile_features, y0, y1, x0, x1))
+
+            X_list = [Xt for (*_, Xt) in batch_items]
+            Xt_all = np.concatenate(X_list, axis=0)
+            t0 = _time.perf_counter()
+            Pt_all = rf.predict_proba(Xt_all).astype(np.float32)
+            dt_pred = _time.perf_counter() - t0
+            t_predict_total += dt_pred
+            n_predict_tiles += len(batch_items)
+
+            offset = 0
+            for (y0, y1, x0, x1, Xt) in batch_items:
+                if is_cancelled():
+                    return
+                dy = int(y1 - y0)
+                dx = int(x1 - x0)
+                n = dy * dx
+                P_tile = Pt_all[offset:offset + n, :].reshape((dy, dx, 3))
+                offset += n
+                i += 1
+                yield ("tile", run_id, y0, y1, x0, x1, P_tile)
+                if (i % progress_every) == 0 or i == n_tiles:
+                    yield ("progress", run_id, i, n_tiles)
+
+            # ---- Timing summary ----
+            try:
+                if n_feature_tiles > 0:
+                    print(
+                        f"[TIMING] Features: total={t_features_total:.2f}s "
+                        f"avg_per_tile={t_features_total/n_feature_tiles:.4f}s"
+                    )
+                if n_predict_tiles > 0:
+                    print(
+                        f"[TIMING] Predict: total={t_predict_total:.2f}s "
+                        f"avg_per_tile={t_predict_total/n_predict_tiles:.4f}s"
+                    )
+            except Exception:
+                pass
