@@ -38,8 +38,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         # Channel checklist header + filter
         header_row = QtWidgets.QHBoxLayout()
         header_row.addWidget(QtWidgets.QLabel("Channels used for RF training:"))
-        self.chk_show_selected_only = QtWidgets.QCheckBox("Show selected only")
-        header_row.addWidget(self.chk_show_selected_only)
+        self.chk_display_selected_only = QtWidgets.QCheckBox("Display selected channels only")
+        header_row.addWidget(self.chk_display_selected_only)
         layout.addLayout(header_row)
 
         self.list_channels = QtWidgets.QListWidget()
@@ -83,8 +83,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_none.clicked.connect(lambda: self.set_all_channels(False))
         self.btn_train.clicked.connect(self.on_train_predict)
         self.slider_alpha.valueChanged.connect(self.on_alpha_change)
-        self.chk_show_selected_only.stateChanged.connect(self.apply_channel_filter)
-        self.list_channels.itemChanged.connect(lambda _: self.apply_channel_filter())
+        self.chk_display_selected_only.stateChanged.connect(self.sync_displayed_channel_layers)
+        self.list_channels.itemChanged.connect(lambda _: self.on_channel_selection_changed())
 
     def set_status(self, msg: str):
         self.status.setText(msg)
@@ -94,6 +94,66 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         a = float(v) / 100.0
         for lyr in self._prob_layers.values():
             lyr.opacity = a
+
+    def _channel_layer_names(self) -> set[str]:
+        return set(self.ch_names or [])
+
+    def sync_displayed_channel_layers(self):
+        """
+        If 'Display selected channels only' is checked, remove non-selected channel layers
+        from the napari layer list. If unchecked, ensure all channel layers are present.
+        Scribbles and probability layers are preserved.
+        """
+        if self.img is None or self.ch_names is None:
+            return
+
+        selected = set(self.get_selected_channels())
+        display_selected_only = self.chk_display_selected_only.isChecked()
+
+        # Determine which channel indices should be displayed
+        if display_selected_only:
+            should_display = {i for i in selected}
+        else:
+            should_display = set(range(len(self.ch_names)))
+
+        # Remove channel layers that should NOT be displayed
+        for i, nm in enumerate(self.ch_names):
+            if nm in self.viewer.layers and i not in should_display:
+                self.viewer.layers.remove(nm)
+
+        # Add missing channel layers that SHOULD be displayed
+        for i in sorted(should_display):
+            nm = self.ch_names[i]
+            if nm not in self.viewer.layers:
+                self.viewer.add_image(
+                    self.img[..., i],
+                    name=nm,
+                    blending="additive",
+                    opacity=0.6,
+                    colormap=self._colormap_for_channel(i),
+                )
+
+        # Keep scribbles on top (re-add if needed)
+        if self._scribbles_layer_name not in self.viewer.layers:
+            self.ensure_scribbles_layer()
+        else:
+            # Move to top for painting convenience
+            lyr = self.viewer.layers[self._scribbles_layer_name]
+            self.viewer.layers.remove(self._scribbles_layer_name)
+            self.viewer.layers.append(lyr)
+
+    def on_channel_selection_changed(self):
+        """
+        Called whenever an item in the channel checklist changes.
+        If display-selected-only mode is enabled, update viewer layers immediately.
+        """
+        if getattr(self, "chk_display_selected_only", None) and self.chk_display_selected_only.isChecked():
+            self.sync_displayed_channel_layers()
+
+
+    def _colormap_for_channel(self, i: int) -> str:
+        palette = ["blue", "green", "red", "magenta", "cyan", "yellow"]
+        return palette[i % len(palette)]
 
     def set_all_channels(self, checked: bool):
         for i in range(self.list_channels.count()):
@@ -107,15 +167,6 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             if it.checkState() == QtCore.Qt.Checked:
                 idxs.append(i)
         return idxs
-
-    def apply_channel_filter(self):
-        show_only = self.chk_show_selected_only.isChecked()
-        for i in range(self.list_channels.count()):
-            it = self.list_channels.item(i)
-            if not show_only:
-                it.setHidden(False)
-            else:
-                it.setHidden(it.checkState() != QtCore.Qt.Checked)
 
     def ensure_scribbles_layer(self):
         if self._scribbles_layer_name in self.viewer.layers:
@@ -144,7 +195,13 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         # Add per-channel layers
         for i, nm in enumerate(self.ch_names):
-            self.viewer.add_image(self.img[..., i], name=nm)
+            self.viewer.add_image(
+                self.img[..., i],
+                name=nm,
+                blending="additive",
+                opacity=0.6,
+                colormap=self._colormap_for_channel(i),
+            )
 
         # Add scribbles last so it paints over everything
         self.ensure_scribbles_layer()
@@ -174,11 +231,11 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             self.list_channels.addItem(it)
         self.list_channels.blockSignals(False)
 
-        self.apply_channel_filter()
-
         # Add named layers
         self._prob_layers = {}
         self._add_channel_layers()
+
+        self.sync_displayed_channel_layers()
 
         self.set_status(f"Loaded image {self.img.shape} with {len(self.ch_names)} channels.")
 
@@ -189,7 +246,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         use_ch = self.get_selected_channels()
         if len(use_ch) == 0:
-            show_warning("Select at least one channel for training.")
+            show_warning("Select at least one channel.")
             return
 
         scrib_layer = self.ensure_scribbles_layer()
@@ -198,37 +255,74 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         train_mask = S > 0
         n_train = int(train_mask.sum())
         if n_train < 2000:
-            show_warning(f"Not enough labeled pixels ({n_train}). Paint more scribbles (aim for >2k).")
+            show_warning(f"Not enough labeled pixels ({n_train}). Paint more scribbles.")
             return
 
-        self.set_status(f"Building features from channels {use_ch} and training on {n_train} pixels…")
+        H, W, _ = self.img.shape
 
-        X_full = build_features(self.img, use_ch)
-        X_train = X_full[train_mask].reshape(-1, X_full.shape[-1])
-        y_train = (S[train_mask] - 1).astype(np.uint8)  # 0..2
-
-        rf = train_rf(X_train, y_train)
-
-        self.set_status("Predicting probabilities (tiled)…")
-        P = predict_proba_tiled(rf, X_full, tile=512)
+        # Allocate probability volume
+        self._P = np.zeros((H, W, 3), dtype=np.float32)
 
         alpha = float(self.slider_alpha.value()) / 100.0
-        P_nuc = P[..., 0]
-        P_cyto = P[..., 1]
 
-        # Add/update probability layers (named)
-        if "P(nucleus)" in self.viewer.layers:
-            self.viewer.layers["P(nucleus)"].data = P_nuc
-        else:
+        # Create probability layers if missing
+        if "P(nucleus)" not in self.viewer.layers:
             self._prob_layers["P_nuc"] = self.viewer.add_image(
-                P_nuc, name="P(nucleus)", opacity=alpha, blending="additive", colormap="magenta"
+                self._P[..., 0],
+                name="P(nucleus)",
+                opacity=alpha,
+                blending="additive",
+                colormap="magenta",
             )
-
-        if "P(cytoplasm)" in self.viewer.layers:
-            self.viewer.layers["P(cytoplasm)"].data = P_cyto
-        else:
+        if "P(cytoplasm)" not in self.viewer.layers:
             self._prob_layers["P_cyto"] = self.viewer.add_image(
-                P_cyto, name="P(cytoplasm)", opacity=alpha, blending="additive", colormap="green"
+                self._P[..., 1],
+                name="P(cytoplasm)",
+                opacity=alpha,
+                blending="additive",
+                colormap="green",
             )
 
-        self.set_status("Done. Inspect P(nucleus)/P(cytoplasm), add scribbles, retrain as needed.")
+        from cycif_seg.predict.workers import predict_rf_worker
+        from cycif_seg.features.multiscale import build_features
+
+        self.set_status("Training + predicting (background)...")
+
+        # Choose a priority point near what the user is looking at
+        try:
+            # camera.center is usually (z, y, x) in 2D display; take last 2
+            cy, cx = self.viewer.camera.center[-2], self.viewer.camera.center[-1]
+        except Exception:
+            # fall back to dims point (y, x)
+            cy, cx = float(self.viewer.dims.point[0]), float(self.viewer.dims.point[1])
+
+        center_yx = (float(cy), float(cx))
+
+        worker = predict_rf_worker(
+            self.img,
+            use_ch,
+            S,
+            build_features,
+            tile_size=512,
+            center_yx=center_yx,
+        )
+
+        @worker.errored.connect
+        def _on_err(e):
+            show_warning(f"Prediction failed: {e}")
+            self.status.setText(f"Prediction failed: {e}")
+
+        @worker.yielded.connect
+        def _on_tile(result):
+            y0, y1, x0, x1, P_tile = result
+            self._P[y0:y1, x0:x1, :] = P_tile
+
+            # Update visible layers progressively
+            self.viewer.layers["P(nucleus)"].data = self._P[..., 0]
+            self.viewer.layers["P(cytoplasm)"].data = self._P[..., 1]
+
+        @worker.finished.connect
+        def _on_done():
+            self.set_status("Prediction complete.")
+
+        worker.start()
