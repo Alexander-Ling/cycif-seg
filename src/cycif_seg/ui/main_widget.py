@@ -21,6 +21,9 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.ch_names = None
         self.path = None
 
+        self._rf_worker = None
+        self._rf_run_id = 0
+
         self._prob_layers = {}
         self._scribbles_layer_name = "Scribbles (0=unlabeled,1=nuc,2=cyto,3=bg)"
 
@@ -63,6 +66,47 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_train = QtWidgets.QPushButton("Train + Predict (RF)")
         layout.addWidget(self.btn_train)
 
+        # --- Cell segmentation controls ---
+        layout.addWidget(QtWidgets.QLabel("Cell segmentation (nucleus-seeded):"))
+
+        grid = QtWidgets.QGridLayout()
+
+        self.spin_nuc_thresh = QtWidgets.QDoubleSpinBox()
+        self.spin_nuc_thresh.setRange(0.0, 1.0)
+        self.spin_nuc_thresh.setSingleStep(0.05)
+        self.spin_nuc_thresh.setValue(0.35)
+
+        self.spin_cyto_thresh = QtWidgets.QDoubleSpinBox()
+        self.spin_cyto_thresh.setRange(0.0, 1.0)
+        self.spin_cyto_thresh.setSingleStep(0.05)
+        self.spin_cyto_thresh.setValue(0.35)
+
+        self.spin_min_nuc_area = QtWidgets.QSpinBox()
+        self.spin_min_nuc_area.setRange(0, 10_000)
+        self.spin_min_nuc_area.setValue(30)
+
+        self.spin_min_cell_area = QtWidgets.QSpinBox()
+        self.spin_min_cell_area.setRange(0, 100_000)
+        self.spin_min_cell_area.setValue(200)
+
+        grid.addWidget(QtWidgets.QLabel("Nuc thresh"), 0, 0)
+        grid.addWidget(self.spin_nuc_thresh, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Cyto thresh"), 0, 2)
+        grid.addWidget(self.spin_cyto_thresh, 0, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Min nucleus area"), 1, 0)
+        grid.addWidget(self.spin_min_nuc_area, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Min cell area"), 1, 2)
+        grid.addWidget(self.spin_min_cell_area, 1, 3)
+
+        layout.addLayout(grid)
+
+        self.btn_cells = QtWidgets.QPushButton("Generate Cells (watershed)")
+        layout.addWidget(self.btn_cells)
+
+        self.btn_cells.clicked.connect(self.on_generate_cells)
+
+
         # Opacity
         op_row = QtWidgets.QHBoxLayout()
         op_row.addWidget(QtWidgets.QLabel("Overlay opacity:"))
@@ -77,6 +121,10 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
+        self.prog = QtWidgets.QProgressBar()
+        self.prog.setVisible(False)
+        layout.addWidget(self.prog)
+
         # Signals
         self.btn_load.clicked.connect(self.on_load)
         self.btn_all.clicked.connect(lambda: self.set_all_channels(True))
@@ -85,6 +133,19 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.slider_alpha.valueChanged.connect(self.on_alpha_change)
         self.chk_display_selected_only.stateChanged.connect(self.sync_displayed_channel_layers)
         self.list_channels.itemChanged.connect(lambda _: self.on_channel_selection_changed())
+
+    def _cancel_rf_worker(self):
+        w = getattr(self, "_rf_worker", None)
+        if w is None:
+            return
+        try:
+            if hasattr(w, "quit"):
+                w.quit()
+            if hasattr(w, "cancel"):
+                w.cancel()
+        except Exception:
+            pass
+        self._rf_worker = None
 
     def set_status(self, msg: str):
         self.status.setText(msg)
@@ -240,6 +301,14 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.set_status(f"Loaded image {self.img.shape} with {len(self.ch_names)} channels.")
 
     def on_train_predict(self):
+
+        self._cancel_rf_worker()
+        self._rf_run_id += 1
+        my_run_id = self._rf_run_id
+
+        def is_cancelled():
+            return my_run_id != self._rf_run_id
+
         if self.img is None:
             show_warning("Load an image first.")
             return
@@ -287,6 +356,9 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         from cycif_seg.features.multiscale import build_features
 
         self.set_status("Training + predicting (background)...")
+        self.prog.setVisible(True)
+        self.prog.setRange(0, 0)  # indeterminate during training
+        self.prog.setValue(0)
 
         # Choose a priority point near what the user is looking at
         try:
@@ -305,24 +377,113 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             build_features,
             tile_size=512,
             center_yx=center_yx,
+            run_id=my_run_id,
+            is_cancelled=is_cancelled,
         )
+        self._rf_worker = worker
 
         @worker.errored.connect
         def _on_err(e):
             show_warning(f"Prediction failed: {e}")
             self.status.setText(f"Prediction failed: {e}")
+            self.prog.setVisible(False)
 
         @worker.yielded.connect
         def _on_tile(result):
-            y0, y1, x0, x1, P_tile = result
-            self._P[y0:y1, x0:x1, :] = P_tile
+            kind = result[0]
 
-            # Update visible layers progressively
-            self.viewer.layers["P(nucleus)"].data = self._P[..., 0]
-            self.viewer.layers["P(cytoplasm)"].data = self._P[..., 1]
+            if kind == "status":
+                _, run_id, msg = result
+                if run_id != self._rf_run_id:
+                    return
+                self.status.setText(str(msg))
+                return
+
+            if kind == "progress_init":
+                _, run_id, n_tiles = result
+                if run_id != self._rf_run_id:
+                    return
+                self.prog.setRange(0, int(n_tiles))
+                self.prog.setValue(0)
+                return
+
+            if kind == "progress":
+                _, run_id, i, n_tiles = result
+                if run_id != self._rf_run_id:
+                    return
+                # range already set; update value
+                self.prog.setValue(int(i))
+                return
+
+            if kind == "tile":
+                _, run_id, y0, y1, x0, x1, P_tile = result
+                if run_id != self._rf_run_id:
+                    return
+                # write probabilities
+                self._P[y0:y1, x0:x1, :] = P_tile
+                # refresh views
+                if "P(nucleus)" in self.viewer.layers:
+                    self.viewer.layers["P(nucleus)"].refresh()
+                if "P(cytoplasm)" in self.viewer.layers:
+                    self.viewer.layers["P(cytoplasm)"].refresh()
+                return
+            # Unknown message type; ignore safely.
+            return            
 
         @worker.finished.connect
         def _on_done():
+            if my_run_id != self._rf_run_id:
+                # stale/cancelled run
+                return
+            self.prog.setValue(self.prog.maximum())
+            self.prog.setVisible(False)
             self.set_status("Prediction complete.")
 
         worker.start()
+
+    def on_generate_cells(self):
+        if "P(nucleus)" not in self.viewer.layers or "P(cytoplasm)" not in self.viewer.layers:
+            show_warning("Run Train + Predict first to create P(nucleus) and P(cytoplasm).")
+            return
+
+        p_nuc = np.asarray(self.viewer.layers["P(nucleus)"].data).astype(np.float32, copy=False)
+        p_cyto = np.asarray(self.viewer.layers["P(cytoplasm)"].data).astype(np.float32, copy=False)
+
+        params = {
+            "nuc_thresh": float(self.spin_nuc_thresh.value()),
+            "cyto_thresh": float(self.spin_cyto_thresh.value()),
+            "min_nucleus_area": int(self.spin_min_nuc_area.value()),
+            "min_cell_area": int(self.spin_min_cell_area.value()),
+            # conservative defaults; we can expose later if needed
+            "peak_min_distance": 6,
+            "peak_footprint": 9,
+        }
+
+        self.set_status("Generating cells (background)…")
+
+        from cycif_seg.instance.workers import cells_from_probs_worker
+
+        worker = cells_from_probs_worker(p_nuc, p_cyto, params)
+
+        @worker.returned.connect
+        def _on_returned(result):
+            labels, debug = result
+
+            # Add / update Cells layer
+            if "Cells" in self.viewer.layers:
+                self.viewer.layers["Cells"].data = labels
+            else:
+                self.viewer.add_labels(labels, name="Cells", opacity=0.6)
+
+            self.set_status(f"Cells generated: N={int(labels.max())} (0=unassigned cytoplasm).")
+
+            # (Optional) Keep debug around for next milestone (split/local resegment)
+            self._cells_debug = debug
+
+        @worker.errored.connect
+        def _on_err(e):
+            show_warning(f"Cell generation failed: {e}")
+            self.status.setText(f"Cell generation failed: {e}")
+
+        worker.start()
+
