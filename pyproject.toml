@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cycif-seg"
+version = "0.0.1"
+description = "MVP napari app for CycIF segmentation (scribbles + RF pixel classifier)"
+requires-python = ">=3.11"
+dependencies = [
+  "napari[pyqt5]",
+  "numpy",
+  "tifffile",
+  "scikit-image",
+  "scipy",
+  "scikit-learn",
+  "qtpy",
+  "ome-types",
+]
+
+[project.scripts]
+cycif-seg = "cycif_seg.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

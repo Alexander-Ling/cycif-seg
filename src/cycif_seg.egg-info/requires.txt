@@ -1,0 +1,8 @@
+napari[pyqt5]
+numpy
+tifffile
+scikit-image
+scipy
+scikit-learn
+qtpy
+ome-types
