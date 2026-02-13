@@ -25,7 +25,7 @@ def sample_training_pixels(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Return (ys, xs) coordinates for training pixels sampled from scribbles.
-    scribbles: uint8 where 0=unlabeled, 1=nuc, 2=cyto, 3=bg
+    scribbles: uint8 where 0=unlabeled, 1=nuc, 2=nuc_boundary, 3=cyto, 4=bg
     We cap per-class points to keep training fast on huge images.
     """
     if scribbles.ndim != 2:
@@ -35,7 +35,7 @@ def sample_training_pixels(
     ys_all = []
     xs_all = []
 
-    for cls in (1, 2, 3):
+    for cls in (1, 2, 3, 4):
         ys, xs = np.where(scribbles == cls)
         n = ys.size
         if n == 0:
@@ -96,15 +96,16 @@ def predict_proba_tiled(
     tile: int = 512,
 ) -> np.ndarray:
     """
-    Predict 3-class probabilities for a full (Y,X,F) feature volume in tiles.
+    Predict class probabilities for a full (Y,X,F) feature volume in tiles.
     Returns P of shape (Y,X,3).
     """
     H, W, F = X_full.shape
-    P = np.zeros((H, W, 3), dtype=np.float32)
+    K = len(getattr(rf, "classes_", [])) or int(rf.n_classes_)
+    P = np.zeros((H, W, K), dtype=np.float32)
 
     for y0, y1, x0, x1 in iter_tiles(H, W, tile):
         Xt = X_full[y0:y1, x0:x1, :].reshape(-1, F)
         Pt = rf.predict_proba(Xt).astype(np.float32)
-        P[y0:y1, x0:x1, :] = Pt.reshape((y1 - y0, x1 - x0, 3))
+        P[y0:y1, x0:x1, :] = Pt.reshape((y1 - y0, x1 - x0, P.shape[-1]))
 
     return P

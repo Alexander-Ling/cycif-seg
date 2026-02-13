@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import os
 import numpy as np
+import os
 from qtpy import QtWidgets, QtCore
 
 import napari
 from napari.utils.notifications import show_info, show_warning
+from napari.qt.threading import thread_worker
 
 from cycif_seg.io.ome_tiff import load_multichannel_tiff
 from cycif_seg.features.multiscale import build_features
@@ -25,7 +26,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self._rf_run_id = 0
 
         self._prob_layers = {}
-        self._scribbles_layer_name = "Scribbles (0=unlabeled,1=nuc,2=cyto,3=bg)"
+        self._scribbles_layer_name = "Scribbles (0=unlabeled,1=nuc,2=nuc_boundary,3=bg)"
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -58,7 +59,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         layout.addWidget(QtWidgets.QLabel(
             "Scribbles: paint into the Labels layer using values:\n"
-            "1 = nucleus, 2 = cytoplasm, 3 = background (0 = unlabeled)\n"
+            "1 = nucleus, 2 = nucleus boundary/overlap, 3 = background (0 = unlabeled)\n"
             "Tip: select the Scribbles layer and set the current label value in napari."
         ))
 
@@ -66,8 +67,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_train = QtWidgets.QPushButton("Train + Predict (RF)")
         layout.addWidget(self.btn_train)
 
-        # --- Cell segmentation controls ---
-        layout.addWidget(QtWidgets.QLabel("Cell segmentation (nucleus-seeded):"))
+        # --- Nuclei instance segmentation controls ---
+        layout.addWidget(QtWidgets.QLabel("Nuclei instance segmentation (boundary-aware):"))
 
         grid = QtWidgets.QGridLayout()
 
@@ -76,36 +77,25 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.spin_nuc_thresh.setSingleStep(0.05)
         self.spin_nuc_thresh.setValue(0.35)
 
-        self.spin_cyto_thresh = QtWidgets.QDoubleSpinBox()
-        self.spin_cyto_thresh.setRange(0.0, 1.0)
-        self.spin_cyto_thresh.setSingleStep(0.05)
-        self.spin_cyto_thresh.setValue(0.35)
-
         self.spin_min_nuc_area = QtWidgets.QSpinBox()
-        self.spin_min_nuc_area.setRange(0, 10_000)
+        self.spin_min_nuc_area.setRange(0, 10_000_000)
         self.spin_min_nuc_area.setValue(30)
 
-        self.spin_min_cell_area = QtWidgets.QSpinBox()
-        self.spin_min_cell_area.setRange(0, 100_000)
-        self.spin_min_cell_area.setValue(200)
-
-        grid.addWidget(QtWidgets.QLabel("Nuc thresh"), 0, 0)
+        grid.addWidget(QtWidgets.QLabel("Nucleus prob thresh"), 0, 0)
         grid.addWidget(self.spin_nuc_thresh, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Cyto thresh"), 0, 2)
-        grid.addWidget(self.spin_cyto_thresh, 0, 3)
-
-        grid.addWidget(QtWidgets.QLabel("Min nucleus area"), 1, 0)
+        grid.addWidget(QtWidgets.QLabel("Min nucleus area (px)"), 1, 0)
         grid.addWidget(self.spin_min_nuc_area, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Min cell area"), 1, 2)
-        grid.addWidget(self.spin_min_cell_area, 1, 3)
 
         layout.addLayout(grid)
 
-        self.btn_cells = QtWidgets.QPushButton("Generate Cells (watershed)")
-        layout.addWidget(self.btn_cells)
+        self.btn_nuclei = QtWidgets.QPushButton("Generate Nuclei (instances)")
+        layout.addWidget(self.btn_nuclei)
 
-        self.btn_cells.clicked.connect(self.on_generate_cells)
+        self.btn_nuclei.clicked.connect(self.on_generate_nuclei)
 
+        self.chk_show_nuc_markers = QtWidgets.QCheckBox("Show nucleus markers overlay")
+        self.chk_show_nuc_markers.setChecked(False)
+        layout.addWidget(self.chk_show_nuc_markers)
 
         # Opacity
         op_row = QtWidgets.QHBoxLayout()
@@ -169,10 +159,9 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             return
         self._prob_dirty = False
         try:
-            if "P(nucleus)" in self.viewer.layers:
-                self.viewer.layers["P(nucleus)"].refresh()
-            if "P(cytoplasm)" in self.viewer.layers:
-                self.viewer.layers["P(cytoplasm)"].refresh()
+            for nm in ("P(nucleus)", "P(nuc_boundary)", "P(background)"):
+                if nm in self.viewer.layers:
+                    self.viewer.layers[nm].refresh()
         except Exception:
             pass
 
@@ -305,25 +294,63 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.path = path
         self.lbl_file.setText(path)
 
-        self.img, self.ch_names = load_multichannel_tiff(path)
+        # Load in a background thread so the UI stays responsive.
+        self.set_status("Loading image (background)…")
+        self.prog.setRange(0, 0)  # indeterminate/busy
+        self.prog.setValue(0)
+        try:
+            self.btn_load.setEnabled(False)
+        except Exception:
+            pass
 
-        # Populate channel list with correct names
-        self.list_channels.blockSignals(True)
-        self.list_channels.clear()
-        for nm in self.ch_names:
-            it = QtWidgets.QListWidgetItem(nm)
-            it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-            it.setCheckState(QtCore.Qt.Checked)  # default select all
-            self.list_channels.addItem(it)
-        self.list_channels.blockSignals(False)
+        @thread_worker
+        def _load_worker(p):
+            return load_multichannel_tiff(p)
 
-        # Add named layers
-        self._prob_layers = {}
-        self._add_channel_layers()
+        worker = _load_worker(path)
 
-        self.sync_displayed_channel_layers()
+        @worker.returned.connect
+        def _on_loaded(result):
+            self.img, self.ch_names = result
 
-        self.set_status(f"Loaded image {self.img.shape} with {len(self.ch_names)} channels.")
+            # Populate channel list with correct names
+            self.list_channels.blockSignals(True)
+            self.list_channels.clear()
+            for nm in self.ch_names:
+                it = QtWidgets.QListWidgetItem(nm)
+                it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                it.setCheckState(QtCore.Qt.Checked)  # default select all
+                self.list_channels.addItem(it)
+            self.list_channels.blockSignals(False)
+
+            # Add named layers
+            self._prob_layers = {}
+            self._add_channel_layers()
+
+            self.sync_displayed_channel_layers()
+
+            self.set_status(f"Loaded image {self.img.shape} with {len(self.ch_names)} channels.")
+
+            # Done loading
+            self.prog.setRange(0, 1)
+            self.prog.setValue(1)
+            try:
+                self.btn_load.setEnabled(True)
+            except Exception:
+                pass
+
+        @worker.errored.connect
+        def _on_load_err(e):
+            show_warning(f"Load failed: {e}")
+            self.set_status(f"Load failed: {e}")
+            self.prog.setRange(0, 1)
+            self.prog.setValue(0)
+            try:
+                self.btn_load.setEnabled(True)
+            except Exception:
+                pass
+
+        worker.start()
 
     def on_train_predict(self):
 
@@ -368,19 +395,43 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 blending="additive",
                 colormap="magenta",
             )
-        if "P(cytoplasm)" not in self.viewer.layers:
-            self._prob_layers["P_cyto"] = self.viewer.add_image(
+        if "P(nuc_boundary)" not in self.viewer.layers:
+            self._prob_layers["P_nb"] = self.viewer.add_image(
                 self._P[..., 1],
-                name="P(cytoplasm)",
+                name="P(nuc_boundary)",
                 opacity=alpha,
                 blending="additive",
-                colormap="green",
+                colormap="yellow",
             )
+        if "P(background)" not in self.viewer.layers:
+            self._prob_layers["P_bg"] = self.viewer.add_image(
+                self._P[..., 2],
+                name="P(background)",
+                opacity=alpha,
+                blending="additive",
+                colormap="gray",
+            )
+
+
+        # Always reset probability layer data to the freshly-zeroed buffer.
+        # (If layers already exist from a previous run, they may still be pointing at the old array.)
+        name_to_idx = {
+            "P(nucleus)": 0,
+            "P(nuc_boundary)": 1,
+            "P(background)": 2,
+        }
+        for nm, ii in name_to_idx.items():
+            if nm in self.viewer.layers:
+                try:
+                    self.viewer.layers[nm].data = self._P[..., ii]
+                    self.viewer.layers[nm].refresh()
+                except Exception:
+                    pass
 
         from cycif_seg.predict.workers import predict_rf_worker
         from cycif_seg.features.multiscale import build_features
 
-        self.set_status("Training + predicting (background)...")
+        self.set_status("Training + predicting (RF)…")
         self.prog.setVisible(True)
         self.prog.setRange(0, 0)  # indeterminate during training
         self.prog.setValue(0)
@@ -484,49 +535,136 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         worker.start()
 
-    def on_generate_cells(self):
-        if "P(nucleus)" not in self.viewer.layers or "P(cytoplasm)" not in self.viewer.layers:
-            show_warning("Run Train + Predict first to create P(nucleus) and P(cytoplasm).")
+    # ---------------------------------------------------------------------
+    # Layer helpers
+    # ---------------------------------------------------------------------
+
+    def _set_or_update_labels_layer(
+        self,
+        name: str,
+        data: np.ndarray,
+        *,
+        opacity: float = 0.7,
+        visible: bool = True,
+    ):
+        """
+        Create or update a napari Labels layer.
+        Keeps the same layer object if it already exists, to preserve user toggles.
+        """
+        if self.viewer is None:
+            return
+
+        # Ensure int labels
+        if data.dtype != np.int32 and data.dtype != np.int64:
+            data = data.astype(np.int32, copy=False)
+
+        if name in self.viewer.layers:
+            layer = self.viewer.layers[name]
+            # If the existing layer isn't Labels for some reason, replace it
+            try:
+                layer.data = data
+                layer.visible = visible
+                # labels layer has opacity in napari
+                if hasattr(layer, "opacity"):
+                    layer.opacity = opacity
+            except Exception:
+                # Replace layer defensively
+                self.viewer.layers.remove(layer)
+                self.viewer.add_labels(data, name=name, opacity=opacity, visible=visible)
+        else:
+            self.viewer.add_labels(data, name=name, opacity=opacity, visible=visible)
+        
+    def on_generate_nuclei(self):
+        # Requires probability maps from RF prediction
+        if ("P(nucleus)" not in self.viewer.layers or "P(nuc_boundary)" not in self.viewer.layers or "P(background)" not in self.viewer.layers):
+            show_warning("Run Train + Predict first to create P(nucleus), P(nuc_boundary), and P(background).")
             return
 
         p_nuc = np.asarray(self.viewer.layers["P(nucleus)"].data).astype(np.float32, copy=False)
-        p_cyto = np.asarray(self.viewer.layers["P(cytoplasm)"].data).astype(np.float32, copy=False)
+        p_nb = np.asarray(self.viewer.layers["P(nuc_boundary)"].data).astype(np.float32, copy=False)
+        p_bg = np.asarray(self.viewer.layers["P(background)"].data).astype(np.float32, copy=False)
 
         params = {
             "nuc_thresh": float(self.spin_nuc_thresh.value()),
-            "cyto_thresh": float(self.spin_cyto_thresh.value()),
             "min_nucleus_area": int(self.spin_min_nuc_area.value()),
-            "min_cell_area": int(self.spin_min_cell_area.value()),
-            # conservative defaults; we can expose later if needed
-            "peak_min_distance": 6,
-            "peak_footprint": 9,
+            # boundary-aware split defaults (can expose later)
+            "boundary_thresh": 0.35,
+            "boundary_dilate": 2,
+            "nuc_core_thresh": max(0.05, float(self.spin_nuc_thresh.value()) + 0.05),
+            "peak_min_distance": 4,
+            "peak_footprint": 7,
+            "bg_thresh": 0.6,
         }
 
-        self.set_status("Generating cells (background)…")
+        self.set_status("Generating nuclei (background)…")
 
-        from cycif_seg.instance.workers import cells_from_probs_worker
+        from cycif_seg.instance.workers import nuclei_instances_from_probs_worker
+        worker = nuclei_instances_from_probs_worker(p_nuc, p_nb, p_bg, params)
 
-        worker = cells_from_probs_worker(p_nuc, p_cyto, params)
+        # UI feedback: show an indeterminate (busy) progress bar.
+        self.prog.setVisible(True)
+        self.prog.setRange(0, 0)
+        self.prog.setValue(0)
+        try:
+            self.btn_nuclei.setEnabled(False)
+        except Exception:
+            pass
 
-        @worker.returned.connect
-        def _on_returned(result):
-            labels, debug = result
+        @worker.yielded.connect
+        def _on_yielded(msg):
+            # Expected messages:
+            #   ("stage", text, step, total)
+            #   ("nuclei", nuclei_labels)
+            #   ("debug", debug_dict)
+            try:
+                kind = msg[0]
+            except Exception:
+                return
 
-            # Add / update Cells layer
-            if "Cells" in self.viewer.layers:
-                self.viewer.layers["Cells"].data = labels
-            else:
-                self.viewer.add_labels(labels, name="Cells", opacity=0.6)
+            if kind == "stage":
+                _, text, step, total = msg
+                self.status.setText(str(text))
+            elif kind == "nuclei":
+                _, nuclei = msg
+                self._set_or_update_labels_layer("Nuclei", nuclei.astype(np.int32, copy=False))
+                self.set_status(f"Nuclei generated: N={int(nuclei.max())}")
+            elif kind == "debug":
+                if not self.chk_show_nuc_markers.isChecked():
+                    return
+                _, dbg = msg
+                # Show a few helpful overlays when requested
+                try:
+                    if "seeds" in dbg:
+                        self._set_or_update_labels_layer("Nucleus seeds", dbg["seeds"].astype(np.int32, copy=False))
+                    if "core_mask" in dbg:
+                        self._set_or_update_labels_layer("Nucleus core mask", dbg["core_mask"].astype(np.uint8, copy=False))
+                    if "boundary_mask" in dbg:
+                        self._set_or_update_labels_layer("Nucleus boundary mask", dbg["boundary_mask"].astype(np.uint8, copy=False))
+                except Exception:
+                    pass
 
-            self.set_status(f"Cells generated: N={int(labels.max())} (0=unassigned cytoplasm).")
-
-            # (Optional) Keep debug around for next milestone (split/local resegment)
-            self._cells_debug = debug
+        @worker.finished.connect
+        def _on_done():
+            self.set_status("Nuclei generation complete.")
+            try:
+                self.btn_nuclei.setEnabled(True)
+            except Exception:
+                pass
+            try:
+                self.prog.setVisible(False)
+            except Exception:
+                pass
 
         @worker.errored.connect
         def _on_err(e):
-            show_warning(f"Cell generation failed: {e}")
-            self.status.setText(f"Cell generation failed: {e}")
+            show_warning(f"Nuclei generation failed: {e}")
+            try:
+                self.btn_nuclei.setEnabled(True)
+            except Exception:
+                pass
+            try:
+                self.prog.setVisible(False)
+            except Exception:
+                pass
 
         worker.start()
-

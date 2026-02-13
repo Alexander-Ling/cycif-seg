@@ -101,6 +101,209 @@ def nuclei_markers_from_prob(
     return markers, nuc_mask
 
 
+
+def nuclei_instances_from_probs(
+    p_nuc: np.ndarray,
+    p_nb: np.ndarray,
+    *,
+    nuc_thresh: float = 0.35,
+    nuc_core_thresh: float = 0.45,
+    boundary_thresh: float = 0.35,
+    boundary_dilate: int = 2,
+    min_nucleus_area: int = 30,
+    peak_min_distance: int = 4,
+    peak_footprint: int = 7,
+    smooth_sigma: float = 1.0,
+    dist_percentile: float = 70.0,
+) -> tuple[np.ndarray, dict]:
+    """
+    Boundary-aware nucleus instance segmentation.
+
+    Intuition:
+      - p_nuc gives "where nuclei are"
+      - p_nb gives "where nuclear boundaries/overlaps are"
+      - We suppress seeds in boundary regions to encourage split of overlapping nuclei.
+
+    Returns:
+      nuclei: int32 instance labels (0 background; 1..N)
+      debug: dict with intermediate masks (nuc_mask, core_mask, boundary_mask, seeds)
+    """
+    if p_nuc.shape != p_nb.shape:
+        raise ValueError("p_nuc and p_nb must have the same shape.")
+    if p_nuc.ndim != 2:
+        raise ValueError("probability maps must be 2D (Y,X).")
+
+    p = p_nuc.astype(np.float32, copy=False)
+    pb = p_nb.astype(np.float32, copy=False)
+
+    if smooth_sigma and smooth_sigma > 0:
+        p = gaussian_filter(p, sigma=float(smooth_sigma))
+        pb = gaussian_filter(pb, sigma=float(smooth_sigma))
+
+    nuc_mask = p >= float(nuc_thresh)
+    nuc_mask = binary_opening(nuc_mask, footprint=disk(1))
+    nuc_mask = binary_closing(nuc_mask, footprint=disk(1))
+    nuc_mask = remove_small_objects(nuc_mask, min_size=int(min_nucleus_area))
+
+    if not np.any(nuc_mask):
+        return np.zeros_like(p_nuc, dtype=np.int32), {
+            "nuc_mask": nuc_mask,
+            "core_mask": nuc_mask,
+            "boundary_mask": np.zeros_like(nuc_mask, dtype=bool),
+            "seeds": np.zeros_like(p_nuc, dtype=np.int32),
+        }
+
+    boundary_mask = pb >= float(boundary_thresh)
+    if boundary_dilate and boundary_dilate > 0:
+        boundary_mask = ndi.binary_dilation(boundary_mask, structure=disk(int(boundary_dilate)))
+
+    # Core = high nucleus prob but not boundary-like (so we seed inside 'interiors')
+    core_mask = (p >= float(nuc_core_thresh)) & nuc_mask & (~boundary_mask)
+    core_mask = remove_small_objects(core_mask, min_size=max(5, int(min_nucleus_area // 4)))
+
+    # Distance transform to find centers; fallback to nuc_mask if core is empty
+    seed_region = core_mask if np.any(core_mask) else nuc_mask
+    dist = ndi.distance_transform_edt(seed_region)
+    if dist_percentile is not None and np.any(seed_region):
+        dp = float(np.percentile(dist[seed_region], float(dist_percentile)))
+        dist = np.where(dist >= dp, dist, 0.0).astype(np.float32, copy=False)
+
+    coords = peak_local_max(
+        dist,
+        labels=seed_region.astype(np.uint8),
+        min_distance=int(peak_min_distance),
+        footprint=np.ones((int(peak_footprint), int(peak_footprint)), dtype=bool),
+        exclude_border=False,
+    )
+
+    if coords.size == 0:
+        nuclei = cc_label(nuc_mask).astype(np.int32)
+        nuclei = _relabel_instances(nuclei)
+        return nuclei, {"nuc_mask": nuc_mask, "core_mask": core_mask, "boundary_mask": boundary_mask, "seeds": nuclei}
+
+    seed_img = np.zeros_like(p, dtype=np.int32)
+    seed_img[coords[:, 0], coords[:, 1]] = 1
+    seed_markers = cc_label(seed_img > 0).astype(np.int32)
+
+    # Split nuclei: watershed on distance within nuc_mask, but discourage crossing boundaries
+    # by restricting mask to nuc_mask (boundaries are still inside).
+    nuclei = watershed(-dist, markers=seed_markers, mask=nuc_mask).astype(np.int32)
+
+    # Post-filter tiny
+    if nuclei.max() > 0 and min_nucleus_area and min_nucleus_area > 0:
+        counts = np.bincount(nuclei.ravel())
+        keep = np.zeros(nuclei.max() + 1, dtype=bool)
+        keep[np.where(counts >= int(min_nucleus_area))[0]] = True
+        keep[0] = False
+        nuclei = np.where(keep[nuclei], nuclei, 0).astype(np.int32)
+        nuclei = _relabel_instances(nuclei)
+
+    return nuclei, {
+        "nuc_mask": nuc_mask,
+        "core_mask": core_mask,
+        "boundary_mask": boundary_mask,
+        "seeds": seed_markers,
+    }
+
+
+def cells_from_probs_boundary(
+    p_nuc: np.ndarray,
+    p_nb: np.ndarray,
+    p_cyto: np.ndarray,
+    p_bg: np.ndarray,
+    *,
+    nuc_thresh: float = 0.35,
+    nuc_core_thresh: float = 0.45,
+    boundary_thresh: float = 0.35,
+    boundary_dilate: int = 2,
+    cyto_thresh: float = 0.35,
+    bg_thresh: float = 0.5,
+    max_grow_radius: int = 80,
+    w_bg: float = 0.5,
+    min_nucleus_area: int = 30,
+    min_cell_area: int = 200,
+    peak_min_distance: int = 6,
+    peak_footprint: int = 9,
+) -> tuple[np.ndarray, dict]:
+    """
+    Generate cell instance labels via boundary-aware nucleus instances (1 nucleus per cell)
+    and constrained cytoplasm growth.
+
+    Growth constraints:
+      - Only expand into cytoplasm-positive pixels (cyto_thresh) OR nucleus pixels.
+      - Do not expand into strong background (bg_thresh).
+      - Limit maximum growth distance from any nucleus to avoid 'mega-cells'.
+      - Each nucleus instance is a fixed seed (one per cell).
+
+    Returns:
+      cell_labels: int32 (0 unassigned; 1..N cells)
+      debug: dict with intermediate images.
+    """
+    if not (p_nuc.shape == p_nb.shape == p_cyto.shape == p_bg.shape):
+        raise ValueError("All probability maps must have the same shape.")
+    if p_nuc.ndim != 2:
+        raise ValueError("probability maps must be 2D (Y,X).")
+
+    nuclei, ndbg = nuclei_instances_from_probs(
+        p_nuc,
+        p_nb,
+        nuc_thresh=nuc_thresh,
+        nuc_core_thresh=nuc_core_thresh,
+        boundary_thresh=boundary_thresh,
+        boundary_dilate=boundary_dilate,
+        min_nucleus_area=min_nucleus_area,
+        peak_min_distance=max(1, int(peak_min_distance) - 2),
+        peak_footprint=max(3, int(peak_footprint) - 2),
+    )
+    print(f"nuclei.max() after nuclei_instances_from_probs = {int(nuclei.max())}")
+
+    if int(nuclei.max()) == 0:
+        return np.zeros_like(nuclei, dtype=np.int32), {"nuclei": nuclei, **ndbg}
+
+    cyto_mask = p_cyto >= float(cyto_thresh)
+    bg_mask = p_bg >= float(bg_thresh)
+
+    # constrain growth to near-nucleus regions
+    if max_grow_radius and max_grow_radius > 0:
+        dist_to_nuc = ndi.distance_transform_edt(nuclei == 0)
+        near_nuc = dist_to_nuc <= float(max_grow_radius)
+    else:
+        near_nuc = np.ones_like(cyto_mask, dtype=bool)
+
+    ws_mask = (cyto_mask | (nuclei > 0)) & (~bg_mask) & near_nuc
+
+    # elevation: prefer high cytoplasm prob, penalize background prob
+    elevation = -(p_cyto.astype(np.float32, copy=False) - float(w_bg) * p_bg.astype(np.float32, copy=False))
+
+    cell_labels = watershed(
+        elevation,
+        markers=nuclei,
+        mask=ws_mask,
+    ).astype(np.int32)
+
+    print(f"cell_labels.max() after watershed: {int(cell_labels.max())}")
+
+    # Filter small cells
+    if min_cell_area and min_cell_area > 0 and int(cell_labels.max()) > 0:
+        counts = np.bincount(cell_labels.ravel())
+        keep = np.zeros(int(cell_labels.max()) + 1, dtype=bool)
+        keep[np.where(counts >= int(min_cell_area))[0]] = True
+        keep[0] = False
+        filtered = np.where(keep[cell_labels], cell_labels, 0).astype(np.int32)
+        cell_labels = _relabel_instances(filtered)
+
+    print(f"cell_labels.max() after filter and relabel: {int(cell_labels.max())}")
+
+    debug = {
+        "nuclei": nuclei,
+        "cyto_mask": cyto_mask,
+        "bg_mask": bg_mask,
+        "ws_mask": ws_mask,
+        **ndbg,
+    }
+    return cell_labels, debug
+
+
 def cells_from_probs(
     p_nuc: np.ndarray,
     p_cyto: np.ndarray,

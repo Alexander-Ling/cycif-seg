@@ -177,6 +177,17 @@ def predict_rf_worker(
             Xt_all = np.concatenate(X_list, axis=0)
             t0 = _time.perf_counter()
             Pt_all = rf.predict_proba(Xt_all).astype(np.float32)
+            # If some classes are absent from scribbles, sklearn will omit them from
+            # predict_proba output. Expand back to the full expected class set.
+            # We currently expect 3 classes: nucleus, nuclear_boundary, background.
+            k_expected = 3
+            if Pt_all.shape[1] != k_expected:
+                Pt_full = np.zeros((Pt_all.shape[0], k_expected), dtype=np.float32)
+                for j, cls in enumerate(getattr(rf, 'classes_', [])):
+                    cls_i = int(cls)
+                    if 0 <= cls_i < k_expected:
+                        Pt_full[:, cls_i] = Pt_all[:, j]
+                Pt_all = Pt_full
             dt_pred = _time.perf_counter() - t0
             t_predict_total += dt_pred
             n_predict_tiles += len(batch_items)
@@ -188,7 +199,8 @@ def predict_rf_worker(
                 dy = int(y1 - y0)
                 dx = int(x1 - x0)
                 n = dy * dx
-                P_tile = Pt_all[offset:offset + n, :].reshape((dy, dx, 3))
+                k = int(Pt_all.shape[1])
+                P_tile = Pt_all[offset:offset + n, :].reshape((dy, dx, k))
                 offset += n
                 i += 1
                 yield ("tile", run_id, y0, y1, x0, x1, P_tile)
