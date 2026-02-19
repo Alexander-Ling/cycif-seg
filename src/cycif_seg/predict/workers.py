@@ -5,6 +5,7 @@ import os
 import concurrent.futures as cf
 
 import numpy as np
+from skimage.segmentation import find_boundaries
 from napari.qt.threading import thread_worker
 
 from cycif_seg.model.rf_pixel import train_rf
@@ -95,6 +96,20 @@ def predict_rf_worker(
         return
 
     rf = train_rf(X_train, y_train)
+
+    # Provide the trained model back to the UI so it can be saved into a project.
+    # Note: this is a reference to a sklearn model; callers should persist it via joblib/pickle.
+    yield (
+        "trained_model",
+        run_id,
+        rf,
+        {
+            "use_channels": list(use_channels),
+            "train_crop_yxxy": [int(y0), int(y1), int(x0), int(x1)],
+            "max_per_class": int(max_per_class),
+            "rng_seed": int(rng_seed),
+        },
+    )
 
     dt = time() - t0
     yield ("status", run_id, f"Training complete in {dt:0.1f}s. Predicting tiles…")
@@ -221,3 +236,177 @@ def predict_rf_worker(
                     )
             except Exception:
                 pass
+
+
+@thread_worker
+def propagate_nuclei_edits_worker(
+    img,
+    use_channels,
+    nuclei_labels,
+    build_features_fn,
+    tile_size,
+    center_yx,
+    run_id,
+    *,
+    batch_tiles=4,
+    feature_workers=None,
+    progress_every=10,
+    training_budget=200_000,
+    seed=0,
+):
+    """Train an RF from edited nuclei labels and predict probabilities across the image.
+
+    This is a convenience worker for "learn from edits" workflows:
+    - derives pixel labels from *instance* edits (nucleus / nucleus-boundary / background)
+    - trains an RF on multi-scale features
+    - predicts in tiles (same streaming protocol as predict_rf_worker)
+
+    Yields:
+      ("stage", run_id, text, step, total)
+      ("tile", run_id, y0, y1, x0, x1, P_tile)
+      ("progress", run_id, done, total)
+    """
+    H, W, _ = img.shape
+    if nuclei_labels.shape != (H, W):
+        raise ValueError(f"nuclei_labels has shape {nuclei_labels.shape}, expected {(H, W)}")
+
+    def is_cancelled():
+        return getattr(thread_worker.current_worker(), "abort_requested", False)
+
+    # ---- Build scribbles from edited instances ----
+    yield ("stage", run_id, "Building training labels from edits…", 1, 3)
+    labels = nuclei_labels
+    nuc_mask = labels > 0
+    boundary = find_boundaries(labels, mode="inner")  # bool
+    scribbles = np.zeros((H, W), dtype=np.uint8)
+    scribbles[~nuc_mask] = 3  # background
+    scribbles[nuc_mask] = 1   # nucleus
+    scribbles[boundary] = 2   # nucleus boundary (overrides nucleus)
+
+    if is_cancelled():
+        return
+
+    # ---- Train RF ----
+    yield ("stage", run_id, "Training RF from edited nuclei…", 2, 3)
+    X_full = build_features_fn(img, use_channels)
+    train_mask = scribbles > 0
+    X_train = X_full[train_mask].reshape(-1, X_full.shape[-1])
+    y_train = (scribbles[train_mask].reshape(-1) - 1).astype(np.uint8, copy=False)
+
+    # Downsample training set (keep class balance reasonably intact)
+    if training_budget is not None and X_train.shape[0] > int(training_budget):
+        rng = np.random.default_rng(int(seed))
+        idx = rng.choice(X_train.shape[0], size=int(training_budget), replace=False)
+        X_train = X_train[idx]
+        y_train = y_train[idx]
+
+    rf = train_rf(X_train, y_train, n_jobs=-1)
+
+    yield (
+        "trained_model",
+        run_id,
+        rf,
+        {
+            "kind": "rf_from_nuclei_edits",
+            "use_channels": list(use_channels),
+            "training_budget": int(training_budget) if training_budget is not None else None,
+            "seed": int(seed),
+        },
+    )
+
+    if is_cancelled():
+        return
+
+    # ---- Predict in tiles (pipeline matches predict_rf_worker) ----
+    yield ("stage", run_id, "Predicting tiles…", 3, 3)
+
+    tiles = list(generate_tiles((H, W), tile_size=tile_size, center_yx=center_yx))
+    n_tiles = len(tiles)
+
+    if feature_workers is None:
+        feature_workers = max(1, min(os.cpu_count() or 1, 8))
+
+    # Timing helpers
+    t_features_total = 0.0
+    t_predict_total = 0.0
+    n_feature_tiles = 0
+    n_predict_tiles = 0
+
+    def build_one(y0, y1, x0, x1):
+        t0 = time.time()
+        X_tile = X_full[y0:y1, x0:x1, :].reshape(-1, X_full.shape[-1])
+        dt = time.time() - t0
+        return (y0, y1, x0, x1, X_tile, dt)
+
+    def predict_many(items):
+        nonlocal t_predict_total, n_predict_tiles
+        t0 = time.time()
+        Xt_all = np.concatenate([it[4] for it in items], axis=0)
+        Pt_all = rf.predict_proba(Xt_all).astype(np.float32, copy=False)
+        dt = time.time() - t0
+        t_predict_total += dt
+        n_predict_tiles += len(items)
+        return Pt_all
+
+    i = 0
+    with cf.ThreadPoolExecutor(max_workers=feature_workers) as ex:
+        # Submit all tiles
+        futures = [ex.submit(build_one, y0, y1, x0, x1) for (y0, y1, x0, x1) in tiles]
+
+        batch_items = []
+        for fut in cf.as_completed(futures):
+            if is_cancelled():
+                return
+            y0, y1, x0, x1, Xt, dt = fut.result()
+            t_features_total += float(dt)
+            n_feature_tiles += 1
+            batch_items.append((y0, y1, x0, x1, Xt))
+            if len(batch_items) < int(batch_tiles):
+                continue
+
+            Pt_all = predict_many(batch_items)
+            offset = 0
+            for (yy0, yy1, xx0, xx1, _) in batch_items:
+                dy = int(yy1 - yy0)
+                dx = int(xx1 - xx0)
+                n = dy * dx
+                k = int(Pt_all.shape[1])
+                P_tile = Pt_all[offset:offset + n, :].reshape((dy, dx, k))
+                offset += n
+                i += 1
+                yield ("tile", run_id, yy0, yy1, xx0, xx1, P_tile)
+                if (i % progress_every) == 0 or i == n_tiles:
+                    yield ("progress", run_id, i, n_tiles)
+
+            batch_items = []
+
+        # flush remainder
+        if batch_items and not is_cancelled():
+            Pt_all = predict_many(batch_items)
+            offset = 0
+            for (yy0, yy1, xx0, xx1, _) in batch_items:
+                dy = int(yy1 - yy0)
+                dx = int(xx1 - xx0)
+                n = dy * dx
+                k = int(Pt_all.shape[1])
+                P_tile = Pt_all[offset:offset + n, :].reshape((dy, dx, k))
+                offset += n
+                i += 1
+                yield ("tile", run_id, yy0, yy1, xx0, xx1, P_tile)
+                if (i % progress_every) == 0 or i == n_tiles:
+                    yield ("progress", run_id, i, n_tiles)
+
+    # ---- Timing summary ----
+    try:
+        if n_feature_tiles > 0:
+            print(
+                f"[TIMING][edits] Features: total={t_features_total:.2f}s "
+                f"avg_per_tile={t_features_total/n_feature_tiles:.4f}s"
+            )
+        if n_predict_tiles > 0:
+            print(
+                f"[TIMING][edits] Predict: total={t_predict_total:.2f}s "
+                f"avg_per_tile={t_predict_total/n_predict_tiles:.4f}s"
+            )
+    except Exception:
+        pass

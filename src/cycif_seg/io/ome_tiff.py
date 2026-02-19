@@ -3,7 +3,13 @@ from __future__ import annotations
 import numpy as np
 import tifffile
 
-from ome_types import from_xml
+# ome-types is nice-to-have, but keep this module usable without it.
+try:
+    from ome_types import from_xml  # type: ignore
+except Exception:  # pragma: no cover
+    from_xml = None
+
+import xml.etree.ElementTree as ET
 
 
 def _normalize_to_yxc(arr: np.ndarray) -> np.ndarray:
@@ -28,28 +34,95 @@ def _normalize_to_yxc(arr: np.ndarray) -> np.ndarray:
 def _channel_names_from_ome(ome_xml: str, n_channels: int) -> list[str] | None:
     if not ome_xml:
         return None
+
+    # First try ome-types (if available)
+    if from_xml is not None:
+        try:
+            ome = from_xml(ome_xml)
+            # Most OME-TIFFs store channels under the first Image/Pixels.
+            img0 = ome.images[0] if ome.images else None
+            px = img0.pixels if img0 else None
+            if not px or not px.channels:
+                return None
+
+            names: list[str] = []
+            for ch in px.channels[:n_channels]:
+                nm = (ch.name or "").strip()
+                names.append(nm)
+
+            if all(n == "" for n in names):
+                return None
+            return [n if n else "" for n in names]
+        except Exception:
+            pass
+
+    # Fallback: parse OME-XML directly.
     try:
-        ome = from_xml(ome_xml)
-        # Most OME-TIFFs store channels under the first Image/Pixels.
-        img0 = ome.images[0] if ome.images else None
-        px = img0.pixels if img0 else None
-        if not px or not px.channels:
+        root = ET.fromstring(ome_xml)
+        # OME namespaces vary; strip them for matching.
+        def _strip(tag: str) -> str:
+            return tag.split("}", 1)[-1]
+
+        channels: list[str] = []
+        for el in root.iter():
+            if _strip(el.tag) == "Channel":
+                nm = (el.attrib.get("Name") or "").strip()
+                channels.append(nm)
+                if len(channels) >= n_channels:
+                    break
+        if not channels:
             return None
-
-        names: list[str] = []
-        for ch in px.channels[:n_channels]:
-            nm = (ch.name or "").strip()
-            names.append(nm)
-
-        # If all empty, treat as missing
-        if all(n == "" for n in names):
+        if all(n == "" for n in channels):
             return None
-
-        # Fill blanks
-        names = [n if n else "" for n in names]
-        return names
+        if len(channels) < n_channels:
+            channels += [""] * (n_channels - len(channels))
+        return channels[:n_channels]
     except Exception:
         return None
+
+
+def save_ome_tiff_yxc(
+    path: str,
+    img_yxc: np.ndarray,
+    channel_names: list[str] | None = None,
+    *,
+    compress: bool | int = True,
+) -> None:
+    """Save a (Y, X, C) array as an OME-TIFF with optional channel names.
+
+    Notes
+    -----
+    tifffile's OME writer is most reliable when channels are stored in the
+    leading dimension (C, Y, X) with axes="CYX".
+
+    Some tifffile versions can raise:
+        ValueError: shape does not match stored shape
+    when writing with axes="YXC".
+
+    To avoid that, we transpose to (C, Y, X) for writing.
+    """
+    if img_yxc.ndim != 3:
+        raise ValueError(f"Expected (Y,X,C). Got shape={img_yxc.shape}")
+
+    n_ch = int(img_yxc.shape[2])
+    if channel_names is None or len(channel_names) != n_ch:
+        channel_names = [f"Channel {i}" for i in range(n_ch)]
+
+    # Write as (C, Y, X) to avoid OME-XML shape/axes mismatches in tifffile.
+    img_cyx = np.moveaxis(img_yxc, 2, 0)
+
+    metadata = {
+        "axes": "CYX",
+        "Channel": {"Name": list(channel_names)},
+    }
+    tifffile.imwrite(
+        path,
+        img_cyx,
+        photometric="minisblack",
+        metadata=metadata,
+        ome=True,
+        compression=("zlib" if compress is True else compress),
+    )
 
 
 def load_multichannel_tiff(path: str) -> tuple[np.ndarray, list[str]]:
