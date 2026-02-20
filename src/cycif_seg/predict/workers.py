@@ -55,7 +55,9 @@ def predict_rf_worker(
     x0 = max(int(xs.min()) - int(train_pad), 0)
     x1 = min(int(xs.max()) + int(train_pad) + 1, W)
 
-    img_crop = img[y0:y1, x0:x1, :]
+    # img can be a numpy array or a dask-backed lazy array. Ensure we hand
+    # numpy arrays to feature builders.
+    img_crop = np.asarray(img[y0:y1, x0:x1, :])
     scr_crop = scribbles[y0:y1, x0:x1]
 
     # Status: starting training (before any tiles appear)
@@ -151,7 +153,7 @@ def predict_rf_worker(
     i = 0
 
     def _compute_tile_features(y0, y1, x0, x1):
-        tile_img = img[y0:y1, x0:x1, :]
+        tile_img = np.asarray(img[y0:y1, x0:x1, :])
         t0 = _time.perf_counter()
         X_tile = build_features_fn(tile_img, use_channels)
         dt = _time.perf_counter() - t0

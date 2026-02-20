@@ -4,17 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cycif-seg"
-version = "0.0.6"
+version = "0.0.7"
 description = "MVP napari app for CycIF segmentation (scribbles + RF pixel classifier)"
 requires-python = ">=3.11"
 dependencies = [
   "napari[pyqt5]",
   "numpy",
   "tifffile",
+  "zarr",
+  "dask[array]",
   "scikit-image",
   "scipy",
   "scikit-learn",
   "qtpy",
+  "superqt",
   "ome-types",
 ]
 

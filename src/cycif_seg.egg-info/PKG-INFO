@@ -1,13 +1,16 @@
 Metadata-Version: 2.4
 Name: cycif-seg
-Version: 0.0.1
+Version: 0.0.7
 Summary: MVP napari app for CycIF segmentation (scribbles + RF pixel classifier)
 Requires-Python: >=3.11
 Requires-Dist: napari[pyqt5]
 Requires-Dist: numpy
 Requires-Dist: tifffile
+Requires-Dist: zarr
+Requires-Dist: dask[array]
 Requires-Dist: scikit-image
 Requires-Dist: scipy
 Requires-Dist: scikit-learn
 Requires-Dist: qtpy
+Requires-Dist: superqt
 Requires-Dist: ome-types

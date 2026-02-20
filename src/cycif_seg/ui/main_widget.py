@@ -18,7 +18,7 @@ import napari
 from napari.utils.notifications import show_info, show_warning
 from napari.qt.threading import thread_worker
 
-from cycif_seg.io.ome_tiff import load_multichannel_tiff
+from cycif_seg.io.ome_tiff import load_multichannel_tiff, load_multichannel_tiff_lazy
 from cycif_seg.project import CycIFProject, create_project, open_project, is_project_dir
 from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
@@ -29,6 +29,9 @@ from cycif_seg.model.rf_pixel import train_rf, predict_proba_tiled
 class CycIFMVPWidget(QtWidgets.QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
+        # Name for the single multichannel image layer used when 'Display selected channels only' is OFF.
+        # Using a single layer (channel_axis) is much faster than one layer per channel for large OME-TIFFs.
+        self._all_channels_layer_name = "All Channels"
         self.viewer = viewer
 
         self.img = None            # (Y,X,C) float32
@@ -50,6 +53,12 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self._prob_layers = {}
         self._scribbles_layer_name = "Scribbles (0=unlabeled,1=nuc,2=nuc_boundary,3=bg)"
         self._nuclei_edit_layer_name = "Nuclei (edit)"
+
+        # Step 2b edit tracking (for training models B/C)
+        # Snapshot of labels before user edits (typically the Step 2a instance labels).
+        self._nuclei_edit_base: np.ndarray | None = None  # (H,W) int32
+        # Pending action for the Shapes layer (auto-applies when a new shape is added)
+        self._nuclei_edit_action: str | None = None  # None | 'split' | 'merge'
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -79,13 +88,9 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         tab1_layout = QtWidgets.QVBoxLayout(tab1)
 
         file_row = QtWidgets.QHBoxLayout()
-        self.btn_load = QtWidgets.QPushButton("Load TIFF/OME-TIFF…")
         self.btn_merge_cycles = QtWidgets.QPushButton("Merge/Register cycles (beta)…")
-        self.lbl_file = QtWidgets.QLabel("(no file loaded)")
-        self.lbl_file.setWordWrap(True)
-        file_row.addWidget(self.btn_load)
         file_row.addWidget(self.btn_merge_cycles)
-        file_row.addWidget(self.lbl_file, 1)
+        file_row.addStretch(1)
         tab1_layout.addLayout(file_row)
 
         tab1_layout.addWidget(
@@ -103,10 +108,18 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         tab2a = QtWidgets.QWidget()
         tab2a_layout = QtWidgets.QVBoxLayout(tab2a)
 
+        # Load image for nuclei segmentation
+        file_row = QtWidgets.QHBoxLayout()
+        self.btn_load = QtWidgets.QPushButton("Load TIFF/OME-TIFF…")
+        self.lbl_file = QtWidgets.QLabel("(no file loaded)")
+        self.lbl_file.setWordWrap(True)
+        file_row.addWidget(self.btn_load)
+        file_row.addWidget(self.lbl_file, 1)
+        tab2a_layout.addLayout(file_row)
+
         header_row = QtWidgets.QHBoxLayout()
         header_row.addWidget(QtWidgets.QLabel("Channels used for RF training:"))
-        self.chk_display_selected_only = QtWidgets.QCheckBox("Display selected channels only")
-        header_row.addWidget(self.chk_display_selected_only)
+        # For large OME-TIFFs, default to showing only selected channels.
         tab2a_layout.addLayout(header_row)
 
         self.list_channels = QtWidgets.QListWidget()
@@ -116,8 +129,13 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         ch_btn_row = QtWidgets.QHBoxLayout()
         self.btn_all = QtWidgets.QPushButton("Select all")
         self.btn_none = QtWidgets.QPushButton("Select none")
+        # When "Display selected channels only" is enabled, changing the checklist can be slow
+        # for large OME-TIFFs. Users can queue selection changes and apply them explicitly.
+        self.btn_apply_channels = QtWidgets.QPushButton("Update displayed channels")
+        self.btn_apply_channels.setEnabled(False)
         ch_btn_row.addWidget(self.btn_all)
         ch_btn_row.addWidget(self.btn_none)
+        ch_btn_row.addWidget(self.btn_apply_channels)
         tab2a_layout.addLayout(ch_btn_row)
 
         tab2a_layout.addWidget(
@@ -187,10 +205,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         edit_row = QtWidgets.QHBoxLayout()
         self.btn_make_nuclei_edit = QtWidgets.QPushButton("Make/Select editable nuclei")
-        self.btn_new_nucleus_id = QtWidgets.QPushButton("New nucleus id")
         self.btn_propagate_nuclei_edits = QtWidgets.QPushButton("Propagate edits (RF)")
         edit_row.addWidget(self.btn_make_nuclei_edit)
-        edit_row.addWidget(self.btn_new_nucleus_id)
         edit_row.addWidget(self.btn_propagate_nuclei_edits)
         tab2b_layout.addLayout(edit_row)
 
@@ -209,12 +225,6 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         tab2b_layout.addLayout(tools_row)
 
         params_row = QtWidgets.QHBoxLayout()
-        params_row.addWidget(QtWidgets.QLabel("Cut width"))
-        self.spin_cut_width = QtWidgets.QSpinBox()
-        self.spin_cut_width.setRange(1, 50)
-        self.spin_cut_width.setValue(5)
-        params_row.addWidget(self.spin_cut_width)
-        params_row.addSpacing(12)
         params_row.addWidget(QtWidgets.QLabel("Erode iters"))
         self.spin_erode_iters = QtWidgets.QSpinBox()
         self.spin_erode_iters.setRange(1, 50)
@@ -293,15 +303,21 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.tabs.currentChanged.connect(lambda _idx: self._mark_project_dirty())
         self.btn_all.clicked.connect(lambda: self.set_all_channels(True))
         self.btn_none.clicked.connect(lambda: self.set_all_channels(False))
+        self.btn_apply_channels.clicked.connect(self.on_apply_channel_selection)
         self.btn_train.clicked.connect(self.on_train_predict)
         self.btn_nuclei.clicked.connect(self.on_generate_nuclei)
         self.btn_make_nuclei_edit.clicked.connect(self.on_make_nuclei_edit_layer)
-        self.btn_new_nucleus_id.clicked.connect(self.on_new_nucleus_id)
         self.btn_propagate_nuclei_edits.clicked.connect(self.on_propagate_nuclei_edits)
+
+        # Step 2b edit tools
+        self.btn_split_cut.clicked.connect(self.on_set_split_draw_mode)
+        self.btn_merge_lasso.clicked.connect(self.on_set_merge_draw_mode)
+        self.btn_delete_nucleus.clicked.connect(self.on_delete_nucleus)
+        self.btn_draw_new_nucleus.clicked.connect(self.on_set_draw_new_nucleus_mode)
+        self.btn_erase_nucleus.clicked.connect(self.on_set_eraser_mode)
 
         # Edit interaction buttons
         self.slider_alpha.valueChanged.connect(self.on_alpha_change)
-        self.chk_display_selected_only.stateChanged.connect(self.sync_displayed_channel_layers)
         self.list_channels.itemChanged.connect(lambda _: self.on_channel_selection_changed())
 
         # Guard against closing with unsaved project changes
@@ -383,11 +399,6 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         """Capture UI/layer state for project reload."""
         state: dict = {}
         # Channels UI
-        try:
-            state["display_selected_only"] = bool(self.chk_display_selected_only.isChecked())
-        except Exception:
-            state["display_selected_only"] = False
-
         selected = []
         try:
             for i in range(self.list_channels.count()):
@@ -397,6 +408,13 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         except Exception:
             pass
         state["selected_channels"] = selected
+
+        # Which channels are currently displayed (can differ from selected channels if the
+        # user has queued changes but not applied them yet).
+        try:
+            state["displayed_channel_indices"] = list(getattr(self, "_displayed_channel_indices", []) or [])
+        except Exception:
+            state["displayed_channel_indices"] = []
 
         # Which file is currently loaded
         if self.path:
@@ -521,9 +539,6 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
             try:
                 disp = bool(restore.get("display_selected_only", False))
-                self.chk_display_selected_only.blockSignals(True)
-                self.chk_display_selected_only.setChecked(disp)
-                self.chk_display_selected_only.blockSignals(False)
             except Exception:
                 pass
 
@@ -543,10 +558,54 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                     except Exception:
                         pass
 
+
+            # Restore displayed channels.
+            # If not present (older projects), fall back to selection-driven sync.
             try:
-                self.sync_displayed_channel_layers()
+                disp_idx = restore.get("displayed_channel_indices", None)
+                if disp_idx is not None and isinstance(disp_idx, (list, tuple)):
+                    disp_set = set(int(x) for x in disp_idx)
+
+                    # Temporarily set checks to match what was displayed, sync, then restore checks.
+                    try:
+                        self.list_channels.blockSignals(True)
+                        original_checks = [self.list_channels.item(i).checkState() for i in range(self.list_channels.count())]
+                        for i in range(self.list_channels.count()):
+                            it = self.list_channels.item(i)
+                            if it is None:
+                                continue
+                            it.setCheckState(QtCore.Qt.Checked if i in disp_set else QtCore.Qt.Unchecked)
+                    finally:
+                        try:
+                            self.list_channels.blockSignals(False)
+                        except Exception:
+                            pass
+
+                    self.sync_displayed_channel_layers()
+
+                    # Restore original selection checks (may differ from displayed)
+                    try:
+                        self.list_channels.blockSignals(True)
+                        for i in range(self.list_channels.count()):
+                            it = self.list_channels.item(i)
+                            if it is None:
+                                continue
+                            it.setCheckState(original_checks[i])
+                    finally:
+                        try:
+                            self.list_channels.blockSignals(False)
+                        except Exception:
+                            pass
+
+                    self._update_apply_channels_button_state()
+                else:
+                    self.sync_displayed_channel_layers()
             except Exception:
-                pass
+                try:
+                    self.sync_displayed_channel_layers()
+                except Exception:
+                    pass
+
 
             # Restore saved layer arrays (scribbles/prob/nuclei)
             try:
@@ -959,61 +1018,296 @@ class CycIFMVPWidget(QtWidgets.QWidget):
     def _channel_layer_names(self) -> set[str]:
         return set(self.ch_names or [])
 
+
     def sync_displayed_channel_layers(self):
-        """
-        If 'Display selected channels only' is checked, remove non-selected channel layers
-        from the napari layer list. If unchecked, ensure all channel layers are present.
-        Scribbles and probability layers are preserved.
+        """Synchronize displayed channel layers with the current channel selection.
+
+        Large-file friendly behavior (simplified):
+        - The viewer always displays ONLY the channels that are currently checked,
+          and only after the user clicks **Update displayed channels**.
+        - This function is used when loading an image/project to materialize the
+          initial displayed channel set (defaults to channel 0 if none selected).
         """
         if self.img is None or self.ch_names is None:
             return
 
-        selected = set(self.get_selected_channels())
-        display_selected_only = self.chk_display_selected_only.isChecked()
+        selected = list(self.get_selected_channels())
+        if not selected:
+            selected = [0]
+            try:
+                self.list_channels.blockSignals(True)
+                if self.list_channels.count() > 0:
+                    self.list_channels.item(0).setCheckState(QtCore.Qt.Checked)
+            finally:
+                self.list_channels.blockSignals(False)
 
-        # Determine which channel indices should be displayed
-        if display_selected_only:
-            should_display = {i for i in selected}
-        else:
-            should_display = set(range(len(self.ch_names)))
+        # Apply immediately (used on initial load/restore). For interactive changes,
+        # users will click "Update displayed channels".
+        self._apply_selected_channels_now(selected)
 
-        # Remove channel layers that should NOT be displayed
-        for i, nm in enumerate(self.ch_names):
-            if nm in self.viewer.layers and i not in should_display:
-                self.viewer.layers.remove(nm)
+    def _apply_selected_channels_now(self, indices: list[int]) -> None:
+            """Immediate (synchronous) apply of selected channels. Use for small updates."""
+            if self.img is None or self.ch_names is None:
+                return
 
-        # Add missing channel layers that SHOULD be displayed
-        for i in sorted(should_display):
-            nm = self.ch_names[i]
-            if nm not in self.viewer.layers:
-                self.viewer.add_image(
-                    self.img[..., i],
-                    name=nm,
-                    blending="additive",
-                    opacity=0.6,
-                    colormap=self._colormap_for_channel(i),
-                )
+            indices = sorted(set(int(i) for i in indices))
+            should_display = set(indices)
+
+            # Remove non-selected channel layers
+            for i, nm in enumerate(self.ch_names):
+                if nm in self.viewer.layers and i not in should_display:
+                    try:
+                        self.viewer.layers.remove(nm)
+                    except Exception:
+                        pass
+
+            # Add missing selected layers
+            for i in indices:
+                nm = self.ch_names[i]
+                if nm not in self.viewer.layers:
+                    self.viewer.add_image(
+                        self.img[..., i],
+                        name=nm,
+                        blending="additive",
+                        opacity=0.6,
+                        colormap=self._colormap_for_channel(i),
+                    )
+                    try:
+                        self._connect_layer_dirty(self.viewer.layers[nm])
+                    except Exception:
+                        pass
+
+            # Keep scribbles on top
+            if self._scribbles_layer_name not in self.viewer.layers:
+                self.ensure_scribbles_layer()
+            else:
+                lyr = self.viewer.layers[self._scribbles_layer_name]
                 try:
-                    self._connect_layer_dirty(self.viewer.layers[nm])
+                    self.viewer.layers.remove(self._scribbles_layer_name)
+                    self.viewer.layers.append(lyr)
                 except Exception:
                     pass
 
-        # Keep scribbles on top (re-add if needed)
-        if self._scribbles_layer_name not in self.viewer.layers:
-            self.ensure_scribbles_layer()
-        else:
-            # Move to top for painting convenience
-            lyr = self.viewer.layers[self._scribbles_layer_name]
-            self.viewer.layers.remove(self._scribbles_layer_name)
-            self.viewer.layers.append(lyr)
+            self._displayed_channel_indices = indices
+            self._update_apply_channels_button_state()
+
+
+    def _remove_all_channels_layer(self) -> None:
+        """Remove any previously-created "All Channels" stack layer.
+
+        We previously supported an "all channels" browsing mode that created a
+        single stack layer (often named "All Channels"). Even though the current
+        UI no longer exposes that mode, we defensively remove any such layer here
+        to prevent it from lingering and confusing users.
+        """
+        base = getattr(self, "_all_channels_layer_name", "All Channels")
+        # Napari may auto-suffix layer names to avoid collisions (e.g. "All Channels [1]").
+        to_remove = [
+            lyr
+            for lyr in list(self.viewer.layers)
+            if isinstance(getattr(lyr, "name", None), str) and getattr(lyr, "name").startswith(base)
+        ]
+        for lyr in to_remove:
+            try:
+                self.viewer.layers.remove(lyr)
+            except Exception:
+                try:
+                    self.viewer.layers.remove(getattr(lyr, "name", ""))
+                except Exception:
+                    pass
+
+    def _apply_selected_channels_incremental(self, indices: list[int], *, done_cb=None) -> None:
+            """Show only the selected per-channel layers, without blocking the UI.
+
+            Strategy:
+            - Remove (hide) the "all channels" stack layer.
+            - Reuse any already-created per-channel layers by toggling visibility.
+            - Only create layers that are missing, one per event-loop tick.
+            """
+            if self.img is None or self.ch_names is None:
+                if done_cb:
+                    done_cb()
+                return
+
+            # Ensure the stack layer is removed/hidden.
+            self._remove_all_channels_layer()
+
+            indices = sorted(set(int(i) for i in indices))
+            should_display = set(indices)
+
+            # Remove any previously displayed per-channel layers that are no longer selected.
+            # This keeps the napari layer list clean and avoids confusion.
+            for i, nm in enumerate(list(self.ch_names)):
+                if nm in self.viewer.layers and i not in should_display:
+                    try:
+                        self.viewer.layers.remove(nm)
+                    except Exception:
+                        # If removal fails for any reason, fall back to hiding.
+                        try:
+                            self.viewer.layers[nm].visible = False
+                        except Exception:
+                            pass
+
+            # Fast path: toggle visibility for any already-existing per-channel layers.
+            for i, nm in enumerate(list(self.ch_names)):
+                if nm in self.viewer.layers:
+                    try:
+                        self.viewer.layers[nm].visible = (i in should_display)
+                    except Exception:
+                        pass
+
+            # Compute which selected layers need to be created.
+            to_add = [i for i in indices if self.ch_names[i] not in self.viewer.layers]
+
+            # Configure determinate progress for layer creation only.
+            try:
+                if getattr(self, "prog", None) is not None:
+                    self.prog.setVisible(True)
+                    self.prog.setRange(0, max(1, len(to_add)))
+                    self.prog.setValue(0)
+                    QtWidgets.QApplication.processEvents()
+            except Exception:
+                pass
+
+            def _finish():
+                # Keep scribbles on top
+                if self._scribbles_layer_name not in self.viewer.layers:
+                    self.ensure_scribbles_layer()
+                else:
+                    try:
+                        lyr = self.viewer.layers[self._scribbles_layer_name]
+                        self.viewer.layers.remove(self._scribbles_layer_name)
+                        self.viewer.layers.append(lyr)
+                    except Exception:
+                        pass
+
+                self._displayed_channel_indices = indices
+                self._update_apply_channels_button_state()
+                if done_cb:
+                    done_cb()
+
+            if not to_add:
+                _finish()
+                return
+
+            def _add_next(k: int):
+                if k >= len(to_add):
+                    _finish()
+                    return
+
+                i = to_add[k]
+                nm = self.ch_names[i]
+
+                # Update progress before add_image so the user sees movement.
+                try:
+                    if getattr(self, "prog", None) is not None and self.prog.isVisible():
+                        self.prog.setValue(min(k, self.prog.maximum()))
+                        QtWidgets.QApplication.processEvents()
+                except Exception:
+                    pass
+
+                try:
+                    self.viewer.add_image(
+                        self.img[..., i],
+                        name=nm,
+                        blending="additive",
+                        opacity=0.6,
+                        colormap=self._colormap_for_channel(i),
+                    )
+                    try:
+                        self._connect_layer_dirty(self.viewer.layers[nm])
+                    except Exception:
+                        pass
+                    try:
+                        self.viewer.layers[nm].visible = True
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        if getattr(self, "prog", None) is not None and self.prog.isVisible():
+                            self.prog.setValue(min(k + 1, self.prog.maximum()))
+                            QtWidgets.QApplication.processEvents()
+                    except Exception:
+                        pass
+                    QtCore.QTimer.singleShot(0, lambda: _add_next(k + 1))
+
+            QtCore.QTimer.singleShot(0, lambda: _add_next(0))
 
     def on_channel_selection_changed(self):
+        """Called when the channel checklist selection changes.
+
+        The viewer does NOT update immediately. Users click 'Update displayed channels'
+        to apply the current selection.
         """
-        Called whenever an item in the channel checklist changes.
-        If display-selected-only mode is enabled, update viewer layers immediately.
+        self._update_apply_channels_button_state()
+        try:
+            if self.project is not None:
+                self.project.mark_dirty()
+                self._update_project_label()
+        except Exception:
+            pass
+
+
+    def _update_apply_channels_button_state(self) -> None:
+        """Enable/disable the 'Update displayed channels' button.
+
+        The button is enabled only when the set of checked channels differs from
+        what is currently displayed.
         """
-        if getattr(self, "chk_display_selected_only", None) and self.chk_display_selected_only.isChecked():
-            self.sync_displayed_channel_layers()
+        try:
+            if not getattr(self, "btn_apply_channels", None):
+                return
+
+            sel = set(self.get_selected_channels())
+            disp = set(getattr(self, "_displayed_channel_indices", []) or [])
+            self.btn_apply_channels.setEnabled(sel != disp)
+        except Exception:
+            try:
+                self.btn_apply_channels.setEnabled(False)
+            except Exception:
+                pass
+
+
+    def on_apply_channel_selection(self) -> None:
+        """Apply channel selection to the viewer when in 'selected-only' mode."""
+        if self.img is None or self.ch_names is None:
+            return
+            return
+
+        target = self.get_selected_channels()
+        if not target:
+            target = [0]
+
+        # Updating the displayed channels can be expensive on very large OME-TIFFs.
+        # Show an indeterminate progress bar + status so users know what they're waiting for.
+        self.set_status("Updating displayed channels…")
+        self.prog.setVisible(True)
+        self.prog.setRange(0, 0)  # indeterminate/busy
+        self.prog.setValue(0)
+        try:
+            self.btn_apply_channels.setEnabled(False)
+        except Exception:
+            pass
+
+        def _done():
+            try:
+                self._mark_project_dirty()
+                self.set_status("Displayed channels updated.")
+            finally:
+                self.prog.setRange(0, 1)
+                self.prog.setValue(1)
+                try:
+                    self._update_apply_channels_button_state()
+                except Exception:
+                    pass
+                try:
+                    self.btn_apply_channels.setEnabled(True)
+                except Exception:
+                    pass
+
+        # Apply incrementally so the UI stays responsive and the busy indicator animates.
+        self._apply_selected_channels_incremental(target, done_cb=_done)
+
 
 
     def _colormap_for_channel(self, i: int) -> str:
@@ -1120,7 +1414,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 pass
 
         # Load in a background thread so the UI stays responsive.
-        self.set_status("Loading image (background)…")
+        self.set_status("Loading image…")
+        self.prog.setVisible(True)
         self.prog.setRange(0, 0)  # indeterminate/busy
         self.prog.setValue(0)
         try:
@@ -1130,7 +1425,20 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         @thread_worker
         def _load_worker(p):
-            return load_multichannel_tiff(p)
+            # Prefer lazy loading for very large OME-TIFFs (dask+zarr), but
+            # fall back to eager loading if optional deps are missing.
+            try:
+                img_cyx, names = load_multichannel_tiff_lazy(p)
+                try:
+                    import dask.array as da  # type: ignore
+
+                    img_yxc = da.moveaxis(img_cyx, 0, 2)
+                except Exception:
+                    # Should not happen if lazy loader succeeded, but keep safe.
+                    img_yxc = img_cyx
+                return img_yxc, names
+            except Exception:
+                return load_multichannel_tiff(p)
 
         worker = _load_worker(path)
 
@@ -1138,19 +1446,26 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         def _on_loaded(result):
             self.img, self.ch_names = result
 
-            # Populate channel list with correct names
+            # Populate channel list with correct names.
+            # Default selection: only 1 channel checked to keep large files responsive.
             self.list_channels.blockSignals(True)
             self.list_channels.clear()
-            for nm in self.ch_names:
+            for i, nm in enumerate(self.ch_names):
                 it = QtWidgets.QListWidgetItem(nm)
                 it.setFlags(it.flags() | QtCore.Qt.ItemIsUserCheckable)
-                it.setCheckState(QtCore.Qt.Checked)  # default select all
+                it.setCheckState(QtCore.Qt.Checked if i == 0 else QtCore.Qt.Unchecked)
                 self.list_channels.addItem(it)
             self.list_channels.blockSignals(False)
 
-            # Add named layers
+
+            # Add named layers (only selected channels are shown by default)
             self._prob_layers = {}
-            self._add_channel_layers()
+
+            # Reset viewer layers for the new image
+            try:
+                self.viewer.layers.clear()
+            except Exception:
+                pass
             self.sync_displayed_channel_layers()
 
             # If opening a project that requested restore, apply it now
@@ -1505,6 +1820,11 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         nuc = np.asarray(nuc_layer.data).astype(np.int32, copy=False)
         edit = nuc.copy()
+
+        # Snapshot "pre-edit" labels so we can later infer what changed.
+        # This enables deciding whether to train model B and/or model C.
+        self._nuclei_edit_base = nuc.copy()
+
         layer = self._set_or_update_labels_layer(self._nuclei_edit_layer_name, edit, opacity=0.7, visible=True)
 
         # Make it convenient to edit
@@ -1539,9 +1859,29 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 edge_width=2,
             )
             shapes.visible = True
+
+            # Auto-apply split/merge when the user finishes drawing a shape.
+            # This keeps the workflow fast and gives immediate visual feedback.
+            try:
+                shapes.events.data.connect(self._on_nuclei_edit_shapes_changed)
+            except Exception:
+                pass
+
             return shapes
         except Exception:
             return None
+
+    def _on_nuclei_edit_shapes_changed(self, event=None):
+        """Auto-apply pending split/merge action after a new shape is drawn."""
+        try:
+            action = self._nuclei_edit_action
+            if action == "split":
+                self.on_split_by_cut_line()
+            elif action == "merge":
+                self.on_merge_by_lasso()
+        except Exception:
+            # Never crash the UI from an event hook
+            pass
 
     def _get_nuclei_edit_layer_or_warn(self):
         layer = self._get_labels_layer(self._nuclei_edit_layer_name)
@@ -1576,6 +1916,120 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 self.viewer.layers[self._nuclei_edit_shapes_layer_name].data = []
             except Exception:
                 pass
+        # Reset pending action after applying
+        self._nuclei_edit_action = None
+
+    
+    def _set_active_label_fresh(self, labels_layer):
+        """Select a fresh (unused) nucleus id for painting new labels."""
+        try:
+            data = np.asarray(labels_layer.data)
+            next_id = int(data.max()) + 1 if data.size else 1
+        except Exception:
+            next_id = 1
+        try:
+            labels_layer.selected_label = int(next_id)
+        except Exception:
+            pass
+        return int(next_id)
+
+    def _apply_delete_label_id(self, labels_layer, label_id: int):
+        """Delete all pixels belonging to a given nucleus label id."""
+        try:
+            label_id = int(label_id)
+        except Exception:
+            return
+        if label_id <= 0:
+            return
+        data = np.asarray(labels_layer.data)
+        if data.size == 0:
+            return
+        if not np.any(data == label_id):
+            return
+        new_data = data.copy()
+        new_data[new_data == label_id] = 0
+        try:
+            labels_layer.data = new_data
+            # Some napari versions need an explicit refresh for immediate repaint
+            try:
+                labels_layer.refresh()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _enable_delete_click_mode(self, labels_layer):
+        """Enable click-to-delete for nuclei labels."""
+        self._delete_click_mode_active = True
+
+        # Define the callback once so we can remove it later.
+        if not hasattr(self, "_delete_click_callback") or self._delete_click_callback is None:
+            def _delete_click_callback(layer, event):
+                # Only act on mouse press (single click).
+                try:
+                    if getattr(event, "type", None) != "mouse_press":
+                        yield
+                        return
+                    # Try to read label under cursor (world coords).
+                    val = None
+                    try:
+                        val = layer.get_value(event.position, world=True)
+                    except Exception:
+                        try:
+                            val = layer.get_value(event.position)
+                        except Exception:
+                            val = None
+                    if val is None:
+                        yield
+                        return
+                    lbl = int(val)
+                    if lbl > 0:
+                        self._apply_delete_label_id(layer, lbl)
+                except Exception:
+                    # Never crash UI due to a callback
+                    pass
+                yield
+
+            self._delete_click_callback = _delete_click_callback
+
+        try:
+            cbs = getattr(labels_layer, "mouse_drag_callbacks", None)
+            if cbs is not None and self._delete_click_callback not in cbs:
+                cbs.append(self._delete_click_callback)
+        except Exception:
+            pass
+
+        # Put the labels layer in a mode that doesn't paint.
+        try:
+            self.viewer.layers.selection.active = labels_layer
+        except Exception:
+            pass
+        try:
+            # 'pick' exists on Labels layers in napari and is ideal for click interactions.
+            labels_layer.mode = "pick"
+        except Exception:
+            try:
+                labels_layer.mode = "pan_zoom"
+            except Exception:
+                pass
+
+    def _disable_delete_click_mode(self, labels_layer):
+        """Disable click-to-delete mode if active."""
+        if not getattr(self, "_delete_click_mode_active", False):
+            return
+        self._delete_click_mode_active = False
+        try:
+            cbs = getattr(labels_layer, "mouse_drag_callbacks", None)
+            if cbs is not None and hasattr(self, "_delete_click_callback") and self._delete_click_callback in cbs:
+                cbs.remove(self._delete_click_callback)
+        except Exception:
+            pass
+        # Restore a neutral mode if we had switched to pick.
+        try:
+            if getattr(labels_layer, "mode", None) == "pick":
+                labels_layer.mode = "pan_zoom"
+        except Exception:
+            pass
 
     def _last_shape_as_mask(self, shape_kind: str, out_shape, *, thickness: int = 3):
         """Rasterize the last drawn shape in the Shapes layer into a boolean mask.
@@ -1624,24 +2078,26 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         shapes = self._ensure_nuclei_edit_shapes_layer()
         if shapes is None:
             return
+        self._nuclei_edit_action = "split"
         try:
             self.viewer.layers.selection.active = shapes
             shapes.mode = "add_path"
         except Exception:
             pass
-        self.set_status("Draw a cut line on the 'Nuclei edit shapes' layer, then click 'Split by cut line'.")
+        self.set_status("Draw a cut line on the 'Nuclei edit shapes' layer (release mouse to finish).")
 
     def on_split_by_cut_line(self):
         """Split a nucleus by removing a drawn cut line and relabeling connected components."""
         layer = self._get_nuclei_edit_layer_or_warn()
         if layer is None:
             return
+        self._disable_delete_click_mode(layer)
 
         data = np.asarray(layer.data).astype(np.int32, copy=False)
         H, W = data.shape
 
-        cut_w = int(self.spin_cut_width.value())
-        cut = self._last_shape_as_mask("line", (H, W), thickness=max(1, cut_w))
+        cut_w = 1  # fixed cut width for split
+        cut = self._last_shape_as_mask("line", (H, W), thickness=1)
         if cut is None:
             return
 
@@ -1688,18 +2144,20 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         shapes = self._ensure_nuclei_edit_shapes_layer()
         if shapes is None:
             return
+        self._nuclei_edit_action = "merge"
         try:
             self.viewer.layers.selection.active = shapes
             shapes.mode = "add_polygon"
         except Exception:
             pass
-        self.set_status("Draw a lasso polygon on 'Nuclei edit shapes', then click 'Merge by lasso'.")
+        self.set_status("Draw a lasso polygon on 'Nuclei edit shapes' (release mouse to finish).")
 
     def on_merge_by_lasso(self):
         """Merge all nuclei whose labels intersect the drawn lasso polygon."""
         layer = self._get_nuclei_edit_layer_or_warn()
         if layer is None:
             return
+        self._disable_delete_click_mode(layer)
 
         data = np.asarray(layer.data).astype(np.int32, copy=False)
         H, W = data.shape
@@ -1725,50 +2183,51 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self._clear_nuclei_edit_shapes()
         self.set_status(f"Merged nuclei {list(map(int, labs))} -> {target}.")
 
+    
     def on_delete_nucleus(self):
-        """Delete the currently selected nucleus label (set to 0)."""
+        """Enable click-to-delete mode: click inside a nucleus to delete the entire label."""
         layer = self._get_nuclei_edit_layer_or_warn()
         if layer is None:
             return
-        sel = self._get_selected_nucleus_id(layer)
-        if sel <= 0:
-            show_warning("Select a nucleus label first (use pick mode or click a label).")
+
+        # toggle off if already active
+        if getattr(self, "_delete_click_mode_active", False):
+            self._disable_delete_click_mode(layer)
+            self.set_status("Delete nucleus mode: off.")
             return
-        data = np.asarray(layer.data).astype(np.int32, copy=False)
-        if not np.any(data == sel):
-            show_warning("Selected nucleus label not present.")
-            return
-        new_data = data.copy()
-        new_data[new_data == sel] = 0
-        layer.data = new_data
-        self.set_status(f"Deleted nucleus {sel}.")
+
+        self._enable_delete_click_mode(layer)
+        self.set_status("Delete nucleus mode: click inside a nucleus to delete it (button again to turn off).")
+
 
     def on_set_draw_new_nucleus_mode(self):
         """Switch to paint mode on the nuclei edit layer, selecting a fresh ID."""
         layer = self._get_nuclei_edit_layer_or_warn()
         if layer is None:
             return
-        self.on_new_nucleus_id()
+        self._disable_delete_click_mode(layer)
+        self._set_active_label_fresh(layer)
         try:
             self.viewer.layers.selection.active = layer
             layer.mode = "paint"
             layer.brush_size = int(self.spin_brush.value())
         except Exception:
             pass
-        self.set_status("Paint a new nucleus region in the 'Nuclei edits' layer.")
+        self.set_status("Paint a new nucleus region in the 'Nuclei (edit)' layer.")
 
     def on_set_eraser_mode(self):
         """Switch to erase mode on the nuclei edit layer."""
         layer = self._get_nuclei_edit_layer_or_warn()
         if layer is None:
             return
+        self._disable_delete_click_mode(layer)
         try:
             self.viewer.layers.selection.active = layer
             layer.mode = "erase"
             layer.brush_size = int(self.spin_brush.value())
         except Exception:
             pass
-        self.set_status("Erase parts of a nucleus in the 'Nuclei edits' layer.")
+        self.set_status("Erase parts of a nucleus in the 'Nuclei (edit)' layer.")
 
     def on_erode_nucleus(self):
         """Morphologically erode the selected nucleus by N iterations."""
@@ -1799,23 +2258,6 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         layer.data = new_data
         self.set_status(f"Eroded nucleus {sel} ({iters} iters).")
 
-    def on_new_nucleus_id(self):
-        """Set the active label on the nuclei edit layer to a fresh ID."""
-        layer = self._get_labels_layer(self._nuclei_edit_layer_name)
-        if layer is None:
-            self.on_make_nuclei_edit_layer()
-            layer = self._get_labels_layer(self._nuclei_edit_layer_name)
-            if layer is None:
-                return
-
-        data = np.asarray(layer.data)
-        new_id = int(data.max()) + 1
-        try:
-            layer.selected_label = new_id
-        except Exception:
-            pass
-        self.set_status(f"New nucleus id selected: {new_id}")
-
     def on_propagate_nuclei_edits(self):
         """Train a pixel RF from edited nuclei labels (as weak supervision) and update probability maps."""
         layer = self._get_labels_layer(self._nuclei_edit_layer_name)
@@ -1827,6 +2269,37 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         if nuclei_labels.max() <= 0:
             show_warning("Edited nuclei layer appears empty.")
             return
+
+        # Step 2b: decide whether edits imply training model B and/or model C.
+        # For now this is informational (and will drive later milestones), but it is
+        # already useful to users/debugging.
+        base = self._nuclei_edit_base
+        if base is None:
+            nuc0 = self._get_labels_layer("Nuclei")
+            if nuc0 is not None:
+                try:
+                    base = np.asarray(nuc0.data).astype(np.int32, copy=False)
+                except Exception:
+                    base = None
+
+        if base is not None and hasattr(base, "shape") and base.shape == nuclei_labels.shape:
+            diff = (nuclei_labels != base)
+            need_model_b = bool(np.any(diff & (base > 0)))
+            need_model_c = bool(np.any((nuclei_labels > 0) & (base == 0)))
+        else:
+            need_model_b = True
+            need_model_c = True
+
+        # Record for future steps (separate B/C model training)
+        self._need_model_b = need_model_b
+        self._need_model_c = need_model_c
+        self.set_status(
+            "Nuclei edits detected: "
+            + ("Model B" if need_model_b else "(no Model B)")
+            + " + "
+            + ("Model C" if need_model_c else "(no Model C)")
+            + ". Starting RF propagation…"
+        )
 
         # Cancel any in-flight RF work
         self._rf_run_id += 1

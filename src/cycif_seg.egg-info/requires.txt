@@ -1,8 +1,11 @@
 napari[pyqt5]
 numpy
 tifffile
+zarr
+dask[array]
 scikit-image
 scipy
 scikit-learn
 qtpy
+superqt
 ome-types

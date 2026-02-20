@@ -3,6 +3,14 @@ from __future__ import annotations
 import numpy as np
 import tifffile
 
+# Optional lazy-loading stack (recommended for very large OME-TIFFs)
+try:  # pragma: no cover
+    import dask.array as da  # type: ignore
+    import zarr  # type: ignore
+except Exception:  # pragma: no cover
+    da = None
+    zarr = None
+
 # ome-types is nice-to-have, but keep this module usable without it.
 try:
     from ome_types import from_xml  # type: ignore
@@ -155,3 +163,74 @@ def load_multichannel_tiff(path: str) -> tuple[np.ndarray, list[str]]:
         ]
 
     return img, ch_names
+
+
+def _normalize_to_cyx_lazy(arr) -> "da.Array":
+    """Canonicalize a lazy array to (C, Y, X).
+
+    Supported common microscopy TIFF layouts:
+      - (C, Y, X) -> (C, Y, X)
+      - (Y, X, C) -> (C, Y, X)
+    """
+    if da is None:
+        raise RuntimeError(
+            "Lazy loading requires dask and zarr. Install with: pip install dask[array] zarr"
+        )
+    if getattr(arr, "ndim", None) != 3:
+        raise ValueError(f"Expected 3D array. Got shape={getattr(arr, 'shape', None)}")
+
+    shp = tuple(int(x) for x in arr.shape)
+
+    # Heuristic: treat first axis as channel if small.
+    if shp[0] <= 32 and shp[1] > 64 and shp[2] > 64:
+        return arr  # already (C,Y,X)
+
+    # Otherwise, if last axis looks like channels, move it to front.
+    if shp[2] <= 32 and shp[0] > 64 and shp[1] > 64:
+        return da.moveaxis(arr, 2, 0)  # (Y,X,C)->(C,Y,X)
+
+    # Fallback: assume (C,Y,X)
+    return arr
+
+
+def load_multichannel_tiff_lazy(path: str):
+    """Lazy-load a TIFF/OME-TIFF and return (img_cyx, channel_names).
+
+    The returned array is a **lazy** dask array backed by the TIFF on disk.
+    No full image data are loaded into RAM until you compute slices.
+
+    Notes
+    -----
+    - Requires `dask[array]` and `zarr`.
+    - The returned image is canonicalized to (C, Y, X).
+    """
+    if da is None or zarr is None:
+        raise RuntimeError(
+            "Lazy loading requires dask and zarr. Install with: pip install dask[array] zarr"
+        )
+
+    # Use tifffile's Zarr interface for on-demand IO.
+    store = tifffile.imread(path, aszarr=True)
+    z = zarr.open(store, mode="r")
+    arr = da.from_zarr(z)
+    arr_cyx = _normalize_to_cyx_lazy(arr)
+
+    # Channel names from OME metadata (same logic as eager loader)
+    n_channels = int(arr_cyx.shape[0])
+    ch_names = None
+    try:
+        with tifffile.TiffFile(path) as tf:
+            ome_xml = tf.ome_metadata
+        ch_names = _channel_names_from_ome(ome_xml, n_channels)
+    except Exception:
+        ch_names = None
+
+    if not ch_names or len(ch_names) != n_channels:
+        ch_names = [f"Channel {i}" for i in range(n_channels)]
+    else:
+        ch_names = [
+            (nm if nm and nm.strip() else f"Channel {i}")
+            for i, nm in enumerate(ch_names)
+        ]
+
+    return arr_cyx, ch_names
