@@ -16,15 +16,20 @@ class Step1PreprocessPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
 
         file_row = QtWidgets.QHBoxLayout()
-        self.btn_merge_cycles = QtWidgets.QPushButton("Merge/Register cycles (beta)…")
+
+        self.btn_merge_cycles = QtWidgets.QPushButton("Single slide: Merge/Register cycles…")
+        self.btn_batch_merge = QtWidgets.QPushButton("Batch slides…")
+
         file_row.addWidget(self.btn_merge_cycles)
+        file_row.addWidget(self.btn_batch_merge)
         file_row.addStretch(1)
         layout.addLayout(file_row)
 
         layout.addWidget(
             QtWidgets.QLabel(
-                "Preprocessing (Step 1, beta): merge 2+ cycle OME-TIFFs into one co-registered OME-TIFF.\n"
-                "Current MVP does translation-only registration using a chosen nuclear marker (default: DAPI)."
+                "Step 1 (Preprocess): merge 1+ cycle OME-TIFFs into one co-registered OME-TIFF.\n"
+                "Current MVP does translation-only registration using a chosen nuclear marker (default: DAPI).\n"
+                "Single-slide mode records per-slide metadata; batch mode runs the same pipeline over many samples."
             )
         )
 

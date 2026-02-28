@@ -6,6 +6,7 @@ import concurrent.futures as cf
 
 import numpy as np
 from skimage.segmentation import find_boundaries
+from skimage.morphology import dilation, disk
 from napari.qt.threading import thread_worker
 
 from cycif_seg.model.rf_pixel import train_rf
@@ -244,7 +245,8 @@ def predict_rf_worker(
 def propagate_nuclei_edits_worker(
     img,
     use_channels,
-    nuclei_labels,
+    base_labels,
+    edited_labels,
     build_features_fn,
     tile_size,
     center_yx,
@@ -255,54 +257,100 @@ def propagate_nuclei_edits_worker(
     progress_every=10,
     training_budget=200_000,
     seed=0,
+    train_dilate_px=16,
+    is_cancelled=None,
 ):
-    """Train an RF from edited nuclei labels and predict probabilities across the image.
+    """Train an RF from *edited nuclei instance labels* and predict probabilities across the image.
 
-    This is a convenience worker for "learn from edits" workflows:
-    - derives pixel labels from *instance* edits (nucleus / nucleus-boundary / background)
-    - trains an RF on multi-scale features
-    - predicts in tiles (same streaming protocol as predict_rf_worker)
+    Strategy A (Step 2b):
+      - derive sparse pixel labels from the *difference* between base_labels and edited_labels
+      - train an RF on multi-scale features (nucleus / boundary / background)
+      - predict in tiles (same streaming protocol as predict_rf_worker)
 
-    Yields:
-      ("stage", run_id, text, step, total)
-      ("tile", run_id, y0, y1, x0, x1, P_tile)
-      ("progress", run_id, done, total)
+    Notes:
+      - Scribbles are generated only near edited pixels (fast + focused).
+      - Cancellation is controlled by the caller via is_cancelled().
     """
+    if is_cancelled is None:
+        is_cancelled = lambda: False  # noqa: E731
+
     H, W, _ = img.shape
-    if nuclei_labels.shape != (H, W):
-        raise ValueError(f"nuclei_labels has shape {nuclei_labels.shape}, expected {(H, W)}")
+    if base_labels.shape != (H, W):
+        raise ValueError(f"base_labels has shape {getattr(base_labels, 'shape', None)}, expected {(H, W)}")
+    if edited_labels.shape != (H, W):
+        raise ValueError(f"edited_labels has shape {getattr(edited_labels, 'shape', None)}, expected {(H, W)}")
 
-    def is_cancelled():
-        return getattr(thread_worker.current_worker(), "abort_requested", False)
-
-    # ---- Build scribbles from edited instances ----
+    # ---- Build sparse scribbles from edited instances (only near diffs) ----
     yield ("stage", run_id, "Building training labels from edits…", 1, 3)
-    labels = nuclei_labels
-    nuc_mask = labels > 0
-    boundary = find_boundaries(labels, mode="inner")  # bool
+
+    diff = (edited_labels != base_labels)
+    if not np.any(diff):
+        raise ValueError("No edits detected (edited labels match base labels).")
+
+    if int(train_dilate_px) > 0:
+        region = dilation(diff, disk(int(train_dilate_px)))
+    else:
+        region = diff
+
+    # Labels derived from EDITED map inside region; everything else is unlabeled (=0)
     scribbles = np.zeros((H, W), dtype=np.uint8)
-    scribbles[~nuc_mask] = 3  # background
-    scribbles[nuc_mask] = 1   # nucleus
-    scribbles[boundary] = 2   # nucleus boundary (overrides nucleus)
+    ed = edited_labels
+    nuc_mask = (ed > 0)
+    boundary = find_boundaries(ed, mode="inner")  # bool
+
+    # background / nucleus / boundary only within region
+    r = region
+    scribbles[r & (~nuc_mask)] = 3
+    scribbles[r & nuc_mask] = 1
+    scribbles[r & boundary] = 2  # override nucleus
 
     if is_cancelled():
         return
 
-    # ---- Train RF ----
+    # ---- Train RF (sample pixels; avoid dask boolean indexing) ----
     yield ("stage", run_id, "Training RF from edited nuclei…", 2, 3)
+
+    # Collect coords by class for balanced sampling
+    rng = np.random.default_rng(int(seed))
+    coords = []
+    classes = (1, 2, 3)
+    max_total = int(training_budget) if training_budget is not None else None
+    per_class = None
+    if max_total is not None:
+        per_class = max(1, max_total // len(classes))
+
+    for c in classes:
+        ys, xs = np.where(scribbles == c)
+        n = ys.size
+        if n == 0:
+            continue
+        if per_class is not None and n > per_class:
+            sel = rng.choice(n, size=per_class, replace=False)
+            ys = ys[sel]
+            xs = xs[sel]
+        coords.append((ys, xs, c))
+
+    if not coords:
+        raise ValueError("No training pixels found near edits. Try increasing train_dilate_px.")
+
+    ys_all = np.concatenate([c[0] for c in coords], axis=0)
+    xs_all = np.concatenate([c[1] for c in coords], axis=0)
+    y_train = (scribbles[ys_all, xs_all] - 1).astype(np.uint8, copy=False)
+
+    # Build features lazily, then gather sampled pixels via vindex (works with dask)
     X_full = build_features_fn(img, use_channels)
-    train_mask = scribbles > 0
-    X_train = X_full[train_mask].reshape(-1, X_full.shape[-1])
-    y_train = (scribbles[train_mask].reshape(-1) - 1).astype(np.uint8, copy=False)
 
-    # Downsample training set (keep class balance reasonably intact)
-    if training_budget is not None and X_train.shape[0] > int(training_budget):
-        rng = np.random.default_rng(int(seed))
-        idx = rng.choice(X_train.shape[0], size=int(training_budget), replace=False)
-        X_train = X_train[idx]
-        y_train = y_train[idx]
+    try:
+        X_train = X_full.vindex[ys_all, xs_all, :].compute()
+    except Exception:
+        # fallback for non-dask feature arrays
+        X_train = np.asarray(X_full)[ys_all, xs_all, :]
+    X_train = np.asarray(X_train, dtype=np.float32).reshape(-1, X_train.shape[-1])
 
-    rf = train_rf(X_train, y_train, n_jobs=-1)
+    # If training_budget is set but class sampling left us under it, that's fine.
+
+    # train_rf() owns RF hyperparameters (including n_jobs) in cycif_seg.model.rf_pixel
+    rf = train_rf(X_train, y_train)
 
     yield (
         "trained_model",
@@ -313,6 +361,7 @@ def propagate_nuclei_edits_worker(
             "use_channels": list(use_channels),
             "training_budget": int(training_budget) if training_budget is not None else None,
             "seed": int(seed),
+            "train_dilate_px": int(train_dilate_px),
         },
     )
 
@@ -322,7 +371,8 @@ def propagate_nuclei_edits_worker(
     # ---- Predict in tiles (pipeline matches predict_rf_worker) ----
     yield ("stage", run_id, "Predicting tiles…", 3, 3)
 
-    tiles = list(generate_tiles((H, W), tile_size=tile_size, center_yx=center_yx))
+    tiles = list(generate_tiles(H, W, tile_size))
+    tiles = sort_tiles_by_point(tiles, center_yx)
     n_tiles = len(tiles)
 
     if feature_workers is None:
@@ -334,9 +384,12 @@ def propagate_nuclei_edits_worker(
     n_feature_tiles = 0
     n_predict_tiles = 0
 
+    F = int(X_full.shape[-1])
+
     def build_one(y0, y1, x0, x1):
         t0 = time.time()
-        X_tile = X_full[y0:y1, x0:x1, :].reshape(-1, X_full.shape[-1])
+        # ensure numpy tile
+        X_tile = np.asarray(X_full[y0:y1, x0:x1, :], dtype=np.float32).reshape(-1, F)
         dt = time.time() - t0
         return (y0, y1, x0, x1, X_tile, dt)
 
@@ -351,8 +404,7 @@ def propagate_nuclei_edits_worker(
         return Pt_all
 
     i = 0
-    with cf.ThreadPoolExecutor(max_workers=feature_workers) as ex:
-        # Submit all tiles
+    with cf.ThreadPoolExecutor(max_workers=int(feature_workers)) as ex:
         futures = [ex.submit(build_one, y0, y1, x0, x1) for (y0, y1, x0, x1) in tiles]
 
         batch_items = []
@@ -377,12 +429,11 @@ def propagate_nuclei_edits_worker(
                 offset += n
                 i += 1
                 yield ("tile", run_id, yy0, yy1, xx0, xx1, P_tile)
-                if (i % progress_every) == 0 or i == n_tiles:
+                if (i % int(progress_every)) == 0 or i == n_tiles:
                     yield ("progress", run_id, i, n_tiles)
 
             batch_items = []
 
-        # flush remainder
         if batch_items and not is_cancelled():
             Pt_all = predict_many(batch_items)
             offset = 0
@@ -395,10 +446,10 @@ def propagate_nuclei_edits_worker(
                 offset += n
                 i += 1
                 yield ("tile", run_id, yy0, yy1, xx0, xx1, P_tile)
-                if (i % progress_every) == 0 or i == n_tiles:
+                if (i % int(progress_every)) == 0 or i == n_tiles:
                     yield ("progress", run_id, i, n_tiles)
 
-    # ---- Timing summary ----
+    # Timing summary (optional)
     try:
         if n_feature_tiles > 0:
             print(
@@ -408,7 +459,7 @@ def propagate_nuclei_edits_worker(
         if n_predict_tiles > 0:
             print(
                 f"[TIMING][edits] Predict: total={t_predict_total:.2f}s "
-                f"avg_per_tile={t_predict_total/n_predict_tiles:.4f}s"
+                f"avg_per_batch={t_predict_total/n_predict_tiles:.4f}s"
             )
     except Exception:
         pass

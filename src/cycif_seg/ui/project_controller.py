@@ -197,6 +197,14 @@ class ProjectController:
             np.save(p, arr)
             return prj.relpath(p)
 
+        def _save_pkl(name: str, obj: Any) -> str:
+            fn = f"{name}.pkl".replace(" ", "_").replace("/", "_")
+            p = prj.data_dir / fn
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "wb") as f:
+                pickle.dump(obj, f)
+            return prj.relpath(p)
+
         # Scribbles
         try:
             if w._scribbles_layer_name in w.viewer.layers:
@@ -230,6 +238,57 @@ class ProjectController:
                 saved_any = True
             except Exception:
                 pass
+
+        # --- Step 2b: nuclei edit layers / previews ---
+        # Labels: Nuclei (edit)
+        try:
+            nm = getattr(w, "_nuclei_edit_layer_name", "Nuclei (edit)")
+            if nm in w.viewer.layers:
+                arr = np.asarray(w.viewer.layers[nm].data).astype(np.int32, copy=False)
+                out["nuclei_edit"] = {"name": nm, "path": _save_npy("nuclei_edit", arr)}
+                saved_any = True
+        except Exception:
+            pass
+
+        # Labels: Nuclei (draw preview)
+        try:
+            nm = getattr(w, "_nuclei_draw_preview_layer_name", "Nuclei (draw preview)")
+            if nm in w.viewer.layers:
+                arr = np.asarray(w.viewer.layers[nm].data).astype(np.int32, copy=False)
+                out["nuclei_draw_preview"] = {"name": nm, "path": _save_npy("nuclei_draw_preview", arr)}
+                saved_any = True
+        except Exception:
+            pass
+
+        # Base snapshot used for propagation
+        try:
+            base = getattr(w, "_nuclei_edit_base", None)
+            if base is not None and hasattr(base, "shape"):
+                arr = np.asarray(base).astype(np.int32, copy=False)
+                out["nuclei_edit_base"] = {"name": "_nuclei_edit_base", "path": _save_npy("nuclei_edit_base", arr)}
+                saved_any = True
+        except Exception:
+            pass
+
+        # Shapes: Nuclei edit shapes
+        try:
+            nm = getattr(w, "_nuclei_edit_shapes_layer_name", "Nuclei edit shapes")
+            if nm in w.viewer.layers:
+                data = list(getattr(w.viewer.layers[nm], "data", []) or [])
+                out["nuclei_edit_shapes"] = {"name": nm, "path": _save_pkl("nuclei_edit_shapes", data)}
+                saved_any = True
+        except Exception:
+            pass
+
+        # Shapes: Nuclei (line preview)
+        try:
+            nm = "Nuclei (line preview)"
+            if nm in w.viewer.layers:
+                data = list(getattr(w.viewer.layers[nm], "data", []) or [])
+                out["nuclei_line_preview"] = {"name": nm, "path": _save_pkl("nuclei_line_preview", data)}
+                saved_any = True
+        except Exception:
+            pass
 
         if saved_any:
             prj.mark_dirty()
@@ -358,6 +417,118 @@ class ProjectController:
                                     if p.exists():
                                         arr = np.load(p, allow_pickle=False).astype(np.int32, copy=False)
                                         w.layers.set_or_update_labels("Nuclei", arr)
+                        except Exception:
+                            pass
+
+                        # --- Step 2b restore ---
+                        # Nuclei (edit)
+                        try:
+                            rec = layers.get("nuclei_edit")
+                            if isinstance(rec, dict):
+                                relp = rec.get("path")
+                                nm = rec.get("name") or getattr(w, "_nuclei_edit_layer_name", "Nuclei (edit)")
+                                if relp:
+                                    p = prj.abspath(relp)
+                                    if p.exists():
+                                        arr = np.load(p, allow_pickle=False).astype(np.int32, copy=False)
+                                        w.layers.set_or_update_labels(str(nm), arr)
+                        except Exception:
+                            pass
+
+                        # Nuclei (draw preview)
+                        try:
+                            rec = layers.get("nuclei_draw_preview")
+                            if isinstance(rec, dict):
+                                relp = rec.get("path")
+                                nm = rec.get("name") or getattr(w, "_nuclei_draw_preview_layer_name", "Nuclei (draw preview)")
+                                if relp:
+                                    p = prj.abspath(relp)
+                                    if p.exists():
+                                        arr = np.load(p, allow_pickle=False).astype(np.int32, copy=False)
+                                        w.layers.set_or_update_labels(str(nm), arr)
+                                        try:
+                                            w.viewer.layers[str(nm)].editable = False
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+
+                        # Base snapshot
+                        try:
+                            rec = layers.get("nuclei_edit_base")
+                            if isinstance(rec, dict):
+                                relp = rec.get("path")
+                                if relp:
+                                    p = prj.abspath(relp)
+                                    if p.exists():
+                                        arr = np.load(p, allow_pickle=False).astype(np.int32, copy=False)
+                                        w._nuclei_edit_base = arr
+                        except Exception:
+                            pass
+
+                        # Shapes helpers (edit shapes + line preview)
+                        def _ensure_shapes_layer(name: str, *, kind: str = "generic"):
+                            if name in w.viewer.layers:
+                                return w.viewer.layers[name]
+                            prev_active = None
+                            try:
+                                prev_active = getattr(w.viewer.layers.selection, "active", None)
+                            except Exception:
+                                prev_active = None
+                            try:
+                                if kind == "line_preview":
+                                    lyr = w.viewer.add_shapes(
+                                        name=name,
+                                        shape_type="path",
+                                        edge_width=2,
+                                        face_color="transparent",
+                                    )
+                                else:
+                                    # Match main_widget's nuclei edit shapes layer creation
+                                    lyr = w.viewer.add_shapes(name=name, opacity=0.9, edge_width=2)
+                                return lyr
+                            finally:
+                                try:
+                                    if prev_active is not None:
+                                        w.viewer.layers.selection.active = prev_active
+                                except Exception:
+                                    pass
+
+                        # Nuclei edit shapes
+                        try:
+                            rec = layers.get("nuclei_edit_shapes")
+                            if isinstance(rec, dict):
+                                relp = rec.get("path")
+                                nm = rec.get("name") or getattr(w, "_nuclei_edit_shapes_layer_name", "Nuclei edit shapes")
+                                if relp:
+                                    p = prj.abspath(relp)
+                                    if p.exists():
+                                        with open(p, "rb") as f:
+                                            data = pickle.load(f)
+                                        lyr = _ensure_shapes_layer(str(nm), kind="generic")
+                                        try:
+                                            lyr.data = data
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            pass
+
+                        # Nuclei (line preview)
+                        try:
+                            rec = layers.get("nuclei_line_preview")
+                            if isinstance(rec, dict):
+                                relp = rec.get("path")
+                                nm = rec.get("name") or "Nuclei (line preview)"
+                                if relp:
+                                    p = prj.abspath(relp)
+                                    if p.exists():
+                                        with open(p, "rb") as f:
+                                            data = pickle.load(f)
+                                        lyr = _ensure_shapes_layer(str(nm), kind="line_preview")
+                                        try:
+                                            lyr.data = data
+                                        except Exception:
+                                            pass
                         except Exception:
                             pass
             except Exception:

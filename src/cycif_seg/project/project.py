@@ -91,6 +91,46 @@ class CycIFProject:
             self.manifest["step1"]["canvas_yx"] = list(canvas_yx)
         self.mark_dirty()
 
+    def add_step1_slide(
+        self,
+        *,
+        sample_name: str,
+        out_path: Path,
+        cycle_inputs: Optional[list[dict]] = None,
+        tissue: Optional[str] = None,
+        species: Optional[str] = None,
+        canvas_yx: Optional[tuple] = None,
+    ) -> None:
+        """Append a Step 1 preprocessing record (supports batch runs).
+
+        Notes
+        -----
+        - Keeps backward-compat by also updating step1.merged_ome_tiff to the most recent output.
+        - Records are stored under: manifest['step1']['slides'].
+        """
+        self.manifest.setdefault("step1", {})
+
+        rec: Dict[str, Any] = {
+            "sample_name": str(sample_name),
+            "merged_ome_tiff": self.relpath(out_path),
+            "saved_utc": _utc_now_iso(),
+        }
+        if cycle_inputs is not None:
+            rec["cycle_inputs"] = cycle_inputs
+        if tissue is not None:
+            rec["tissue"] = str(tissue)
+        if species is not None:
+            rec["species"] = str(species)
+        if canvas_yx:
+            rec["canvas_yx"] = list(canvas_yx)
+
+        slides = self.manifest["step1"].setdefault("slides", [])
+        slides.append(rec)
+
+        # Backward compat: last output is the "active" merged file.
+        self.manifest["step1"]["merged_ome_tiff"] = self.relpath(out_path)
+        self.mark_dirty()
+
     # ---- Step 2 / model tracking helpers ----
     def add_input(self, path: Path) -> None:
         rel = self.relpath(path)

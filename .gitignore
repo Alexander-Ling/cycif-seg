@@ -10,6 +10,7 @@
 *.userosscache
 *.sln.docstates
 cycif_env/
+Test_Project/
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs

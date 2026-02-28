@@ -63,6 +63,17 @@ class RFController:
         except Exception:
             pass
 
+    def request_cancel(self):
+        """Cooperatively cancel the current RF job.
+
+        We bump the run id so any late yields are ignored, then ask the worker to stop.
+        """
+        try:
+            self._rf_run_id += 1
+        except Exception:
+            pass
+        self.cancel_worker()
+
     def on_train_predict(self):
         """
         Train the RF pixel classifier from scribbles and predict tiled probabilities.
@@ -185,6 +196,12 @@ class RFController:
             except Exception:
                 pass
             self.w.prog.setVisible(False)
+            try:
+                self.w.btn_train.setEnabled(True)
+                if hasattr(self.w, "btn_stop_train"):
+                    self.w.btn_stop_train.setEnabled(False)
+            except Exception:
+                pass
 
         @worker.yielded.connect
         def _on_tile(result):
@@ -252,12 +269,19 @@ class RFController:
                 pass
             self.w.prog.setVisible(False)
             self.w.set_status("Prediction complete.")
+            try:
+                self.w.btn_train.setEnabled(True)
+                if hasattr(self.w, "btn_stop_train"):
+                    self.w.btn_stop_train.setEnabled(False)
+            except Exception:
+                pass
 
         worker.start()
 
     def propagate_nuclei_edits(
         self,
-        nuclei_labels: np.ndarray,
+        base_labels: np.ndarray,
+        edited_labels: np.ndarray,
         use_channels: Sequence[int],
         *,
         tile_size: int,
@@ -333,7 +357,8 @@ class RFController:
         worker = propagate_nuclei_edits_worker(
             self.w.img,
             list(use_channels),
-            nuclei_labels,
+            base_labels,
+            edited_labels,
             build_features,
             tile_size,
             center_yx,

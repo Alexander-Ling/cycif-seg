@@ -28,10 +28,8 @@ class Step2bEditPanel(QtWidgets.QWidget):
         edit_row = QtWidgets.QHBoxLayout()
         self.btn_make_nuclei_edit = QtWidgets.QPushButton("Make/Select editable nuclei")
         self.btn_propagate_nuclei_edits = QtWidgets.QPushButton("Propagate edits (RF)")
-        self.btn_stop_propagation = QtWidgets.QPushButton("Stop")
         edit_row.addWidget(self.btn_make_nuclei_edit)
         edit_row.addWidget(self.btn_propagate_nuclei_edits)
-        edit_row.addWidget(self.btn_stop_propagation)
         layout.addLayout(edit_row)
 
         tools_row = QtWidgets.QHBoxLayout()

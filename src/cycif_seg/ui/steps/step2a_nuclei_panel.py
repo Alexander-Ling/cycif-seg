@@ -50,8 +50,13 @@ class Step2aNucleiPanel(QtWidgets.QWidget):
             )
         )
 
+        rf_row = QtWidgets.QHBoxLayout()
         self.btn_train = QtWidgets.QPushButton("Train + Predict (RF)")
-        layout.addWidget(self.btn_train)
+        self.btn_stop_train = QtWidgets.QPushButton("Stop")
+        self.btn_stop_train.setEnabled(False)
+        rf_row.addWidget(self.btn_train)
+        rf_row.addWidget(self.btn_stop_train)
+        layout.addLayout(rf_row)
 
         grid = QtWidgets.QGridLayout()
 
@@ -70,8 +75,13 @@ class Step2aNucleiPanel(QtWidgets.QWidget):
         grid.addWidget(self.spin_min_nuc_area, 1, 1)
         layout.addLayout(grid)
 
+        nuc_row = QtWidgets.QHBoxLayout()
         self.btn_nuclei = QtWidgets.QPushButton("Generate Nuclei (instances)")
-        layout.addWidget(self.btn_nuclei)
+        self.btn_stop_nuclei = QtWidgets.QPushButton("Stop")
+        self.btn_stop_nuclei.setEnabled(False)
+        nuc_row.addWidget(self.btn_nuclei)
+        nuc_row.addWidget(self.btn_stop_nuclei)
+        layout.addLayout(nuc_row)
 
         self.chk_show_nuc_markers = QtWidgets.QCheckBox("Show nucleus markers overlay")
         self.chk_show_nuc_markers.setChecked(False)

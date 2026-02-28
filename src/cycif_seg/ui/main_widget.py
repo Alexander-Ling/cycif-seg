@@ -37,6 +37,7 @@ from cycif_seg.ui.project_controller import ProjectController
 from cycif_seg.ui.image_controller import ImageController
 from cycif_seg.ui.rf_controller import RFController
 from cycif_seg.ui.steps.step1_preprocess_panel import Step1PreprocessPanel
+from cycif_seg.ui.batch_preprocess_dialog import BatchPreprocessDialog
 from cycif_seg.ui.steps.step2a_nuclei_panel import Step2aNucleiPanel
 from cycif_seg.ui.steps.step2b_edit_panel import Step2bEditPanel
 from cycif_seg.features.multiscale import build_features
@@ -44,6 +45,9 @@ from cycif_seg.model.rf_pixel import train_rf, predict_proba_tiled
 
 
 class CycIFMVPWidget(QtWidgets.QWidget):
+    # Thread-safe UI update signals (emitted from worker threads).
+    sig_step1_status = QtCore.Signal(str)
+    sig_step1_progress = QtCore.Signal(int, int)  # (idx, n)
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
         # Name for the single multichannel image layer used when 'Display selected channels only' is OFF.
@@ -72,6 +76,10 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self._prob_layers = {}
         self._scribbles_layer_name = "Scribbles (0=unlabeled,1=nuc,2=nuc_boundary,3=bg)"
         self._nuclei_edit_layer_name = "Nuclei (edit)"
+
+        # Step 2a background workers
+        self._nuclei_worker = None
+        self._nuclei_run_id = 0
 
         # Step 2b: nuclei edit tool controller (extracted to reduce main_widget.py size)
         self.nuclei_edit = NucleiEditController(
@@ -115,6 +123,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         # Back-compat: expose frequently used controls as attributes on the main widget.
         # This keeps the rest of the codebase unchanged while we incrementally refactor.
         self.btn_merge_cycles = self.step1_panel.btn_merge_cycles
+        self.btn_batch_merge = self.step1_panel.btn_batch_merge
         self.tabs.addTab(self.step1_panel, "Step 1: Preprocess")
 
         # -----------------------------
@@ -130,9 +139,11 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_none = self.step2a_panel.btn_none
         self.btn_apply_channels = self.step2a_panel.btn_apply_channels
         self.btn_train = self.step2a_panel.btn_train
+        self.btn_stop_train = self.step2a_panel.btn_stop_train
         self.spin_nuc_thresh = self.step2a_panel.spin_nuc_thresh
         self.spin_min_nuc_area = self.step2a_panel.spin_min_nuc_area
         self.btn_nuclei = self.step2a_panel.btn_nuclei
+        self.btn_stop_nuclei = self.step2a_panel.btn_stop_nuclei
         self.chk_show_nuc_markers = self.step2a_panel.chk_show_nuc_markers
         self.slider_alpha = self.step2a_panel.slider_alpha
         self.tabs.addTab(self.step2a_panel, "Step 2a: Nuclei (initial)")
@@ -192,6 +203,13 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.prog = QtWidgets.QProgressBar()
         self.prog.setVisible(False)
         layout.addWidget(self.prog)
+
+        # Thread-safe UI updates from background workers.
+        try:
+            self.sig_step1_status.connect(self.set_status)
+            self.sig_step1_progress.connect(self._apply_step1_progress)
+        except Exception:
+            pass
         # Throttle probability layer refresh during tile prediction.
         # Writing into self._P happens per-tile; refreshing napari layers per tile can be expensive
         # and can cause sawtooth CPU usage. We refresh at a fixed cadence instead.
@@ -202,12 +220,15 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_save_project.clicked.connect(self.on_save_project)
         self.btn_load.clicked.connect(self.image_ctrl.on_load)
         self.btn_merge_cycles.clicked.connect(self.on_merge_cycles)
+        self.btn_batch_merge.clicked.connect(self.on_batch_merge_cycles)
         self.tabs.currentChanged.connect(lambda _idx: self._mark_project_dirty())
         self.btn_all.clicked.connect(lambda: self.image_ctrl.set_all_channels(True))
         self.btn_none.clicked.connect(lambda: self.image_ctrl.set_all_channels(False))
         self.btn_apply_channels.clicked.connect(self.image_ctrl.on_apply_channel_selection)
         self.btn_train.clicked.connect(self.on_train_predict)
+        self.btn_stop_train.clicked.connect(self.on_stop_train_predict)
         self.btn_nuclei.clicked.connect(self.on_generate_nuclei)
+        self.btn_stop_nuclei.clicked.connect(self.on_stop_generate_nuclei)
         self.btn_make_nuclei_edit.clicked.connect(self.on_make_nuclei_edit_layer)
         self.btn_propagate_nuclei_edits.clicked.connect(self.on_propagate_nuclei_edits)
 
@@ -338,8 +359,13 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         self.set_status("Merging/registering cycles (background)…")
         self.prog.setVisible(True)
-        self.prog.setRange(0, 0)
-        self.prog.setValue(0)
+        # Determinate progress: 0..N cycles processed (includes the reference cycle).
+        try:
+            self.prog.setRange(0, max(1, len(cycles)))
+            self.prog.setValue(0)
+        except Exception:
+            self.prog.setRange(0, 0)
+            self.prog.setValue(0)
         try:
             self.btn_merge_cycles.setEnabled(False)
         except Exception:
@@ -348,14 +374,29 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         @thread_worker
         def _merge_worker():
             def _progress(s: str) -> None:
-                # Ensure UI updates happen on the main thread.
-                QtCore.QTimer.singleShot(0, lambda: self.set_status(f"[Step 1] {s}"))
+                # Thread-safe UI update.
+                self.sig_step1_status.emit(f"[Step 1] {s}")
+
+            def _progress_event(ev: dict) -> None:
+                # ev: {phase, cycle?, idx, n, msg}
+                try:
+                    msg = str(ev.get("msg") or "")
+                    idx = int(ev.get("idx") or 0)
+                    n = int(ev.get("n") or 0)
+                except Exception:
+                    msg, idx, n = "", 0, 0
+
+                if msg:
+                    self.sig_step1_status.emit(f"[Step 1] {msg}")
+                if n > 0:
+                    self.sig_step1_progress.emit(int(idx), int(n))
 
             return merge_cycles_to_ome_tiff(
                 cycles,
                 out_path,
                 default_registration_marker="DAPI",
                 progress_cb=_progress,
+                progress_event_cb=_progress_event,
             )
 
         worker = _merge_worker()
@@ -417,6 +458,44 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         worker.start()
 
+    def on_batch_merge_cycles(self):
+        """Step (1) batch mode: scan a folder-of-folders and preprocess multiple samples."""
+        dlg = BatchPreprocessDialog(self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            # Dialog runs batch internally; we still want to record outputs when done.
+            # Users close the dialog with "Close".
+            pass
+
+        reports = dlg.get_reports()
+        if not reports:
+            return
+
+        # Record outputs in the active project manifest (if any)
+        if self.project is not None:
+            for rep in reports:
+                try:
+                    sample_name = str(rep.get("sample_name") or "")
+                    out_p = Path(str(rep.get("output_path") or ""))
+                    # Cycle inputs for reproducibility
+                    cycle_inputs = []
+                    for ci in rep.get("inputs") or []:
+                        p = Path(str(ci.get("path") or ""))
+                        cycle_inputs.append({"path": self.project.relpath(p), "cycle": int(ci.get("cycle") or 0)})
+                    self.project.add_step1_slide(
+                        sample_name=sample_name or out_p.stem,
+                        out_path=out_p,
+                        cycle_inputs=cycle_inputs,
+                        tissue=None,
+                        species=None,
+                        canvas_yx=tuple(rep.get("canvas_yx") or ()),
+                    )
+                except Exception:
+                    continue
+            try:
+                self._update_project_label()
+            except Exception:
+                pass
+
     def _cancel_rf_worker(self):
         # Delegated to RFController
         return self.rf_ctrl.cancel_worker()
@@ -424,6 +503,15 @@ class CycIFMVPWidget(QtWidgets.QWidget):
     def set_status(self, msg: str):
         self.status.setText(msg)
         show_info(msg)
+
+    def _apply_step1_progress(self, idx: int, n: int) -> None:
+        """Update Step 1 progress bar (main-thread)."""
+        try:
+            if n > 0:
+                self.prog.setRange(0, int(n))
+                self.prog.setValue(max(0, min(int(idx), int(n))))
+        except Exception:
+            pass
 
     def _refresh_prob_layers_if_dirty(self):
         # Delegated to RFController (kept for backward-compat)
@@ -530,7 +618,32 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
     def on_train_predict(self):
         # Delegated to RFController
+        try:
+            self.btn_train.setEnabled(False)
+            self.btn_stop_train.setEnabled(True)
+        except Exception:
+            pass
         return self.rf_ctrl.on_train_predict()
+
+    def on_stop_train_predict(self):
+        """Stop an in-flight RF train+predict job."""
+        try:
+            self.rf_ctrl.request_cancel()
+        except Exception:
+            try:
+                self.rf_ctrl.cancel_worker()
+            except Exception:
+                pass
+        try:
+            self.prog.setVisible(False)
+        except Exception:
+            pass
+        try:
+            self.btn_train.setEnabled(True)
+            self.btn_stop_train.setEnabled(False)
+        except Exception:
+            pass
+        self.set_status("RF job cancelled.")
 
     # ---------------------------------------------------------------------
     # Layer helpers
@@ -1867,7 +1980,10 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             return
 
         # Delegate the RF propagation worker to RFController.
+        base_labels = base if (base is not None and hasattr(base, 'shape') and base.shape == nuclei_labels.shape) else nuclei_labels
+
         self.rf_ctrl.propagate_nuclei_edits(
+            base_labels,
             nuclei_labels,
             use_channels,
             tile_size=getattr(self, "tile_size", 512),
@@ -1899,17 +2015,37 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             "bg_thresh": 0.6,
         }
     
+        # Cancel any prior run
+        self.on_stop_generate_nuclei(silent=True)
+        self._nuclei_run_id += 1
+        my_run_id = self._nuclei_run_id
+
+        def is_cancelled() -> bool:
+            return my_run_id != self._nuclei_run_id
+
         self.set_status("Generating nuclei (background)…")
     
         from cycif_seg.instance.workers import nuclei_instances_from_probs_worker
-        worker = nuclei_instances_from_probs_worker(p_nuc, p_nb, p_bg, params)
+        worker = nuclei_instances_from_probs_worker(
+            p_nuc,
+            p_nb,
+            p_bg,
+            params,
+            run_id=my_run_id,
+            is_cancelled=is_cancelled,
+        )
+        self._nuclei_worker = worker
     
-        # UI feedback: show an indeterminate (busy) progress bar.
+        # UI feedback
         self.prog.setVisible(True)
-        self.prog.setRange(0, 0)
+        self.prog.setRange(0, 2)
         self.prog.setValue(0)
         try:
             self.btn_nuclei.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            self.btn_stop_nuclei.setEnabled(True)
         except Exception:
             pass
     
@@ -1925,16 +2061,27 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 return
     
             if kind == "stage":
-                _, text, step, total = msg
+                _, run_id, text, step, total = msg
+                if run_id != self._nuclei_run_id:
+                    return
                 self.status.setText(str(text))
+                try:
+                    self.prog.setRange(0, int(total))
+                    self.prog.setValue(int(step))
+                except Exception:
+                    pass
             elif kind == "nuclei":
-                _, nuclei = msg
+                _, run_id, nuclei = msg
+                if run_id != self._nuclei_run_id:
+                    return
                 self.layers.set_or_update_labels("Nuclei", nuclei.astype(np.int32, copy=False))
                 self.set_status(f"Nuclei generated: N={int(nuclei.max())}")
             elif kind == "debug":
                 if not self.chk_show_nuc_markers.isChecked():
                     return
-                _, dbg = msg
+                _, run_id, dbg = msg
+                if run_id != self._nuclei_run_id:
+                    return
                 # Show a few helpful overlays when requested
                 try:
                     if "seeds" in dbg:
@@ -1948,26 +2095,69 @@ class CycIFMVPWidget(QtWidgets.QWidget):
     
         @worker.finished.connect
         def _on_done():
+            if my_run_id != self._nuclei_run_id:
+                return
             self.set_status("Nuclei generation complete.")
             try:
                 self.btn_nuclei.setEnabled(True)
             except Exception:
                 pass
             try:
+                self.btn_stop_nuclei.setEnabled(False)
+            except Exception:
+                pass
+            try:
                 self.prog.setVisible(False)
             except Exception:
                 pass
+            self._nuclei_worker = None
     
         @worker.errored.connect
         def _on_err(e):
+            if my_run_id != self._nuclei_run_id:
+                return
             show_warning(f"Nuclei generation failed: {e}")
             try:
                 self.btn_nuclei.setEnabled(True)
             except Exception:
                 pass
             try:
+                self.btn_stop_nuclei.setEnabled(False)
+            except Exception:
+                pass
+            try:
                 self.prog.setVisible(False)
             except Exception:
                 pass
+            self._nuclei_worker = None
     
         worker.start()
+
+    def on_stop_generate_nuclei(self, silent: bool = False):
+        """Stop an in-flight nuclei instance generation job."""
+        w = getattr(self, "_nuclei_worker", None)
+        # Invalidate run id so any late yields are ignored
+        try:
+            self._nuclei_run_id += 1
+        except Exception:
+            pass
+        if w is not None:
+            try:
+                if hasattr(w, "quit"):
+                    w.quit()
+                if hasattr(w, "cancel"):
+                    w.cancel()
+            except Exception:
+                pass
+        self._nuclei_worker = None
+        try:
+            self.prog.setVisible(False)
+        except Exception:
+            pass
+        try:
+            self.btn_nuclei.setEnabled(True)
+            self.btn_stop_nuclei.setEnabled(False)
+        except Exception:
+            pass
+        if not silent:
+            self.set_status("Nuclei generation cancelled.")

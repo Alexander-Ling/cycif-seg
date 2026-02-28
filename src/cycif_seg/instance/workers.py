@@ -78,13 +78,22 @@ def cells_from_probs_worker(p_nuc, p_nb, p_cyto, p_bg, params: dict):
 
 
 @thread_worker
-def nuclei_instances_from_probs_worker(p_nuc, p_nb, p_bg, params: dict):
-    """Generate nuclei instances (boundary-aware) with coarse progress updates for the UI."""
+def nuclei_instances_from_probs_worker(p_nuc, p_nb, p_bg, params: dict, *, run_id: int = 0, is_cancelled=None):
+    """Generate nuclei instances (boundary-aware) with coarse progress updates for the UI.
+
+    Notes
+    -----
+    Cancellation is cooperative: we check `is_cancelled()` between coarse stages and
+    suppress yields/returns if cancellation is requested.
+    """
     p_nuc = np.asarray(p_nuc, dtype=np.float32)
     p_nb = np.asarray(p_nb, dtype=np.float32)
     p_bg = np.asarray(p_bg, dtype=np.float32)
 
-    yield ("stage", "Computing nuclei instances (boundary-aware)…", 1, 2)
+    if callable(is_cancelled) and is_cancelled():
+        return
+
+    yield ("stage", run_id, "Computing nuclei instances (boundary-aware)…", 1, 2)
 
     # Optionally suppress nucleus probability where background is high
     bg_thresh = float(params.get("bg_thresh", 0.6))
@@ -108,6 +117,9 @@ def nuclei_instances_from_probs_worker(p_nuc, p_nb, p_bg, params: dict):
         dist_percentile=float(params.get("dist_percentile", 70.0)),
     )
 
-    yield ("nuclei", nuclei)
-    yield ("debug", debug)
-    yield ("stage", "Done.", 2, 2)
+    if callable(is_cancelled) and is_cancelled():
+        return
+
+    yield ("nuclei", run_id, nuclei)
+    yield ("debug", run_id, debug)
+    yield ("stage", run_id, "Done.", 2, 2)

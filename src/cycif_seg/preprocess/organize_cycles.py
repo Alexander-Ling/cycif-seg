@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 
@@ -175,6 +175,8 @@ def merge_cycles_to_ome_tiff(
     downsample_for_registration: int = 4,
     upsample_factor: int = 10,
     progress_cb: Callable[[str], None] | None = None,
+    progress_event_cb: Optional[Callable[[dict], None]] = None,
+    cancel_cb: Callable[[], bool] | None = None,
 ) -> dict:
     """
     Load multiple cycle OME-TIFFs, optionally rigid-translate register each cycle to a reference,
@@ -189,6 +191,24 @@ def merge_cycles_to_ome_tiff(
     if not cycles:
         raise ValueError("No cycles provided")
 
+    def _check_cancel() -> None:
+        """Raise RuntimeError('Cancelled') if cancel_cb signals cancellation."""
+        try:
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError("Cancelled")
+        except RuntimeError:
+            raise
+        except Exception:
+            # Do not allow a buggy cancel callback to crash preprocessing.
+            return
+
+    # Validate cycle numbering: must be positive and unique.
+    cy_vals = [int(ci.cycle) for ci in cycles]
+    if any(cy <= 0 for cy in cy_vals):
+        raise ValueError(f"Cycle numbers must be >= 1. Got: {cy_vals}")
+    if len(set(cy_vals)) != len(cy_vals):
+        raise ValueError(f"Cycle numbers must be unique. Got: {cy_vals}")
+
     # Sort by cycle index for stable output ordering.
     cycles = sorted(cycles, key=lambda x: int(x.cycle))
 
@@ -198,9 +218,21 @@ def merge_cycles_to_ome_tiff(
     imgs: list[np.ndarray] = []
     names: list[list[str]] = []
     paths: list[str] = []
-    for ci in cycles:
+    n_cycles = int(len(cycles))
+    for k, ci in enumerate(cycles, start=1):
+        _check_cancel()
         if progress_cb:
             progress_cb(f"Loading cycle {int(ci.cycle)}")
+        if progress_event_cb:
+            progress_event_cb(
+                {
+                    "phase": "load",
+                    "cycle": int(ci.cycle),
+                    "idx": int(k),
+                    "n": int(n_cycles),
+                    "msg": f"Loading cycle {int(ci.cycle)}",
+                }
+            )
         img, ch = load_multichannel_tiff(ci.path)
         imgs.append(img)
         names.append(ch)
@@ -237,11 +269,29 @@ def merge_cycles_to_ome_tiff(
     aligned_imgs: list[np.ndarray] = []
 
     for i, ci in enumerate(cycles):
+        _check_cancel()
         img_i = imgs[i]
+
+        # Report progress as "cycles processed" (includes the reference cycle).
+        # This maps cleanly to a determinate per-sample progress bar in the UI.
+        def _emit_register_progress(msg: str) -> None:
+            if progress_cb:
+                progress_cb(msg)
+            if progress_event_cb:
+                progress_event_cb(
+                    {
+                        "phase": "register",
+                        "cycle": int(ci.cycle),
+                        "idx": int(i + 1),
+                        "n": int(n_cycles),
+                        "msg": msg,
+                    }
+                )
 
         if i == ref_idx or ref_yx is None:
             aligned_imgs.append(img_i.astype(np.float32, copy=False))
             shifts[int(ci.cycle)] = (0.0, 0.0)
+            _emit_register_progress(f"Registered cycle {int(ci.cycle)} (reference)")
             continue
 
         marker = ci.registration_marker or default_registration_marker
@@ -250,10 +300,14 @@ def merge_cycles_to_ome_tiff(
             # Can't register this cycle; leave as-is.
             aligned_imgs.append(img_i.astype(np.float32, copy=False))
             shifts[int(ci.cycle)] = (0.0, 0.0)
+            _emit_register_progress(
+                f"Registered cycle {int(ci.cycle)} (skipped: marker '{marker}' not found)"
+            )
             continue
 
-        if progress_cb:
-            progress_cb(f"Registering cycle {int(ci.cycle)}")
+        _emit_register_progress(f"Registering cycle {int(ci.cycle)}")
+
+        _check_cancel()
 
         mov_yx = img_i[..., ch_idx]
         dy, dx = estimate_translation(
@@ -266,8 +320,19 @@ def merge_cycles_to_ome_tiff(
         aligned_imgs.append(aligned)
         shifts[int(ci.cycle)] = (dy, dx)
 
+        _emit_register_progress(f"Registered cycle {int(ci.cycle)}")
+
     if progress_cb:
         progress_cb("Merging channels")
+    if progress_event_cb:
+        progress_event_cb(
+            {
+                "phase": "merge",
+                "idx": int(n_cycles),
+                "n": int(n_cycles),
+                "msg": "Merging channels",
+            }
+        )
 
     merged = np.concatenate(aligned_imgs, axis=2)
 
@@ -289,6 +354,16 @@ def merge_cycles_to_ome_tiff(
             merged_names.append(out_nm2)
 
     save_ome_tiff_yxc(output_path, merged, merged_names)
+
+    if progress_event_cb:
+        progress_event_cb(
+            {
+                "phase": "write",
+                "idx": int(n_cycles),
+                "n": int(n_cycles),
+                "msg": f"Wrote output: {output_path}",
+            }
+        )
 
     return {
         "output_path": output_path,
