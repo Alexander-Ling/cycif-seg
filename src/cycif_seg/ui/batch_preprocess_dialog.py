@@ -339,7 +339,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 cycles_out.append(
                     {
                         "path": str(p),
-                        "cycle": int(s.cycles[i] if i < len(s.cycles) else (i + 1)),
+                        "cycle": int(s.cycles[i] if i < len(s.cycles) else i),
                         "registration_marker": str(s.registration_markers[i] if i < len(s.registration_markers) else ""),
                         "channel_markers": list(s.channel_markers[i] if i < len(s.channel_markers) else []),
                         "channel_antibodies": list(s.channel_antibodies[i] if i < len(s.channel_antibodies) else []),
@@ -369,7 +369,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 d = cycles_cfg[i]
             if d is None:
                 continue
-            cycles.append(int(d.get("cycle") or (i + 1)))
+            # Note: cycle 0 is valid; only default when missing/None.
+            cycles.append(int(d.get("cycle") if d.get("cycle") is not None else i))
             reg.append(str(d.get("registration_marker") or "").strip())
             chm.append(list(d.get("channel_markers") or []))
             cha.append(list(d.get("channel_antibodies") or []))
@@ -533,7 +534,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     cycles_in.append(
                         CycleInput(
                             path=str(p),
-                            cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else (i + 1)),
+                            cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
                             tissue=(s.tissue or None),
                             species=(s.species or None),
                             registration_marker=(s.registration_markers[i] if s.registration_markers and i < len(s.registration_markers) else None),
@@ -569,6 +570,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     default_registration_marker="DAPI",
                     progress_event_cb=_ev,
                     cancel_cb=lambda: bool(self._cancel_requested),
+                    low_mem=True,
                 )
                 rep["sample_name"] = s.name
                 reports.append(rep)

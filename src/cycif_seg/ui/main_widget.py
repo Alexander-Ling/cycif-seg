@@ -397,6 +397,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 default_registration_marker="DAPI",
                 progress_cb=_progress,
                 progress_event_cb=_progress_event,
+                low_mem=True,
             )
 
         worker = _merge_worker()

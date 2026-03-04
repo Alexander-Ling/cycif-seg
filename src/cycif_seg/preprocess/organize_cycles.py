@@ -13,7 +13,9 @@ try:
 except Exception:  # pragma: no cover
     ndi_shift = None
 
-from cycif_seg.io.ome_tiff import load_multichannel_tiff, save_ome_tiff_yxc
+import tifffile
+
+from cycif_seg.io.ome_tiff import load_multichannel_tiff, load_multichannel_tiff_native, save_ome_tiff_yxc
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,57 @@ def _pad_channels_to_canvas(img_yxc: np.ndarray, shape_yx: tuple[int, int]) -> n
         np.float32, copy=False
     )
     return out
+
+
+def _pad_plane_to_canvas(plane_yx: np.ndarray, canvas_yx: tuple[int, int], *, out_dtype=np.float32) -> np.ndarray:
+    """Pad/crop a single (Y,X) plane to a common canvas."""
+    if plane_yx.ndim != 2:
+        raise ValueError(f"Expected (Y,X). Got shape={plane_yx.shape}")
+    y, x = int(plane_yx.shape[0]), int(plane_yx.shape[1])
+    Y, X = int(canvas_yx[0]), int(canvas_yx[1])
+    out = np.zeros((Y, X), dtype=out_dtype)
+    y0 = max((Y - y) // 2, 0)
+    x0 = max((X - x) // 2, 0)
+    ys = min(y, Y)
+    xs = min(x, X)
+    in_y0 = max((y - Y) // 2, 0)
+    in_x0 = max((x - X) // 2, 0)
+    out[y0 : y0 + ys, x0 : x0 + xs] = plane_yx[in_y0 : in_y0 + ys, in_x0 : in_x0 + xs].astype(
+        out_dtype, copy=False
+    )
+    return out
+
+
+def _tiff_info_yxc(path: str) -> tuple[tuple[int, int, int], np.dtype]:
+    """Return ((Y,X,C), dtype) without reading full pixel data."""
+    with tifffile.TiffFile(path) as tf:
+        series0 = tf.series[0]
+        shp = tuple(int(x) for x in series0.shape)
+        dtype = np.dtype(series0.dtype)
+
+    if len(shp) != 3:
+        raise ValueError(f"Expected 3D TIFF series. Got shape={shp} for {path}")
+
+    # Same heuristic as _normalize_to_yxc
+    if shp[0] <= 32 and shp[1] > 64 and shp[2] > 64:
+        # (C,Y,X)
+        y, x, c = shp[1], shp[2], shp[0]
+    else:
+        # assume (Y,X,C)
+        y, x, c = shp[0], shp[1], shp[2]
+
+    return (int(y), int(x), int(c)), dtype
+
+
+def _cast_preserve_dtype(plane_f32: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    """Cast float32 plane back to dtype while preserving range for integer types."""
+    dt = np.dtype(dtype)
+    if np.issubdtype(dt, np.floating):
+        return plane_f32.astype(dt, copy=False)
+    if np.issubdtype(dt, np.integer):
+        info = np.iinfo(dt)
+        return np.clip(plane_f32, info.min, info.max).astype(dt, copy=False)
+    return plane_f32.astype(dt, copy=False)
 
 
 def estimate_translation(
@@ -174,6 +227,7 @@ def merge_cycles_to_ome_tiff(
     default_registration_marker: str = "DAPI",
     downsample_for_registration: int = 4,
     upsample_factor: int = 10,
+    low_mem: bool = False,
     progress_cb: Callable[[str], None] | None = None,
     progress_event_cb: Optional[Callable[[dict], None]] = None,
     cancel_cb: Callable[[], bool] | None = None,
@@ -202,10 +256,10 @@ def merge_cycles_to_ome_tiff(
             # Do not allow a buggy cancel callback to crash preprocessing.
             return
 
-    # Validate cycle numbering: must be positive and unique.
+    # Validate cycle numbering: must be non-negative and unique.
     cy_vals = [int(ci.cycle) for ci in cycles]
-    if any(cy <= 0 for cy in cy_vals):
-        raise ValueError(f"Cycle numbers must be >= 1. Got: {cy_vals}")
+    if any(cy < 0 for cy in cy_vals):
+        raise ValueError(f"Cycle numbers must be >= 0. Got: {cy_vals}")
     if len(set(cy_vals)) != len(cy_vals):
         raise ValueError(f"Cycle numbers must be unique. Got: {cy_vals}")
 
@@ -215,6 +269,181 @@ def merge_cycles_to_ome_tiff(
     if reference_cycle is None:
         reference_cycle = int(cycles[0].cycle)
 
+    if bool(low_mem):
+        # Low-memory merge: keep only the current cycle + reference reg channel + final merged output in RAM.
+        # This avoids holding all cycles in memory at once.
+        _check_cancel()
+
+        # First pass: gather shapes/dtypes without loading all pixels.
+        infos: list[tuple[CycleInput, tuple[int, int, int], np.dtype]] = []
+        canvas_y = 0
+        canvas_x = 0
+        total_ch = 0
+        base_dtype: np.dtype | None = None
+        for ci in cycles:
+            shp_yxc, dt = _tiff_info_yxc(ci.path)
+            if base_dtype is None:
+                base_dtype = dt
+            elif np.dtype(dt) != np.dtype(base_dtype):
+                raise ValueError(
+                    f"All cycles must have the same dtype for low_mem merge. Got {base_dtype} vs {dt} ({ci.path})"
+                )
+            canvas_y = max(canvas_y, int(shp_yxc[0]))
+            canvas_x = max(canvas_x, int(shp_yxc[1]))
+            total_ch += int(shp_yxc[2])
+            infos.append((ci, shp_yxc, dt))
+
+        # For progress callbacks in low-memory mode.
+        n_cycles = int(len(infos))
+
+        assert base_dtype is not None
+        canvas_yx = (int(canvas_y), int(canvas_x))
+
+        # Identify reference cycle
+        ref_ci: CycleInput | None = None
+        for ci, _, _ in infos:
+            if int(ci.cycle) == int(reference_cycle):
+                ref_ci = ci
+                break
+        if ref_ci is None:
+            raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
+
+        # Allocate final merged output once.
+        merged = np.zeros((int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)), dtype=base_dtype)
+
+        # Build merged channel names as we go.
+        merged_names: list[str] = []
+        seen: dict[str, int] = {}
+
+        # Load reference registration channel once (float32), but do not keep whole reference image.
+        ref_marker = ref_ci.registration_marker or default_registration_marker
+        if progress_cb:
+            progress_cb(f"Loading reference cycle {int(ref_ci.cycle)}")
+        if progress_event_cb:
+            progress_event_cb(
+                {
+                    "phase": "load",
+                    "cycle": int(ref_ci.cycle),
+                    "idx": 1,
+                    "n": int(n_cycles),
+                    "msg": f"Loading reference cycle {int(ref_ci.cycle)}",
+                }
+            )
+        ref_img, ref_names = load_multichannel_tiff_native(ref_ci.path)
+        ref_ch_idx = _find_channel_index(ref_names, ref_marker)
+        ref_yx: np.ndarray | None
+        if ref_ch_idx is None:
+            ref_yx = None
+        else:
+            ref_yx = _pad_plane_to_canvas(ref_img[..., ref_ch_idx], canvas_yx, out_dtype=np.float32)
+
+        shifts: dict[int, tuple[float, float]] = {}
+
+        # Helper to name output channels
+        def _append_channel_name(ci: CycleInput, orig_name: str, j: int) -> None:
+            cy = int(ci.cycle)
+            markers = ci.channel_markers or []
+            marker = (markers[j] if j < len(markers) else "").strip()
+            base = marker or (orig_name or "").strip() or "Channel"
+            out_nm = f"{base}_cy{cy}"
+            k = int(seen.get(out_nm, 0))
+            out_nm2 = f"{out_nm}_{k+1}" if k else out_nm
+            seen[out_nm] = k + 1
+            merged_names.append(out_nm2)
+
+        # Write reference cycle first (unregistered)
+        out_c = 0
+        for ci in cycles:
+            _check_cancel()
+
+            if int(ci.cycle) == int(ref_ci.cycle):
+                # Use already-loaded ref_img/ref_names
+                img = ref_img
+                ch_names = ref_names
+                dy = 0.0
+                dx = 0.0
+            else:
+                if progress_cb:
+                    progress_cb(f"Registering cycle {int(ci.cycle)}")
+                if progress_event_cb:
+                    # idx as position in sorted cycles
+                    idx = int([c.cycle for c in cycles].index(ci.cycle) + 1)
+                    progress_event_cb(
+                        {
+                            "phase": "load",
+                            "cycle": int(ci.cycle),
+                            "idx": int(idx),
+                            "n": int(n_cycles),
+                            "msg": f"Registering cycle {int(ci.cycle)}",
+                        }
+                    )
+                img, ch_names = load_multichannel_tiff_native(ci.path)
+
+                # Determine shift for this cycle
+                if ref_yx is None:
+                    dy, dx = (0.0, 0.0)
+                else:
+                    marker = ci.registration_marker or default_registration_marker
+                    ch_idx = _find_channel_index(ch_names, marker)
+                    if ch_idx is None:
+                        dy, dx = (0.0, 0.0)
+                    else:
+                        mov_yx = _pad_plane_to_canvas(img[..., ch_idx], canvas_yx, out_dtype=np.float32)
+                        dy, dx = estimate_translation(
+                            ref_yx,
+                            mov_yx,
+                            downsample=int(downsample_for_registration),
+                            upsample_factor=int(upsample_factor),
+                        )
+
+            shifts[int(ci.cycle)] = (float(dy), float(dx))
+
+            # Register/write each channel plane directly into the final output.
+            for j in range(int(img.shape[2])):
+                plane = _pad_plane_to_canvas(img[..., j], canvas_yx, out_dtype=np.float32)
+                if dy != 0.0 or dx != 0.0:
+                    # Use the existing translation implementation on a 1-channel stack to reuse code.
+                    plane_yxc = plane[..., None]
+                    plane_reg = apply_translation_yxc(plane_yxc, dy=dy, dx=dx, order=1)[..., 0]
+                else:
+                    plane_reg = plane
+                merged[..., int(out_c)] = _cast_preserve_dtype(plane_reg, base_dtype)
+                _append_channel_name(ci, ch_names[j], j)
+                out_c += 1
+
+            # Release non-reference cycle arrays ASAP.
+            if int(ci.cycle) != int(ref_ci.cycle):
+                try:
+                    del img
+                except Exception:
+                    pass
+
+        if progress_cb:
+            progress_cb("Writing OME-TIFF")
+        if progress_event_cb:
+            progress_event_cb(
+                {
+                    "phase": "write",
+                    "idx": int(n_cycles),
+                    "n": int(n_cycles),
+                    "msg": f"Writing output: {output_path}",
+                }
+            )
+
+        save_ome_tiff_yxc(output_path, merged, merged_names)
+
+        return {
+            "output_path": output_path,
+            "reference_cycle": int(reference_cycle),
+            "default_registration_marker": default_registration_marker,
+            "shifts_yx": shifts,
+            "canvas_yx": canvas_yx,
+            "inputs": [{"cycle": int(ci.cycle), "path": ci.path} for ci in cycles],
+            "n_channels_out": int(merged.shape[2]),
+            "shape_yxc": tuple(int(x) for x in merged.shape),
+            "low_mem": True,
+        }
+
     imgs: list[np.ndarray] = []
     names: list[list[str]] = []
     paths: list[str] = []
@@ -222,7 +451,7 @@ def merge_cycles_to_ome_tiff(
     for k, ci in enumerate(cycles, start=1):
         _check_cancel()
         if progress_cb:
-            progress_cb(f"Loading cycle {int(ci.cycle)}")
+            progress_cb(f"Registering cycle {int(ci.cycle)}")
         if progress_event_cb:
             progress_event_cb(
                 {
@@ -230,7 +459,7 @@ def merge_cycles_to_ome_tiff(
                     "cycle": int(ci.cycle),
                     "idx": int(k),
                     "n": int(n_cycles),
-                    "msg": f"Loading cycle {int(ci.cycle)}",
+                    "msg": f"Registering cycle {int(ci.cycle)}",
                 }
             )
         img, ch = load_multichannel_tiff(ci.path)

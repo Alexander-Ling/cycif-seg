@@ -45,6 +45,40 @@ def _hessian_eigs(H_elems):
     return e1, e2
 
 
+
+def features_per_channel(
+    *,
+    sigmas=(2.0, 3.0, 4.0, 5.0, 6.0),
+    use_intensity: bool = True,
+    use_gaussian: bool = True,
+    use_gradmag: bool = True,
+    use_log: bool = True,
+    use_dog: bool = True,
+    use_structure_tensor: bool = True,
+    use_hessian: bool = True,
+) -> int:
+    """Return number of feature maps produced per channel for the given config."""
+    n = 0
+    if use_intensity:
+        n += 1
+    sigmas = tuple(float(s) for s in sigmas)
+    per_sigma = 0
+    if use_gaussian:
+        per_sigma += 1
+    if use_gradmag:
+        per_sigma += 1
+    if use_log:
+        per_sigma += 1
+    if use_dog:
+        per_sigma += 1
+    if use_structure_tensor:
+        per_sigma += 2
+    if use_hessian:
+        per_sigma += 2
+    n += per_sigma * len(sigmas)
+    return int(n)
+
+
 def build_features(
     img_yxc: np.ndarray,
     use_channels: list[int],

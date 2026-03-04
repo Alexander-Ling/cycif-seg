@@ -156,6 +156,7 @@ class RFController:
 
         from cycif_seg.predict.workers import predict_rf_worker
         from cycif_seg.features.multiscale import build_features
+        from cycif_seg.features.zarr_tile_cache import ZarrTileFeatureCache, FeatureCacheConfig
 
         self.w.set_status("Training + predicting (RF)…")
         self.w.prog.setVisible(True)
@@ -170,6 +171,74 @@ class RFController:
 
         center_yx = (float(cy), float(cx))
 
+        # Optional on-disk feature cache (Zarr) to avoid recomputing features on every run.
+        # This caches *tile-local* feature maps per channel and reuses them across retrains.
+        get_tile_features = None
+        get_point_features = None
+        cache_for_stats = None
+        try:
+            prj = getattr(self.w, "project", None)
+            if prj is not None and ZarrTileFeatureCache.available():
+                # Cache path: <project>/features/step2a_rf/<image_fp>/<cfg_hash>/
+                img_shape = tuple(int(x) for x in self.w.img.shape)
+                img_fp = ZarrTileFeatureCache.compute_image_fingerprint(getattr(self.w, "path", None), img_shape)
+                cfg = FeatureCacheConfig()  # current hard-coded feature set
+                # Normalize intensities to [0,1] before feature computation so features can be cached as float16 safely.
+                cfg.norm_mode = "p0.5_p99.5"
+                cache_dir = prj.root / "features" / "step2a_rf" / img_fp / cfg.hash()
+                cache = ZarrTileFeatureCache(
+                    cache_dir,
+                    image_fingerprint=img_fp,
+                    image_shape_yxc=img_shape,
+                    tile_size=512,
+                    cfg=cfg,
+                )
+                cache_for_stats = cache
+                img_for_stats = self.w.img  # full image array/dask for normalization stats
+
+                # Pre-initialize per-channel stores serially to avoid concurrent
+                # metadata writes from tile worker threads (important on Windows).
+                cache.prepare_channels(use_ch)
+
+                def _get_tile_features(y0, y1, x0, x1, use_channels, tile_img):
+                    return cache.get_tile_features(y0, y1, x0, x1, list(use_channels), tile_img, img=img_for_stats)
+
+                get_tile_features = _get_tile_features
+
+                def _get_point_features(ys, xs, use_channels, img):
+                    return cache.get_point_features(ys, xs, list(use_channels), img)
+
+                get_point_features = _get_point_features
+
+                # Record cache info in manifest for transparency (best-effort).
+                try:
+                    prj.manifest.setdefault("step2a", {})
+                    prj.manifest["step2a"].setdefault("feature_cache", {})
+                    prj.manifest["step2a"]["feature_cache"].update(
+                        {
+                            "kind": "zarr_tile_cache",
+                            "image_fingerprint": img_fp,
+                            "tile_size": 512,
+                            "cfg": cfg.to_dict(),
+                            "cfg_hash": cfg.hash(),
+                            "root": prj.relpath(cache_dir),
+                        }
+                    )
+                    prj.mark_dirty()
+                    self.w._update_project_label()
+                except Exception:
+                    pass
+
+        except Exception as e:
+            try:
+                print(f"[FeatureCache] WARNING: disabled (init failed): {e}")
+            except Exception:
+                pass
+            get_tile_features = None
+            get_point_features = None
+            cache_for_stats = None
+
+
         worker = predict_rf_worker(
             self.w.img,
             use_ch,
@@ -179,6 +248,8 @@ class RFController:
             center_yx=center_yx,
             run_id=my_run_id,
             is_cancelled=is_cancelled,
+            get_tile_features=get_tile_features,
+            get_point_features=get_point_features,
             progress_every=2,
             batch_tiles=4,
             feature_workers=3,
@@ -269,6 +340,11 @@ class RFController:
                 pass
             self.w.prog.setVisible(False)
             self.w.set_status("Prediction complete.")
+            try:
+                if cache_for_stats is not None:
+                    print(cache_for_stats.stats_summary())
+            except Exception:
+                pass
             try:
                 self.w.btn_train.setEnabled(True)
                 if hasattr(self.w, "btn_stop_train"):

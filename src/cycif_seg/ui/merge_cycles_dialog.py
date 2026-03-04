@@ -117,13 +117,18 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
 
         # Load channel names for each file and create UI group.
         self._cycles.clear()
-        for i, p in enumerate(self._paths):
+        for i, p in enumerate(self._paths, start=1):
             img, ch = load_multichannel_tiff(p)
             del img
 
             # If we have a prior config for this file, prefer it.
             prior = init_by_path.get(p) or init_by_name.get(Path(p).name)
-            cycle_idx = int(prior.get("cycle")) if isinstance(prior, dict) and prior.get("cycle") else (i + 1)
+            # Note: cycle 0 is valid. Only treat as missing if key is absent/None.
+            cycle_idx = (
+                int(prior.get("cycle"))
+                if isinstance(prior, dict) and (prior.get("cycle") is not None)
+                else i
+            )
 
             # default registration channel: use prior if available, else DAPI if present.
             reg_default = ""
@@ -166,10 +171,12 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             cyc_row = QtWidgets.QHBoxLayout()
             cyc_row.addWidget(QtWidgets.QLabel("Cycle number:"))
             sp_cy = QtWidgets.QSpinBox()
-            sp_cy.setMinimum(1)
+            sp_cy.setMinimum(0)
             sp_cy.setMaximum(999)
             sp_cy.setValue(int(cycle_idx))
-            sp_cy.setToolTip("Cycle index used in output channel naming (e.g., <marker>_cy<cycle>). Must be unique.")
+            sp_cy.setToolTip(
+                "Cycle index used in output channel naming (e.g., <marker>_cy<cycle>). Must be unique. Cycle 0 is allowed."
+            )
             cyc_row.addWidget(sp_cy)
             cyc_row.addStretch(1)
             gb_layout.addLayout(cyc_row)

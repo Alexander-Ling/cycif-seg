@@ -103,11 +103,11 @@ def save_ome_tiff_yxc(
     tifffile's OME writer is most reliable when channels are stored in the
     leading dimension (C, Y, X) with axes="CYX".
 
-    Some tifffile versions can raise:
-        ValueError: shape does not match stored shape
-    when writing with axes="YXC".
+    For larger images, classic TIFF uses 32-bit offsets and will fail once the
+    file grows beyond ~4 GiB. In that case, we must write BigTIFF.
 
-    To avoid that, we transpose to (C, Y, X) for writing.
+    To avoid OME-XML shape/axes mismatches in tifffile, we transpose to (C, Y, X)
+    for writing.
     """
     if img_yxc.ndim != 3:
         raise ValueError(f"Expected (Y,X,C). Got shape={img_yxc.shape}")
@@ -123,15 +123,26 @@ def save_ome_tiff_yxc(
         "axes": "CYX",
         "Channel": {"Name": list(channel_names)},
     }
+
+    # Classic TIFF uses 32-bit offsets; BigTIFF is required once the written file
+    # may exceed ~4 GiB. We conservatively decide based on the *uncompressed* size.
+    try:
+        bytes_per_px = int(np.dtype(img_cyx.dtype).itemsize)
+        est_uncompressed = int(img_cyx.size) * bytes_per_px
+    except Exception:
+        est_uncompressed = 0
+
+    bigtiff = bool(est_uncompressed >= (2**32 - 1))
+
     tifffile.imwrite(
         path,
         img_cyx,
         photometric="minisblack",
         metadata=metadata,
         ome=True,
+        bigtiff=bigtiff,
         compression=("zlib" if compress is True else compress),
     )
-
 
 def load_multichannel_tiff(path: str) -> tuple[np.ndarray, list[str]]:
     """
@@ -163,6 +174,34 @@ def load_multichannel_tiff(path: str) -> tuple[np.ndarray, list[str]]:
         ]
 
     return img, ch_names
+
+
+def load_multichannel_tiff_native(path: str) -> tuple[np.ndarray, list[str]]:
+    """Load a TIFF/OME-TIFF as (Y, X, C) preserving the on-disk dtype.
+
+    This is useful for preprocessing/registration steps where we want to keep the
+    original integer dtype (e.g., uint16) and only use float32 as a transient
+    compute type.
+    """
+    arr = tifffile.imread(path)
+    arr = _normalize_to_yxc(arr)
+    n_channels = int(arr.shape[2])
+
+    # Try OME metadata (same logic as eager loader)
+    ch_names = None
+    try:
+        with tifffile.TiffFile(path) as tf:
+            ome_xml = tf.ome_metadata
+        ch_names = _channel_names_from_ome(ome_xml, n_channels)
+    except Exception:
+        ch_names = None
+
+    if not ch_names or len(ch_names) != n_channels:
+        ch_names = [f"Channel {i}" for i in range(n_channels)]
+    else:
+        ch_names = [(nm if nm and nm.strip() else f"Channel {i}") for i, nm in enumerate(ch_names)]
+
+    return arr, ch_names
 
 
 def _normalize_to_cyx_lazy(arr) -> "da.Array":
