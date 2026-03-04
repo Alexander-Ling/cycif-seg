@@ -345,6 +345,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         # Treat selection order as cycle order 1..N.
         cycles: list[CycleInput] = []
         for d in cycles_cfg:
+            if bool(d.get("enabled", True)) is False:
+                continue
             cycles.append(
                 CycleInput(
                     path=str(d.get("path")),
@@ -357,11 +359,15 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 )
             )
 
+        if not cycles:
+            show_warning("No cycles selected (all cycles were disabled).")
+            return
+
         self.set_status("Merging/registering cycles (background)…")
         self.prog.setVisible(True)
-        # Determinate progress: 0..N cycles processed (includes the reference cycle).
+        # Determinate progress: 0..(N cycles + 1 write step). Progress ticks happen after each cycle completes and after the output is written.
         try:
-            self.prog.setRange(0, max(1, len(cycles)))
+            self.prog.setRange(0, max(1, len(cycles) + 1))
             self.prog.setValue(0)
         except Exception:
             self.prog.setRange(0, 0)
@@ -395,6 +401,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 cycles,
                 out_path,
                 default_registration_marker="DAPI",
+                registration_algorithm=str(cfg.get("registration_algorithm") or "translation"),
                 progress_cb=_progress,
                 progress_event_cb=_progress_event,
                 low_mem=True,

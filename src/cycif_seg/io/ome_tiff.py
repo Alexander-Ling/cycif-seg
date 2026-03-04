@@ -203,6 +203,58 @@ def load_multichannel_tiff_native(path: str) -> tuple[np.ndarray, list[str]]:
 
     return arr, ch_names
 
+def load_channel_names_only(path: str) -> list[str]:
+    """Read OME channel names without reading pixel data.
+
+    This avoids a full tifffile.imread() which can be slow for large slides.
+    Falls back to generic "Channel i" names if OME metadata is missing.
+    """
+    with tifffile.TiffFile(path) as tf:
+        # Determine channel count from the first series
+        try:
+            series = tf.series[0]
+            shape = tuple(series.shape)
+            axes = getattr(series, "axes", "") or ""
+        except Exception:
+            shape = ()
+            axes = ""
+
+        # Best-effort infer n_channels from axes/shape
+        n_channels = 0
+        try:
+            if axes and "C" in axes:
+                cpos = axes.index("C")
+                n_channels = int(shape[cpos])
+            else:
+                # Common fallback: (C,Y,X) or (Y,X,C)
+                if len(shape) == 3:
+                    if shape[0] <= 64:
+                        n_channels = int(shape[0])
+                    else:
+                        n_channels = int(shape[2])
+        except Exception:
+            n_channels = 0
+
+        if n_channels <= 0:
+            # Last-resort: count pages if they look like channel planes
+            try:
+                n_channels = int(len(tf.pages))
+            except Exception:
+                n_channels = 1
+
+        # Try OME metadata for names
+        ch_names = None
+        try:
+            ome_xml = tf.ome_metadata
+            ch_names = _channel_names_from_ome(ome_xml, int(n_channels))
+        except Exception:
+            ch_names = None
+
+    if not ch_names or len(ch_names) != int(n_channels):
+        return [f"Channel {i}" for i in range(int(n_channels))]
+    return [(nm if nm and nm.strip() else f"Channel {i}") for i, nm in enumerate(ch_names)]
+
+
 
 def _normalize_to_cyx_lazy(arr) -> "da.Array":
     """Canonicalize a lazy array to (C, Y, X).

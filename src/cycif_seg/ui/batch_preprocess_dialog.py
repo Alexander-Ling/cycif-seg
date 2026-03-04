@@ -11,6 +11,7 @@ from napari.utils.notifications import show_info, show_warning
 from napari.qt.threading import thread_worker
 
 from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
+from cycif_seg.io.ome_tiff import load_channel_names_only
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 
 
@@ -47,6 +48,8 @@ class BatchSample:
     registration_markers: list[str] | None = None
     channel_markers: list[list[str]] | None = None
     channel_antibodies: list[list[str]] | None = None
+    cycles_enabled: list[bool] | None = None
+    registration_algorithm: str = "translation"
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -241,6 +244,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     species=self.txt_default_species.text().strip(),
                     output_path=(out_dir / f"{sname}.ome.tiff"),
                     enabled=True,
+                    registration_algorithm="translation",
                 )
             )
 
@@ -304,7 +308,93 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         # If this sample already has configuration (from plan JSON or prior edits),
         # re-open the dialog with those settings prefilled.
         initial_cfg = self._sample_to_cfg(s)
-        dlg = MergeRegisterCyclesDialog(self, paths=[str(p) for p in s.files], initial_cfg=initial_cfg)
+
+        # Loading channel names from many OME-TIFFs can take a moment. Do it in a worker
+        # with a progress dialog so the UI doesn't feel frozen.
+        ch_cache: dict[str, list[str]] = {}
+
+        prog = QtWidgets.QProgressDialog("Reading cycle channel metadata…", "Cancel", 0, max(1, len(s.files)), self)
+        prog.setWindowTitle("Loading cycles…")
+        prog.setWindowModality(QtCore.Qt.ApplicationModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        cancel_flag = {"cancel": False}
+        try:
+            prog.canceled.connect(lambda: cancel_flag.__setitem__("cancel", True))
+        except Exception:
+            pass
+
+        @thread_worker
+        def _load_channels():
+            out: dict[str, list[str]] = {}
+            for i, p in enumerate(s.files, start=1):
+                try:
+                    out[str(p)] = list(load_channel_names_only(str(p)) or [])
+                except Exception:
+                    out[str(p)] = []
+                self.sig_set_cycle_progress.emit(int(i), int(len(s.files)))
+                self.sig_set_status.emit(f"Loaded channels for {p.name} ({i}/{len(s.files)})")
+                if bool(cancel_flag.get("cancel")):
+                    raise RuntimeError("Cancelled")
+            return out
+
+        # Reuse the existing per-cycle progress bar signal for this short step.
+        self.sig_set_cycle_progress.emit(0, int(len(s.files)))
+
+        w = _load_channels()
+
+        def _open_dialog(cache: dict[str, list[str]]):
+            try:
+                prog.close()
+            except Exception:
+                pass
+            nonlocal ch_cache
+            ch_cache = dict(cache or {})
+            dlg = MergeRegisterCyclesDialog(self, paths=[str(p) for p in s.files], initial_cfg=initial_cfg, channel_name_cache=ch_cache)
+
+            # Default output in dialog is ignored for batch, but keeping it sensible is nice.
+            try:
+                dlg.set_default_output(str(s.output_path or "merged.ome.tiff"))
+            except Exception:
+                pass
+
+            # Seed global metadata + algorithm
+            try:
+                dlg.txt_tissue.setText(s.tissue or "")
+                dlg.txt_species.setText(s.species or "")
+                for i in range(dlg.cmb_algorithm.count()):
+                    if str(dlg.cmb_algorithm.itemData(i)) == str(s.registration_algorithm or "translation"):
+                        dlg.cmb_algorithm.setCurrentIndex(i)
+                        break
+            except Exception:
+                pass
+
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return
+
+            cfg = dlg.get_result()
+            self._template_cfg = cfg
+            # Apply to this sample immediately
+            self._apply_cfg_to_sample(s, cfg)
+            self._refresh_table()
+            self._set_status(f"Stored cycle configuration template from sample '{s.name}'.")
+
+        def _open_err(e):
+            try:
+                prog.close()
+            except Exception:
+                pass
+            msg = str(e)
+            if "Cancelled" in msg:
+                self._set_status("Cycle metadata loading cancelled.")
+            else:
+                show_warning(f"Failed to read cycle metadata: {e}")
+                self._set_status(f"Failed to read cycle metadata: {e}")
+
+        w.returned.connect(_open_dialog)
+        w.errored.connect(_open_err)
+        w.start()
+        return
 
         # Default output in dialog is ignored for batch, but keeping it sensible is nice.
         try:
@@ -349,17 +439,29 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "tissue": s.tissue,
                 "species": s.species,
                 "output_path": str(s.output_path or ""),
+                "registration_algorithm": str(getattr(s, 'registration_algorithm', 'translation') or 'translation'),
                 "cycles": cycles_out,
             }
         except Exception:
             return None
 
     def _apply_cfg_to_sample(self, s: BatchSample, cfg: dict) -> None:
+        # Update global metadata from the dialog/plan.
+        try:
+            if 'tissue' in cfg:
+                s.tissue = str(cfg.get('tissue') or '').strip()
+            if 'species' in cfg:
+                s.species = str(cfg.get('species') or '').strip()
+            s.registration_algorithm = str(cfg.get('registration_algorithm') or s.registration_algorithm or 'translation').strip() or 'translation'
+        except Exception:
+            pass
+
         cycles_cfg = cfg.get("cycles") or []
         # Map by file basename when possible, else fall back to order.
         by_base = {Path(d.get("path") or "").name: d for d in cycles_cfg}
 
         cycles: list[int] = []
+        enableds: list[bool] = []
         reg: list[str] = []
         chm: list[list[str]] = []
         cha: list[list[str]] = []
@@ -371,6 +473,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 continue
             # Note: cycle 0 is valid; only default when missing/None.
             cycles.append(int(d.get("cycle") if d.get("cycle") is not None else i))
+            enableds.append(bool(d.get("enabled", True)))
             reg.append(str(d.get("registration_marker") or "").strip())
             chm.append(list(d.get("channel_markers") or []))
             cha.append(list(d.get("channel_antibodies") or []))
@@ -380,6 +483,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.registration_markers = reg
             s.channel_markers = chm
             s.channel_antibodies = cha
+            s.cycles_enabled = enableds
 
     def _apply_template_to_all(self) -> None:
         if not self._template_cfg:
@@ -399,10 +503,12 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             "root_dir": root_dir,
             "output_dir": out_dir,
             "defaults": {
+                "registration_algorithm": "translation",
                 "tissue": self.txt_default_tissue.text().strip(),
                 "species": self.txt_default_species.text().strip(),
             },
             "samples": [],
+            "registration_algorithm": "translation",
         }
         for s in self._samples:
             rec = {
@@ -417,11 +523,15 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "registration_markers": list(s.registration_markers or []),
                 "channel_markers": list(s.channel_markers or []),
                 "channel_antibodies": list(s.channel_antibodies or []),
+                "cycles_enabled": list(s.cycles_enabled or []),
+                "registration_algorithm": str(getattr(s, "registration_algorithm", "translation") or "translation"),
             }
             d["samples"].append(rec)
         return d
 
     def _save_plan(self) -> None:
+        # Ensure any table edits are captured before writing JSON.
+        self._sync_table_to_models()
         start = self.txt_outdir.text().strip() or self.txt_root.text().strip() or str(Path.cwd())
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save batch plan JSON", os.path.join(start, "batch_plan.json"), "JSON files (*.json);;All files (*.*)")
         if not path:
@@ -455,11 +565,13 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 species=str(rec.get("species") or ""),
                 output_path=Path(str(rec.get("output_path") or "")).expanduser() if rec.get("output_path") else None,
                 enabled=bool(rec.get("enabled", True)),
+                registration_algorithm=str(rec.get("registration_algorithm") or defs.get("registration_algorithm") or "translation"),
             )
             s.cycles = list(rec.get("cycles") or []) or None
             s.registration_markers = list(rec.get("registration_markers") or []) or None
             s.channel_markers = list(rec.get("channel_markers") or []) or None
             s.channel_antibodies = list(rec.get("channel_antibodies") or []) or None
+            s.cycles_enabled = list(rec.get("cycles_enabled") or []) or None
             samples.append(s)
 
         self._samples = samples
@@ -493,6 +605,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 return False, f"Sample '{s.name}' has no input files."
             if not s.cycles or not s.registration_markers or not s.channel_markers or not s.channel_antibodies:
                 return False, f"Sample '{s.name}' missing per-cycle configuration. Use 'Configure cycles…' and optionally 'Copy to all'."
+            if s.cycles_enabled and not any(bool(x) for x in s.cycles_enabled):
+                return False, f"Sample '{s.name}' has all cycles disabled. Enable at least one cycle."
         return True, ""
 
     def _run_batch(self) -> None:
@@ -531,6 +645,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 # Build CycleInput list
                 cycles_in: list[CycleInput] = []
                 for i, p in enumerate(s.files):
+                    if s.cycles_enabled and i < len(s.cycles_enabled) and (not bool(s.cycles_enabled[i])):
+                        continue
                     cycles_in.append(
                         CycleInput(
                             path=str(p),
@@ -545,7 +661,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
                 # Reset per-sample cycle progress before starting.
                 try:
-                    self.sig_set_cycle_progress.emit(0, int(len(cycles_in)))
+                    self.sig_set_cycle_progress.emit(0, int(len(cycles_in) + 1))
                 except Exception:
                     pass
 
@@ -568,6 +684,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     cycles_in,
                     str(out_path),
                     default_registration_marker="DAPI",
+                    registration_algorithm=str(getattr(s, 'registration_algorithm', 'translation') or 'translation'),
                     progress_event_cb=_ev,
                     cancel_cb=lambda: bool(self._cancel_requested),
                     low_mem=True,

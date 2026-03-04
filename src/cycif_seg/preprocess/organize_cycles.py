@@ -225,6 +225,7 @@ def merge_cycles_to_ome_tiff(
     *,
     reference_cycle: int | None = None,
     default_registration_marker: str = "DAPI",
+    registration_algorithm: str = "translation",
     downsample_for_registration: int = 4,
     upsample_factor: int = 10,
     low_mem: bool = False,
@@ -244,6 +245,14 @@ def merge_cycles_to_ome_tiff(
     cycles = list(cycles)
     if not cycles:
         raise ValueError("No cycles provided")
+
+    reg_alg = str(registration_algorithm or "translation").strip().lower()
+    if reg_alg not in {"translation", "phase_correlation", "phase-correlation"}:
+        # UI exposes non-rigid options, but they are not implemented yet.
+        raise NotImplementedError(
+            f"registration_algorithm='{registration_algorithm}' is not implemented in this build. "
+            "Select 'Translation (phase correlation)' or implement a non-rigid backend (e.g., SimpleITK BSpline/Demons)."
+        )
 
     def _check_cancel() -> None:
         """Raise RuntimeError('Cancelled') if cancel_cb signals cancellation."""
@@ -295,7 +304,9 @@ def merge_cycles_to_ome_tiff(
 
         # For progress callbacks in low-memory mode.
         n_cycles = int(len(infos))
+        total_steps = int(n_cycles + 1)  # cycles + final write
 
+        completed_cycles = 0
         assert base_dtype is not None
         canvas_yx = (int(canvas_y), int(canvas_x))
 
@@ -324,8 +335,8 @@ def merge_cycles_to_ome_tiff(
                 {
                     "phase": "load",
                     "cycle": int(ref_ci.cycle),
-                    "idx": 1,
-                    "n": int(n_cycles),
+                    "idx": int(completed_cycles),
+                    "n": int(total_steps),
                     "msg": f"Loading reference cycle {int(ref_ci.cycle)}",
                 }
             )
@@ -372,8 +383,8 @@ def merge_cycles_to_ome_tiff(
                         {
                             "phase": "load",
                             "cycle": int(ci.cycle),
-                            "idx": int(idx),
-                            "n": int(n_cycles),
+                            "idx": int(completed_cycles),
+                            "n": int(total_steps),
                             "msg": f"Registering cycle {int(ci.cycle)}",
                         }
                     )
@@ -411,6 +422,18 @@ def merge_cycles_to_ome_tiff(
                 _append_channel_name(ci, ch_names[j], j)
                 out_c += 1
 
+            # Progress tick: only after this cycle is fully processed.
+            if progress_event_cb:
+                completed_cycles += 1
+                done_idx = int(completed_cycles)
+                progress_event_cb({
+                    "phase": "cycle_done",
+                    "cycle": int(ci.cycle),
+                    "idx": int(done_idx),
+                    "n": int(total_steps),
+                    "msg": f"Finished cycle {int(ci.cycle)}",
+                })
+
             # Release non-reference cycle arrays ASAP.
             if int(ci.cycle) != int(ref_ci.cycle):
                 try:
@@ -423,14 +446,21 @@ def merge_cycles_to_ome_tiff(
         if progress_event_cb:
             progress_event_cb(
                 {
-                    "phase": "write",
-                    "idx": int(n_cycles),
-                    "n": int(n_cycles),
+                    "phase": "write_start",
+                    "idx": int(completed_cycles),
+                    "n": int(total_steps),
                     "msg": f"Writing output: {output_path}",
                 }
             )
 
         save_ome_tiff_yxc(output_path, merged, merged_names)
+        if progress_event_cb:
+            progress_event_cb({
+                "phase": "write_done",
+                "idx": int(total_steps),
+                "n": int(total_steps),
+                "msg": f"Wrote output: {output_path}",
+            })
 
         return {
             "output_path": output_path,
@@ -448,6 +478,7 @@ def merge_cycles_to_ome_tiff(
     names: list[list[str]] = []
     paths: list[str] = []
     n_cycles = int(len(cycles))
+    total_steps = int(n_cycles + 1)
     for k, ci in enumerate(cycles, start=1):
         _check_cancel()
         if progress_cb:
@@ -457,8 +488,8 @@ def merge_cycles_to_ome_tiff(
                 {
                     "phase": "load",
                     "cycle": int(ci.cycle),
-                    "idx": int(k),
-                    "n": int(n_cycles),
+                    "idx": int(k - 1),
+                    "n": int(total_steps),
                     "msg": f"Registering cycle {int(ci.cycle)}",
                 }
             )
@@ -512,7 +543,7 @@ def merge_cycles_to_ome_tiff(
                         "phase": "register",
                         "cycle": int(ci.cycle),
                         "idx": int(i + 1),
-                        "n": int(n_cycles),
+                        "n": int(total_steps),
                         "msg": msg,
                     }
                 )
@@ -558,7 +589,7 @@ def merge_cycles_to_ome_tiff(
             {
                 "phase": "merge",
                 "idx": int(n_cycles),
-                "n": int(n_cycles),
+                "n": int(total_steps),
                 "msg": "Merging channels",
             }
         )
@@ -589,7 +620,7 @@ def merge_cycles_to_ome_tiff(
             {
                 "phase": "write",
                 "idx": int(n_cycles),
-                "n": int(n_cycles),
+                "n": int(total_steps),
                 "msg": f"Wrote output: {output_path}",
             }
         )

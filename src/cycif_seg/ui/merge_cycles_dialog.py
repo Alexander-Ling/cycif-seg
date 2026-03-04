@@ -5,7 +5,7 @@ from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 
-from cycif_seg.io.ome_tiff import load_multichannel_tiff
+from cycif_seg.io.ome_tiff import load_channel_names_only
 
 
 @dataclass
@@ -16,17 +16,19 @@ class CycleUIConfig:
     marker_names: list[str]
     antibody_names: list[str]
     registration_channel: str
+    enabled: bool = True
 
 
 class MergeRegisterCyclesDialog(QtWidgets.QDialog):
     """Collect step (1) metadata + per-cycle registration channel in a visual way."""
 
-    def __init__(self, parent=None, *, paths: list[str], initial_cfg: dict | None = None):
+    def __init__(self, parent=None, *, paths: list[str], initial_cfg: dict | None = None, channel_name_cache: dict[str, list[str]] | None = None):
         super().__init__(parent)
         self.setWindowTitle("Merge/Register cycles")
         self.setModal(True)
 
         self._paths = list(paths)
+        self._channel_name_cache = dict(channel_name_cache or {})
         self._cycles: list[CycleUIConfig] = []
         # Optional prior configuration (e.g., from a loaded batch plan).
         # Expected shape matches get_result(): {tissue, species, output_path, cycles:[...]}
@@ -40,6 +42,13 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.txt_species = QtWidgets.QLineEdit()
         form.addRow("Tissue type:", self.txt_tissue)
         form.addRow("Species:", self.txt_species)
+        self.cmb_algorithm = QtWidgets.QComboBox()
+        self.cmb_algorithm.addItem("Translation (phase correlation)", "translation")
+        self.cmb_algorithm.addItem("Non-rigid (BSpline - SimpleITK)", "bspline")
+        self.cmb_algorithm.addItem("Non-rigid (Demons - SimpleITK)", "demons")
+        self.cmb_algorithm.setCurrentIndex(0)
+        self.cmb_algorithm.setToolTip("Registration algorithm used to align cycles. Non-rigid options require additional implementation.")
+        form.addRow("Registration algorithm:", self.cmb_algorithm)
         root.addLayout(form)
 
         # Seed global metadata from an initial config (e.g., loaded plan).
@@ -47,6 +56,13 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             if isinstance(self._initial_cfg, dict):
                 self.txt_tissue.setText(str(self._initial_cfg.get("tissue") or ""))
                 self.txt_species.setText(str(self._initial_cfg.get("species") or ""))
+                alg = str(self._initial_cfg.get("registration_algorithm") or "").strip()
+                if alg:
+                    # Prefer matching by userData (internal key)
+                    for i in range(self.cmb_algorithm.count()):
+                        if str(self.cmb_algorithm.itemData(i)) == alg:
+                            self.cmb_algorithm.setCurrentIndex(i)
+                            break
         except Exception:
             pass
 
@@ -118,8 +134,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         # Load channel names for each file and create UI group.
         self._cycles.clear()
         for i, p in enumerate(self._paths, start=1):
-            img, ch = load_multichannel_tiff(p)
-            del img
+            ch = list(self._channel_name_cache.get(p) or load_channel_names_only(p) or [])
 
             # If we have a prior config for this file, prefer it.
             prior = init_by_path.get(p) or init_by_name.get(Path(p).name)
@@ -152,6 +167,13 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                     prior_markers = []
                     prior_abs = []
 
+            enabled0 = True
+            try:
+                if isinstance(prior, dict) and (prior.get("enabled") is False):
+                    enabled0 = False
+            except Exception:
+                enabled0 = True
+
             cfg = CycleUIConfig(
                 path=p,
                 cycle=cycle_idx,
@@ -159,6 +181,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 marker_names=[(prior_markers[j] if j < len(prior_markers) else (nm or "")).strip() for j, nm in enumerate(ch)],
                 antibody_names=[(prior_abs[j] if j < len(prior_abs) else "").strip() for j in range(len(ch))],
                 registration_channel=reg_default,
+                enabled=bool(enabled0),
             )
             self._cycles.append(cfg)
 
@@ -166,6 +189,14 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             gb_layout = QtWidgets.QVBoxLayout(gb)
 
             gb_layout.addWidget(QtWidgets.QLabel(str(p)))
+
+            use_row = QtWidgets.QHBoxLayout()
+            chk_use = QtWidgets.QCheckBox("Use this cycle")
+            chk_use.setChecked(bool(cfg.enabled))
+            chk_use.setToolTip("Uncheck to skip this cycle during merge/registration (it will not be included in the output).")
+            use_row.addWidget(chk_use)
+            use_row.addStretch(1)
+            gb_layout.addLayout(use_row)
 
             # Allow manual cycle numbering (users often load files out of order).
             cyc_row = QtWidgets.QHBoxLayout()
@@ -209,6 +240,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             gb_layout.addWidget(tbl)
 
             # Store widgets for later readout
+            gb._cycif_enabled_chk = chk_use  # type: ignore[attr-defined]
             gb._cycif_cycle_spin = sp_cy  # type: ignore[attr-defined]
             gb._cycif_reg_combo = cmb  # type: ignore[attr-defined]
             gb._cycif_table = tbl  # type: ignore[attr-defined]
@@ -221,6 +253,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         tissue = self.txt_tissue.text().strip()
         species = self.txt_species.text().strip()
         out_path = self.txt_output.text().strip()
+        reg_algorithm = str(self.cmb_algorithm.currentData() or "translation")
         if not out_path:
             raise ValueError("Output path is required")
 
@@ -231,16 +264,19 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             w = self.inner_layout.itemAt(idx).widget()
             if not isinstance(w, QtWidgets.QGroupBox):
                 continue
+            chk_use = getattr(w, "_cycif_enabled_chk", None)
             sp_cy = getattr(w, "_cycif_cycle_spin", None)
             cmb = getattr(w, "_cycif_reg_combo", None)
             tbl = getattr(w, "_cycif_table", None)
-            if sp_cy is None or cmb is None or tbl is None:
+            if chk_use is None or sp_cy is None or cmb is None or tbl is None:
                 continue
 
             cy = int(sp_cy.value())
-            if cy in seen_cycles:
-                raise ValueError(f"Duplicate cycle number {cy}. Each cycle number must be unique.")
-            seen_cycles.add(cy)
+            enabled = bool(chk_use.isChecked())
+            if enabled:
+                if cy in seen_cycles:
+                    raise ValueError(f"Duplicate cycle number: {cy}. Cycle numbers must be unique among enabled cycles.")
+                seen_cycles.add(cy)
 
             # Find original config by groupbox order (stable) instead of cycle number.
             # Users can edit the cycle number, so the mapping must not depend on it.
@@ -262,6 +298,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 {
                     "path": cfg.path,
                     "cycle": int(cy),
+                    "enabled": bool(enabled),
                     "registration_marker": str(cmb.currentText()).strip(),
                     "channel_markers": markers,
                     "channel_antibodies": antibodies,
@@ -272,5 +309,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "tissue": tissue,
             "species": species,
             "output_path": out_path,
+            "registration_algorithm": reg_algorithm,
             "cycles": cycles_out,
         }
