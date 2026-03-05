@@ -42,27 +42,12 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.txt_species = QtWidgets.QLineEdit()
         form.addRow("Tissue type:", self.txt_tissue)
         form.addRow("Species:", self.txt_species)
-        self.cmb_algorithm = QtWidgets.QComboBox()
-        self.cmb_algorithm.addItem("Translation (phase correlation)", "translation")
-        self.cmb_algorithm.addItem("Non-rigid (BSpline - SimpleITK)", "bspline")
-        self.cmb_algorithm.addItem("Non-rigid (Demons - SimpleITK)", "demons")
-        self.cmb_algorithm.setCurrentIndex(0)
-        self.cmb_algorithm.setToolTip("Registration algorithm used to align cycles. Non-rigid options require additional implementation.")
-        form.addRow("Registration algorithm:", self.cmb_algorithm)
         root.addLayout(form)
-
         # Seed global metadata from an initial config (e.g., loaded plan).
         try:
             if isinstance(self._initial_cfg, dict):
                 self.txt_tissue.setText(str(self._initial_cfg.get("tissue") or ""))
                 self.txt_species.setText(str(self._initial_cfg.get("species") or ""))
-                alg = str(self._initial_cfg.get("registration_algorithm") or "").strip()
-                if alg:
-                    # Prefer matching by userData (internal key)
-                    for i in range(self.cmb_algorithm.count()):
-                        if str(self.cmb_algorithm.itemData(i)) == alg:
-                            self.cmb_algorithm.setCurrentIndex(i)
-                            break
         except Exception:
             pass
 
@@ -73,6 +58,24 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 "Output channels will be named as: <marker>_cy<cycle>."
             )
         )
+
+        # Tiled rigid options
+        self.chk_allow_rotation = QtWidgets.QCheckBox("Enable rotation during tile registration")
+        self.chk_allow_rotation.setChecked(False)
+        root.addWidget(self.chk_allow_rotation)
+        # Seed from initial config if present
+        try:
+            if isinstance(self._initial_cfg, dict):
+                v = self._initial_cfg.get("tiled_rigid_allow_rotation")
+                if v is None:
+                    v = self._initial_cfg.get("allow_rotation")
+                if v is None:
+                    v = self._initial_cfg.get("enable_rotation")
+                if v is not None:
+                    self.chk_allow_rotation.setChecked(bool(v))
+        except Exception:
+            pass
+
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -253,7 +256,8 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         tissue = self.txt_tissue.text().strip()
         species = self.txt_species.text().strip()
         out_path = self.txt_output.text().strip()
-        reg_algorithm = str(self.cmb_algorithm.currentData() or "translation")
+        reg_algorithm = "tiled_rigid"
+        tiled_allow_rotation = bool(getattr(self, 'chk_allow_rotation', None) and self.chk_allow_rotation.isChecked())
         if not out_path:
             raise ValueError("Output path is required")
 
@@ -310,5 +314,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "species": species,
             "output_path": out_path,
             "registration_algorithm": reg_algorithm,
+            "tiled_rigid_allow_rotation": tiled_allow_rotation,
             "cycles": cycles_out,
         }

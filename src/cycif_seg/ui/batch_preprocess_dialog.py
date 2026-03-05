@@ -49,7 +49,8 @@ class BatchSample:
     channel_markers: list[list[str]] | None = None
     channel_antibodies: list[list[str]] | None = None
     cycles_enabled: list[bool] | None = None
-    registration_algorithm: str = "translation"
+    registration_algorithm: str = "tiled_rigid"
+    tiled_rigid_allow_rotation: bool = False
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -244,7 +245,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     species=self.txt_default_species.text().strip(),
                     output_path=(out_dir / f"{sname}.ome.tiff"),
                     enabled=True,
-                    registration_algorithm="translation",
+                    registration_algorithm="tiled_rigid",
                 )
             )
 
@@ -357,15 +358,10 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 dlg.set_default_output(str(s.output_path or "merged.ome.tiff"))
             except Exception:
                 pass
-
-            # Seed global metadata + algorithm
+            # Seed global metadata
             try:
                 dlg.txt_tissue.setText(s.tissue or "")
                 dlg.txt_species.setText(s.species or "")
-                for i in range(dlg.cmb_algorithm.count()):
-                    if str(dlg.cmb_algorithm.itemData(i)) == str(s.registration_algorithm or "translation"):
-                        dlg.cmb_algorithm.setCurrentIndex(i)
-                        break
             except Exception:
                 pass
 
@@ -439,7 +435,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "tissue": s.tissue,
                 "species": s.species,
                 "output_path": str(s.output_path or ""),
-                "registration_algorithm": str(getattr(s, 'registration_algorithm', 'translation') or 'translation'),
+                "registration_algorithm": str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
+                "tiled_rigid_allow_rotation": bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -452,7 +449,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.tissue = str(cfg.get('tissue') or '').strip()
             if 'species' in cfg:
                 s.species = str(cfg.get('species') or '').strip()
-            s.registration_algorithm = str(cfg.get('registration_algorithm') or s.registration_algorithm or 'translation').strip() or 'translation'
+            s.registration_algorithm = str(cfg.get('registration_algorithm') or s.registration_algorithm or 'tiled_rigid').strip() or 'tiled_rigid'
+            s.tiled_rigid_allow_rotation = bool(cfg.get('tiled_rigid_allow_rotation') if cfg.get('tiled_rigid_allow_rotation') is not None else getattr(s, 'tiled_rigid_allow_rotation', False))
         except Exception:
             pass
 
@@ -503,12 +501,12 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             "root_dir": root_dir,
             "output_dir": out_dir,
             "defaults": {
-                "registration_algorithm": "translation",
-                "tissue": self.txt_default_tissue.text().strip(),
+                "registration_algorithm": "tiled_rigid",
+                                "tissue": self.txt_default_tissue.text().strip(),
                 "species": self.txt_default_species.text().strip(),
             },
             "samples": [],
-            "registration_algorithm": "translation",
+            "registration_algorithm": "tiled_rigid",
         }
         for s in self._samples:
             rec = {
@@ -524,7 +522,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "channel_markers": list(s.channel_markers or []),
                 "channel_antibodies": list(s.channel_antibodies or []),
                 "cycles_enabled": list(s.cycles_enabled or []),
-                "registration_algorithm": str(getattr(s, "registration_algorithm", "translation") or "translation"),
+                "registration_algorithm": str(getattr(s, "registration_algorithm", "tiled_rigid") or "tiled_rigid"),
+                "tiled_rigid_allow_rotation": bool(getattr(s, "tiled_rigid_allow_rotation", False)),
             }
             d["samples"].append(rec)
         return d
@@ -565,8 +564,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 species=str(rec.get("species") or ""),
                 output_path=Path(str(rec.get("output_path") or "")).expanduser() if rec.get("output_path") else None,
                 enabled=bool(rec.get("enabled", True)),
-                registration_algorithm=str(rec.get("registration_algorithm") or defs.get("registration_algorithm") or "translation"),
+                registration_algorithm=str(rec.get("registration_algorithm") or defs.get("registration_algorithm") or "tiled_rigid"),
             )
+            s.tiled_rigid_allow_rotation = bool(rec.get("tiled_rigid_allow_rotation", False))
             s.cycles = list(rec.get("cycles") or []) or None
             s.registration_markers = list(rec.get("registration_markers") or []) or None
             s.channel_markers = list(rec.get("channel_markers") or []) or None
@@ -684,7 +684,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     cycles_in,
                     str(out_path),
                     default_registration_marker="DAPI",
-                    registration_algorithm=str(getattr(s, 'registration_algorithm', 'translation') or 'translation'),
+                    registration_algorithm=str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
+                    tiled_rigid_allow_rotation=bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
                     progress_event_cb=_ev,
                     cancel_cb=lambda: bool(self._cancel_requested),
                     low_mem=True,
