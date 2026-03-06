@@ -98,9 +98,6 @@ class RFController:
             show_warning("Select at least one channel.")
             return
 
-        img_for_rf = self.w.img.subset(use_ch) if hasattr(self.w.img, "subset") else self.w.img
-        use_ch_local = list(range(len(use_ch)))
-
         scrib_layer = self.w.layers.ensure_scribbles_layer(
             image_shape=self.w.img.shape[:2],
             name=self.w._scribbles_layer_name,
@@ -113,7 +110,7 @@ class RFController:
             show_warning(f"Not enough labeled pixels ({n_train}). Paint more scribbles.")
             return
 
-        H, W, _ = img_for_rf.shape
+        H, W, _ = self.w.img.shape
 
         # Allocate probability volume
         self.w._P = np.zeros((H, W, 3), dtype=np.float32)
@@ -183,7 +180,7 @@ class RFController:
             prj = getattr(self.w, "project", None)
             if prj is not None and ZarrTileFeatureCache.available():
                 # Cache path: <project>/features/step2a_rf/<image_fp>/<cfg_hash>/
-                img_shape = tuple(int(x) for x in img_for_rf.shape)
+                img_shape = tuple(int(x) for x in self.w.img.shape)
                 img_fp = ZarrTileFeatureCache.compute_image_fingerprint(getattr(self.w, "path", None), img_shape)
                 cfg = FeatureCacheConfig()  # current hard-coded feature set
                 # Normalize intensities to [0,1] before feature computation so features can be cached as float16 safely.
@@ -197,11 +194,11 @@ class RFController:
                     cfg=cfg,
                 )
                 cache_for_stats = cache
-                img_for_stats = img_for_rf
+                img_for_stats = self.w.img  # full image array/dask for normalization stats
 
                 # Pre-initialize per-channel stores serially to avoid concurrent
                 # metadata writes from tile worker threads (important on Windows).
-                cache.prepare_channels(use_ch_local)
+                cache.prepare_channels(use_ch)
 
                 def _get_tile_features(y0, y1, x0, x1, use_channels, tile_img):
                     return cache.get_tile_features(y0, y1, x0, x1, list(use_channels), tile_img, img=img_for_stats)
@@ -243,8 +240,8 @@ class RFController:
 
 
         worker = predict_rf_worker(
-            img_for_rf,
-            use_ch_local,
+            self.w.img,
+            use_ch,
             S,
             build_features,
             tile_size=512,
@@ -294,8 +291,6 @@ class RFController:
                     return
                 meta = dict(meta or {})
                 meta.setdefault("kind", "rf_pixel_model_A")
-                meta["use_channels"] = list(use_ch)
-                meta["use_channels_local"] = list(use_ch_local)
                 self.w._pending_models.append({"model": model, "meta": meta, "saved_path": None})
                 self.w._mark_project_dirty()
                 return

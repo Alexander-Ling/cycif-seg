@@ -18,18 +18,57 @@ from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 PLAN_SCHEMA_VERSION = 1
 
 
-def _find_ome_tiffs_in_dir(d: Path) -> list[Path]:
-    exts = (".ome.tif", ".ome.tiff", ".tif", ".tiff")
-    out: list[Path] = []
+def _parse_cycle_number_from_filename(name: str) -> int | None:
+    """Parse cycle number from stitched file names like ``C3_sample_...ome.tiff``."""
     try:
-        for p in sorted(d.iterdir()):
-            if not p.is_file():
-                continue
-            nm = p.name.lower()
-            if any(nm.endswith(e) for e in exts) and (".ome." in nm):
-                out.append(p)
+        import re
+
+        m = re.match(r"^c(\d+)_", str(name or "").strip(), flags=re.IGNORECASE)
+        if not m:
+            return None
+        return int(m.group(1))
     except Exception:
-        pass
+        return None
+
+
+def _find_stitched_cycle_files_in_sample_dir(sample_dir: Path) -> list[tuple[Path, int]]:
+    """
+    Discover stitched cycle OME-TIFFs using the expected layout::
+
+        {input}/{sample_dir}/{cycle_dir}/C#_{stuff}.ome.tiff
+
+    Rules:
+    - only inspect immediate subdirectories of ``sample_dir`` as cycle dirs
+    - ignore any OME-TIFF directly under ``sample_dir``
+    - ignore tile files such as ``area_*.ome.tiff``
+    - infer cycle number from the stitched filename prefix ``C#_``
+    """
+    out: list[tuple[Path, int]] = []
+    try:
+        cycle_dirs = [p for p in sorted(sample_dir.iterdir()) if p.is_dir()]
+    except Exception:
+        return out
+
+    for cycle_dir in cycle_dirs:
+        try:
+            files = [p for p in sorted(cycle_dir.iterdir()) if p.is_file()]
+        except Exception:
+            continue
+        for p in files:
+            nm = p.name
+            low = nm.lower()
+            if ".ome." not in low:
+                continue
+            if not (low.endswith('.ome.tif') or low.endswith('.ome.tiff')):
+                continue
+            if low.startswith('area_'):
+                continue
+            cy = _parse_cycle_number_from_filename(nm)
+            if cy is None:
+                continue
+            out.append((p, int(cy)))
+
+    out.sort(key=lambda t: (int(t[1]), str(t[0]).lower()))
     return out
 
 
@@ -229,13 +268,17 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         samples: list[BatchSample] = []
+        n_cycle_files = 0
         for sub in sorted(root_dir.iterdir()):
             if not sub.is_dir():
                 continue
-            files = _find_ome_tiffs_in_dir(sub)
-            if not files:
+            stitched = _find_stitched_cycle_files_in_sample_dir(sub)
+            if not stitched:
                 continue
+            files = [p for (p, _cy) in stitched]
+            cycles = [int(cy) for (_p, cy) in stitched]
             sname = sub.name
+            n_cycle_files += len(files)
             samples.append(
                 BatchSample(
                     name=sname,
@@ -245,13 +288,17 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     species=self.txt_default_species.text().strip(),
                     output_path=(out_dir / f"{sname}.ome.tiff"),
                     enabled=True,
+                    cycles=cycles,
                     registration_algorithm="tiled_rigid",
                 )
             )
 
         self._samples = samples
         self._refresh_table()
-        self._set_status(f"Found {len(samples)} sample(s) with .ome.tiff files.")
+        self._set_status(
+            f"Found {len(samples)} sample(s) with {n_cycle_files} stitched cycle file(s) "
+            f"under sample/cycle directories."
+        )
 
     def _refresh_table(self) -> None:
         self.tbl.setRowCount(len(self._samples))
@@ -418,17 +465,21 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
     def _sample_to_cfg(self, s: BatchSample) -> dict | None:
         """Build an initial_cfg dict (MergeRegisterCyclesDialog-compatible) from a BatchSample."""
         try:
-            if not (s.cycles and s.registration_markers and s.channel_markers and s.channel_antibodies):
+            if not s.files:
                 return None
             cycles_out: list[dict] = []
             for i, p in enumerate(s.files):
+                reg_markers = list(s.registration_markers or [])
+                channel_markers = list(s.channel_markers or [])
+                channel_antibodies = list(s.channel_antibodies or [])
                 cycles_out.append(
                     {
                         "path": str(p),
-                        "cycle": int(s.cycles[i] if i < len(s.cycles) else i),
-                        "registration_marker": str(s.registration_markers[i] if i < len(s.registration_markers) else ""),
-                        "channel_markers": list(s.channel_markers[i] if i < len(s.channel_markers) else []),
-                        "channel_antibodies": list(s.channel_antibodies[i] if i < len(s.channel_antibodies) else []),
+                        "cycle": int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
+                        "enabled": bool(s.cycles_enabled[i] if s.cycles_enabled and i < len(s.cycles_enabled) else True),
+                        "registration_marker": str(reg_markers[i] if i < len(reg_markers) else ""),
+                        "channel_markers": list(channel_markers[i] if i < len(channel_markers) else []),
+                        "channel_antibodies": list(channel_antibodies[i] if i < len(channel_antibodies) else []),
                     }
                 )
             return {
