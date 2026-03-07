@@ -89,6 +89,81 @@ def _channel_names_from_ome(ome_xml: str, n_channels: int) -> list[str] | None:
         return None
 
 
+
+class IncrementalOmeBigTiffWriter:
+    """Incrementally write a (Y, X, C) image to an on-disk OME BigTIFF.
+
+    Uses ``tifffile.memmap`` so callers can write one channel plane at a time
+    without keeping the full merged output stack in RAM.
+
+    Notes
+    -----
+    - Compression is intentionally disabled because memory-mapped incremental
+      writes require an uncompressed layout.
+    - Internally the TIFF is stored as (C, Y, X) with OME axes="CYX".
+    """
+
+    def __init__(self, path: str, shape_yxc: tuple[int, int, int], dtype: np.dtype, channel_names: list[str] | None = None):
+        if len(shape_yxc) != 3:
+            raise ValueError(f"Expected output shape (Y,X,C). Got {shape_yxc}")
+        y, x, c = (int(shape_yxc[0]), int(shape_yxc[1]), int(shape_yxc[2]))
+        if y <= 0 or x <= 0 or c <= 0:
+            raise ValueError(f"Invalid output shape: {shape_yxc}")
+
+        self.path = path
+        self.shape_yxc = (y, x, c)
+        self.dtype = np.dtype(dtype)
+        if channel_names is None or len(channel_names) != c:
+            channel_names = [f"Channel {i}" for i in range(c)]
+        self.channel_names = list(channel_names)
+
+        metadata = {
+            "axes": "CYX",
+            "Channel": {"Name": list(self.channel_names)},
+        }
+
+        self._mm = tifffile.memmap(
+            self.path,
+            shape=(c, y, x),
+            dtype=self.dtype,
+            photometric="minisblack",
+            metadata=metadata,
+            ome=True,
+            bigtiff=True,
+        )
+
+    def write_channel(self, channel_index: int, plane_yx: np.ndarray) -> None:
+        idx = int(channel_index)
+        if idx < 0 or idx >= int(self.shape_yxc[2]):
+            raise IndexError(f"channel_index out of range: {channel_index}")
+        if plane_yx.ndim != 2:
+            raise ValueError(f"Expected (Y,X) plane. Got shape={plane_yx.shape}")
+        exp = (int(self.shape_yxc[0]), int(self.shape_yxc[1]))
+        got = (int(plane_yx.shape[0]), int(plane_yx.shape[1]))
+        if got != exp:
+            raise ValueError(f"Plane shape mismatch. Expected {exp}, got {got}")
+        self._mm[idx, :, :] = plane_yx.astype(self.dtype, copy=False)
+
+    def flush(self) -> None:
+        try:
+            self._mm.flush()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        self.flush()
+        try:
+            del self._mm
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
 def save_ome_tiff_yxc(
     path: str,
     img_yxc: np.ndarray,
@@ -203,56 +278,188 @@ def load_multichannel_tiff_native(path: str) -> tuple[np.ndarray, list[str]]:
 
     return arr, ch_names
 
-def load_channel_names_only(path: str) -> list[str]:
-    """Read OME channel names without reading pixel data.
 
-    This avoids a full tifffile.imread() which can be slow for large slides.
-    Falls back to generic "Channel i" names if OME metadata is missing.
+
+def inspect_tiff_yxc(path: str) -> dict:
+    """Inspect a TIFF/OME-TIFF without reading full pixel data.
+
+    Returns a dict with keys:
+      - shape_yxc: (Y, X, C)
+      - dtype: numpy dtype
+      - channel_names: list[str]
+      - axes: original tifffile series axes string (best effort)
     """
     with tifffile.TiffFile(path) as tf:
-        # Determine channel count from the first series
         try:
             series = tf.series[0]
-            shape = tuple(series.shape)
-            axes = getattr(series, "axes", "") or ""
+            shape = tuple(int(x) for x in series.shape)
+            axes = str(getattr(series, "axes", "") or "")
+            dtype = np.dtype(series.dtype)
         except Exception:
+            # Fall back to pages if series metadata are unavailable.
+            pages = list(tf.pages)
+            if not pages:
+                raise ValueError(f"No TIFF pages found in {path}")
+            dtype = np.dtype(getattr(pages[0], 'dtype', np.uint16))
+            axes = "CYX"
+            shape = (len(pages),) + tuple(int(x) for x in pages[0].shape)
+
+        if len(shape) != 3:
+            raise ValueError(f"Expected 3D TIFF/OME-TIFF. Got shape={shape}, axes={axes!r}")
+
+        # Convert common layouts to YXC metadata without reading pixels.
+        if axes and "C" in axes:
+            cpos = axes.index("C")
+            if cpos == 0:
+                c, y, x = shape
+            elif cpos == 2:
+                y, x, c = shape
+            else:
+                raise ValueError(f"Unsupported channel axis placement: shape={shape}, axes={axes!r}")
+        else:
+            # Common fallback: CYX when first dim is small, else YXC.
+            if shape[0] <= 64 and shape[1] > 64 and shape[2] > 64:
+                c, y, x = shape
+            elif shape[2] <= 64 and shape[0] > 64 and shape[1] > 64:
+                y, x, c = shape
+            else:
+                raise ValueError(f"Unable to infer channel axis from shape={shape}, axes={axes!r}")
+
+        ch_names = None
+        try:
+            ch_names = _channel_names_from_ome(tf.ome_metadata, int(c))
+        except Exception:
+            ch_names = None
+        if not ch_names or len(ch_names) != int(c):
+            ch_names = [f"Channel {i}" for i in range(int(c))]
+        else:
+            ch_names = [(nm if nm and nm.strip() else f"Channel {i}") for i, nm in enumerate(ch_names)]
+
+    return {
+        "shape_yxc": (int(y), int(x), int(c)),
+        "dtype": dtype,
+        "channel_names": list(ch_names),
+        "axes": axes,
+    }
+
+
+def load_single_channel_tiff_native(path: str, channel_index: int) -> np.ndarray:
+    """Load a single channel plane as (Y, X), preserving native dtype.
+
+    Uses TIFF metadata/page structure when possible to avoid reading all channels.
+    Falls back conservatively to full-series read + slice for uncommon layouts.
+    """
+    info = inspect_tiff_yxc(path)
+    y, x, c = info["shape_yxc"]
+    idx = int(channel_index)
+    if idx < 0 or idx >= int(c):
+        raise IndexError(f"channel_index {idx} out of bounds for {c} channels")
+
+    with tifffile.TiffFile(path) as tf:
+        try:
+            series = tf.series[0]
+            shape = tuple(int(v) for v in series.shape)
+            axes = str(getattr(series, "axes", "") or "")
+        except Exception:
+            series = None
             shape = ()
             axes = ""
 
-        # Best-effort infer n_channels from axes/shape
-        n_channels = 0
+        # Fast path: channels as separate pages / first axis.
         try:
-            if axes and "C" in axes:
-                cpos = axes.index("C")
-                n_channels = int(shape[cpos])
-            else:
-                # Common fallback: (C,Y,X) or (Y,X,C)
-                if len(shape) == 3:
-                    if shape[0] <= 64:
-                        n_channels = int(shape[0])
-                    else:
-                        n_channels = int(shape[2])
+            if len(shape) == 3 and ((axes and axes.startswith("C")) or (not axes and shape[0] == int(c))):
+                arr = series.asarray(key=idx) if series is not None else tf.pages[idx].asarray()
+                return np.asarray(arr)
         except Exception:
-            n_channels = 0
+            pass
 
-        if n_channels <= 0:
-            # Last-resort: count pages if they look like channel planes
-            try:
-                n_channels = int(len(tf.pages))
-            except Exception:
-                n_channels = 1
-
-        # Try OME metadata for names
-        ch_names = None
+        # Fast path: sample-interleaved YXC; read one page and slice the requested channel.
         try:
-            ome_xml = tf.ome_metadata
-            ch_names = _channel_names_from_ome(ome_xml, int(n_channels))
+            if len(shape) == 3 and ((axes and axes.endswith("C")) or (not axes and shape[2] == int(c))):
+                arr = series.asarray() if series is not None else tf.asarray()
+                arr = np.asarray(arr)
+                return arr[..., idx]
         except Exception:
-            ch_names = None
+            pass
 
-    if not ch_names or len(ch_names) != int(n_channels):
-        return [f"Channel {i}" for i in range(int(n_channels))]
-    return [(nm if nm and nm.strip() else f"Channel {i}") for i, nm in enumerate(ch_names)]
+    # Conservative fallback for unusual layouts.
+    arr = tifffile.imread(path)
+    arr = _normalize_to_yxc(arr)
+    return np.asarray(arr[..., idx])
+
+
+class LazyChannelImage:
+    """Lightweight on-demand YXC image wrapper backed by single-channel TIFF reads."""
+
+    def __init__(self, path: str, *, channel_indices: list[int] | None = None, _root=None):
+        self.path = str(path)
+        self._root = _root or self
+        if _root is None:
+            info = inspect_tiff_yxc(self.path)
+            self._shape_yxc_root = tuple(int(v) for v in info["shape_yxc"])
+            self.dtype = np.dtype(info["dtype"])
+            self.channel_names = list(info["channel_names"])
+            self._cache: dict[int, np.ndarray] = {}
+        else:
+            self._shape_yxc_root = tuple(int(v) for v in _root._shape_yxc_root)
+            self.dtype = np.dtype(_root.dtype)
+            self.channel_names = list(_root.channel_names)
+        if channel_indices is None:
+            channel_indices = list(range(int(self._shape_yxc_root[2])))
+        self._channel_indices = [int(i) for i in channel_indices]
+
+    @property
+    def shape(self):
+        y, x, _ = self._shape_yxc_root
+        return (int(y), int(x), int(len(self._channel_indices)))
+
+    @property
+    def ndim(self):
+        return 3
+
+    def subset(self, channel_indices: list[int]):
+        mapped = [self._channel_indices[int(i)] for i in channel_indices]
+        return LazyChannelImage(self.path, channel_indices=mapped, _root=self._root)
+
+    def get_channel(self, local_index: int) -> np.ndarray:
+        root = self._root
+        global_index = int(self._channel_indices[int(local_index)])
+        if global_index not in root._cache:
+            root._cache[global_index] = np.asarray(load_single_channel_tiff_native(self.path, global_index))
+        return root._cache[global_index]
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        parts = list(key)
+        if Ellipsis in parts:
+            eidx = parts.index(Ellipsis)
+            n_missing = 3 - (len(parts) - 1)
+            parts = parts[:eidx] + [slice(None)] * max(0, n_missing) + parts[eidx + 1:]
+        while len(parts) < 3:
+            parts.append(slice(None))
+        yk, xk, ck = parts[:3]
+
+        if isinstance(ck, (int, np.integer)):
+            return np.asarray(self.get_channel(int(ck))[yk, xk])
+
+        if isinstance(ck, slice):
+            local_channels = list(range(*ck.indices(len(self._channel_indices))))
+        elif isinstance(ck, (list, tuple, np.ndarray)):
+            local_channels = [int(i) for i in ck]
+        else:
+            raise TypeError(f"Unsupported channel index type: {type(ck)!r}")
+
+        planes = [np.asarray(self.get_channel(i)[yk, xk]) for i in local_channels]
+        if not planes:
+            y, x = np.asarray(self.get_channel(0)[yk, xk]).shape[:2]
+            return np.empty((y, x, 0), dtype=self.dtype)
+        return np.stack(planes, axis=-1)
+
+
+def load_channel_names_only(path: str) -> list[str]:
+    """Read channel names without reading full pixel data."""
+    return list(inspect_tiff_yxc(path)["channel_names"])
 
 
 

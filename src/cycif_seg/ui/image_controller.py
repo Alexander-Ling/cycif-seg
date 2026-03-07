@@ -8,7 +8,7 @@ from qtpy import QtCore, QtWidgets
 from napari.qt.threading import thread_worker
 from napari.utils.notifications import show_warning, show_info
 
-from cycif_seg.io.ome_tiff import load_multichannel_tiff, load_multichannel_tiff_lazy
+from cycif_seg.io.ome_tiff import LazyChannelImage, inspect_tiff_yxc, load_single_channel_tiff_native
 
 
 class ImageController:
@@ -162,36 +162,41 @@ class ImageController:
         indices = sorted(set(int(i) for i in indices))
         should_display = set(indices)
 
-        # Remove any per-channel layers no longer selected
-        for i, nm in enumerate(list(w.ch_names)):
-            if nm in w.viewer.layers and i not in should_display:
-                try:
-                    w.viewer.layers.remove(nm)
-                except Exception:
-                    try:
-                        w.viewer.layers[nm].visible = False
-                    except Exception:
-                        pass
-
-        # Toggle visibility for existing layers
-        for i, nm in enumerate(list(w.ch_names)):
-            if nm in w.viewer.layers:
-                try:
-                    w.viewer.layers[nm].visible = (i in should_display)
-                except Exception:
-                    pass
-
+        to_remove = [i for i, nm in enumerate(list(w.ch_names)) if nm in w.viewer.layers and i not in should_display]
         to_add = [i for i in indices if w.ch_names[i] not in w.viewer.layers]
+        total_ops = max(1, len(to_remove) + len(to_add))
+        progress = {"n": 0}
 
-        # Configure determinate progress for layer creation only.
         try:
             if getattr(w, "prog", None) is not None:
                 w.prog.setVisible(True)
-                w.prog.setRange(0, max(1, len(to_add)))
+                w.prog.setRange(0, total_ops)
                 w.prog.setValue(0)
                 QtWidgets.QApplication.processEvents()
         except Exception:
             pass
+
+        def _bump_progress():
+            progress["n"] += 1
+            try:
+                if getattr(w, "prog", None) is not None and w.prog.isVisible():
+                    w.prog.setValue(min(progress["n"], total_ops))
+                    QtWidgets.QApplication.processEvents()
+            except Exception:
+                pass
+
+        # Remove any per-channel layers no longer selected.
+        for i in to_remove:
+            nm = w.ch_names[i]
+            try:
+                if nm in w.viewer.layers:
+                    w.viewer.layers.remove(nm)
+            except Exception:
+                try:
+                    w.viewer.layers.remove(str(nm))
+                except Exception:
+                    pass
+            _bump_progress()
 
         def _finish():
             # Keep scribbles on top
@@ -215,48 +220,56 @@ class ImageController:
             _finish()
             return
 
-        def _add_next(k: int):
-            if k >= len(to_add):
-                _finish()
-                return
+        @thread_worker
+        def _load_planes_worker(path, load_indices):
+            for idx in load_indices:
+                plane = np.asarray(load_single_channel_tiff_native(path, int(idx)))
+                yield (int(idx), plane)
 
-            i = to_add[k]
+        worker = _load_planes_worker(w.path, to_add)
+        w._channel_update_worker = worker
+
+        @worker.yielded.connect
+        def _on_plane_loaded(result):
+            i, plane = result
             nm = w.ch_names[i]
-
-            # Update progress before add_image so the user sees movement.
             try:
-                if getattr(w, "prog", None) is not None and w.prog.isVisible():
-                    w.prog.setValue(min(k, w.prog.maximum()))
-                    QtWidgets.QApplication.processEvents()
+                if nm in w.viewer.layers:
+                    try:
+                        w.viewer.layers[nm].data = plane
+                        w.viewer.layers[nm].visible = True
+                    except Exception:
+                        pass
+                else:
+                    w.viewer.add_image(
+                        plane,
+                        name=nm,
+                        blending="additive",
+                        opacity=0.6,
+                        colormap=w._colormap_for_channel(i),
+                    )
+                    try:
+                        w._connect_layer_dirty(w.viewer.layers[nm])
+                    except Exception:
+                        pass
+                _bump_progress()
+            except Exception:
+                raise
+
+        @worker.returned.connect
+        def _on_done(_):
+            _finish()
+
+        @worker.errored.connect
+        def _on_err(e):
+            show_warning(f"Update displayed channels failed: {e}")
+            try:
+                w.set_status(f"Update displayed channels failed: {e}")
             except Exception:
                 pass
+            _finish()
 
-            try:
-                w.viewer.add_image(
-                    w.img[..., i],
-                    name=nm,
-                    blending="additive",
-                    opacity=0.6,
-                    colormap=w._colormap_for_channel(i),
-                )
-                try:
-                    w._connect_layer_dirty(w.viewer.layers[nm])
-                except Exception:
-                    pass
-                try:
-                    w.viewer.layers[nm].visible = True
-                except Exception:
-                    pass
-            finally:
-                try:
-                    if getattr(w, "prog", None) is not None and w.prog.isVisible():
-                        w.prog.setValue(min(k + 1, w.prog.maximum()))
-                        QtWidgets.QApplication.processEvents()
-                except Exception:
-                    pass
-                QtCore.QTimer.singleShot(0, lambda: _add_next(k + 1))
-
-        QtCore.QTimer.singleShot(0, lambda: _add_next(0))
+        worker.start()
 
     def on_apply_channel_selection(self) -> None:
         w = self.w
@@ -315,7 +328,7 @@ class ImageController:
 
         w.set_status("Loading image…")
         w.prog.setVisible(True)
-        w.prog.setRange(0, 0)  # indeterminate/busy
+        w.prog.setRange(0, 3)
         w.prog.setValue(0)
         try:
             w.btn_load.setEnabled(False)
@@ -324,22 +337,44 @@ class ImageController:
 
         @thread_worker
         def _load_worker(p):
-            try:
-                img_cyx, names = load_multichannel_tiff_lazy(p)
-                try:
-                    import dask.array as da  # type: ignore
-                    img_yxc = da.moveaxis(img_cyx, 0, 2)
-                except Exception:
-                    img_yxc = img_cyx
-                return img_yxc, names
-            except Exception:
-                return load_multichannel_tiff(p)
+            info = inspect_tiff_yxc(p)
+            yield ("metadata", info)
+            first_plane = np.asarray(load_single_channel_tiff_native(p, 0))
+            yield ("first_plane", first_plane)
+            return info
 
         worker = _load_worker(path)
+        state = {"info": None, "first_plane": None}
+        w._image_load_worker = worker
+
+        @worker.yielded.connect
+        def _on_progress(payload):
+            kind, value = payload
+            if kind == "metadata":
+                state["info"] = value
+                try:
+                    w.prog.setValue(1)
+                except Exception:
+                    pass
+            elif kind == "first_plane":
+                state["first_plane"] = value
+                try:
+                    w.prog.setValue(2)
+                except Exception:
+                    pass
 
         @worker.returned.connect
-        def _on_loaded(result):
-            w.img, w.ch_names = result
+        def _on_loaded(info):
+            ch_names = list(info.get("channel_names") or [])
+            if not ch_names:
+                ch_names = ["Channel 0"]
+
+            w.img = LazyChannelImage(path)
+            try:
+                w.img._root._cache[0] = np.asarray(state.get("first_plane"))
+            except Exception:
+                pass
+            w.ch_names = ch_names
 
             # Populate channel list
             w.list_channels.blockSignals(True)
@@ -367,10 +402,10 @@ class ImageController:
                 finally:
                     w._pending_restore = None
 
-            w.set_status(f"Loaded image {w.img.shape} with {len(w.ch_names)} channels.")
+            shp = tuple(int(v) for v in getattr(w.img, 'shape', (0, 0, 0)))
+            w.set_status(f"Loaded image {shp} with {len(w.ch_names)} channels.")
 
-            w.prog.setRange(0, 1)
-            w.prog.setValue(1)
+            w.prog.setValue(3)
             try:
                 w.btn_load.setEnabled(True)
             except Exception:

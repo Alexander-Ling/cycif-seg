@@ -26,7 +26,15 @@ except Exception:  # pragma: no cover
 
 import tifffile
 
-from cycif_seg.io.ome_tiff import load_multichannel_tiff, load_multichannel_tiff_native, save_ome_tiff_yxc
+from cycif_seg.io.ome_tiff import (
+    IncrementalOmeBigTiffWriter,
+    inspect_tiff_yxc,
+    load_channel_names_only,
+    load_multichannel_tiff,
+    load_multichannel_tiff_native,
+    load_single_channel_tiff_native,
+    save_ome_tiff_yxc,
+)
 
 
 # Enable very fine-grained debug prints for isolating native crashes (e.g., in SimpleITK/ITK).
@@ -133,23 +141,8 @@ def _pad_plane_to_canvas(plane_yx: np.ndarray, canvas_yx: tuple[int, int], *, ou
 
 def _tiff_info_yxc(path: str) -> tuple[tuple[int, int, int], np.dtype]:
     """Return ((Y,X,C), dtype) without reading full pixel data."""
-    with tifffile.TiffFile(path) as tf:
-        series0 = tf.series[0]
-        shp = tuple(int(x) for x in series0.shape)
-        dtype = np.dtype(series0.dtype)
-
-    if len(shp) != 3:
-        raise ValueError(f"Expected 3D TIFF series. Got shape={shp} for {path}")
-
-    # Same heuristic as _normalize_to_yxc
-    if shp[0] <= 32 and shp[1] > 64 and shp[2] > 64:
-        # (C,Y,X)
-        y, x, c = shp[1], shp[2], shp[0]
-    else:
-        # assume (Y,X,C)
-        y, x, c = shp[0], shp[1], shp[2]
-
-    return (int(y), int(x), int(c)), dtype
+    info = inspect_tiff_yxc(path)
+    return tuple(int(v) for v in info["shape_yxc"]), np.dtype(info["dtype"])
 
 
 def _cast_preserve_dtype(plane_f32: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -998,27 +991,30 @@ def merge_cycles_to_ome_tiff(
         if ref_ci is None:
             raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
 
-        # Allocate final merged output once.
-        merged = np.zeros((int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)), dtype=base_dtype)
-
-        # Build merged channel names as we go.
+        # Build merged channel names up front so the output OME metadata can be
+        # written once when the on-disk BigTIFF is initialized.
         merged_names: list[str] = []
         seen: dict[str, int] = {}
 
-        # Load reference registration channel once (float32), but do not keep whole reference image.
+        # Load only the reference registration channel once (float32), not the full reference stack.
         ref_marker = ref_ci.registration_marker or default_registration_marker
         if progress_cb:
             progress_cb(f"Loading reference cycle {int(ref_ci.cycle)}")
         _dbg(f"load reference: cycle={int(ref_ci.cycle)} marker={ref_marker!r}")
         _emit_tick(f"Loading reference cycle {int(ref_ci.cycle)}", phase="load_ref", cycle=int(ref_ci.cycle))
-        ref_img, ref_names = load_multichannel_tiff_native(ref_ci.path)
-        _dbg(f"loaded reference: names={len(ref_names)}")
+        ref_names = load_channel_names_only(ref_ci.path)
+        _dbg(f"loaded reference channel metadata: names={len(ref_names)}")
         ref_ch_idx = _find_channel_index(ref_names, ref_marker)
         ref_yx: np.ndarray | None
         if ref_ch_idx is None:
             ref_yx = None
         else:
-            ref_yx = _pad_plane_to_canvas(ref_img[..., ref_ch_idx], canvas_yx, out_dtype=np.float32)
+            ref_plane_native = load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx))
+            ref_yx = _pad_plane_to_canvas(ref_plane_native, canvas_yx, out_dtype=np.float32)
+            try:
+                del ref_plane_native
+            except Exception:
+                pass
 
         # After loading reference cycle
         completed_ticks += 1
@@ -1029,7 +1025,7 @@ def merge_cycles_to_ome_tiff(
         transforms: dict[int, object] = {}
 
         # Helper to name output channels
-        def _append_channel_name(ci: CycleInput, orig_name: str, j: int) -> None:
+        def _make_output_channel_name(ci: CycleInput, orig_name: str, j: int) -> str:
             cy = int(ci.cycle)
             markers = ci.channel_markers or []
             marker = (markers[j] if j < len(markers) else "").strip()
@@ -1038,173 +1034,187 @@ def merge_cycles_to_ome_tiff(
             k = int(seen.get(out_nm, 0))
             out_nm2 = f"{out_nm}_{k+1}" if k else out_nm
             seen[out_nm] = k + 1
-            merged_names.append(out_nm2)
+            return out_nm2
 
-        # Write reference cycle first (unregistered)
-        out_c = 0
-        for ci in cycles:
-            _check_cancel()
+        for ci, _shp_yxc, _dt in infos:
+            ch_names_only = load_channel_names_only(ci.path)
+            for j, nm in enumerate(ch_names_only):
+                merged_names.append(_make_output_channel_name(ci, nm, j))
 
-            _dbg(f"cycle start: cycle={int(ci.cycle)}")
+        with IncrementalOmeBigTiffWriter(
+            output_path,
+            (int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)),
+            base_dtype,
+            merged_names,
+        ) as writer:
+            # Write reference cycle first (unregistered)
+            out_c = 0
+            for ci in cycles:
+                _check_cancel()
 
-            if int(ci.cycle) == int(ref_ci.cycle):
-                # Use already-loaded ref_img/ref_names
-                img = ref_img
-                ch_names = ref_names
-                dy = 0.0
-                dx = 0.0
-                
-            else:
-                if progress_cb:
-                    progress_cb(f"Registering cycle {int(ci.cycle)}")
-                _dbg(f"load cycle: cycle={int(ci.cycle)}")
-                _emit_tick(f"Registering cycle {int(ci.cycle)}", phase="load_cycle", cycle=int(ci.cycle))
-                img, ch_names = load_multichannel_tiff_native(ci.path)
-                _dbg(f"loaded cycle: cycle={int(ci.cycle)} n_channels={int(img.shape[2])} names={len(ch_names)}")
+                _dbg(f"cycle start: cycle={int(ci.cycle)}")
 
-                # Progress: loading cycle image
-                completed_ticks += 1
-                completed_ticks = min(int(completed_ticks), int(total_ticks))
-                _emit_tick(f"Loaded cycle {int(ci.cycle)}", phase="cycle_loaded", cycle=int(ci.cycle))
+                ch_names = load_channel_names_only(ci.path)
+                n_ch_cycle = int(len(ch_names))
 
-                # Determine shift for this cycle
-                if ref_yx is None:
-                    dy, dx = (0.0, 0.0)
+                if int(ci.cycle) == int(ref_ci.cycle):
+                    dy = 0.0
+                    dx = 0.0
                 else:
-                    marker = ci.registration_marker or default_registration_marker
-                    ch_idx = _find_channel_index(ch_names, marker)
-                    if ch_idx is None:
-                        dy, dx = (0.0, 0.0)
-                    else:
-                        mov_yx = _pad_plane_to_canvas(img[..., ch_idx], canvas_yx, out_dtype=np.float32)
-                    
-                        _dbg(f"estimate translation: cycle={int(ci.cycle)}")
-                    
-                        # Always compute an initial translation (for reporting + as initialization for the tiled refinement).
-                        dy, dx = estimate_translation(
-                            ref_yx,
-                            mov_yx,
-                            downsample=int(downsample_for_registration),
-                            upsample_factor=int(upsample_factor),
-                        )
-                    
-                        _dbg(f"estimated translation: cycle={int(ci.cycle)} dy={float(dy):.3f} dx={float(dx):.3f}")
+                    if progress_cb:
+                        progress_cb(f"Registering cycle {int(ci.cycle)}")
+                    _dbg(f"load cycle registration channel: cycle={int(ci.cycle)}")
+                    _emit_tick(f"Registering cycle {int(ci.cycle)}", phase="load_cycle", cycle=int(ci.cycle))
 
-                        # Progress: initial transform
-                        completed_ticks += 1
-                        completed_ticks = min(int(completed_ticks), int(total_ticks))
-                        _emit_tick(f"Cycle {int(ci.cycle)}: initial transform", phase="initial_transform", cycle=int(ci.cycle))
-                    
-                        if reg_alg == "tiled_rigid":
-                            # Tiled rigid refinement (rotation+translation per tile) on the registration channel.
-                            if progress_cb:
-                                progress_cb(f"Tiled rigid registering cycle {int(ci.cycle)}")
-                            _dbg(f"tiled rigid compute: cycle={int(ci.cycle)}")
-                            mov_init = mov_yx
-                            if dy != 0.0 or dx != 0.0:
-                                mov_init = apply_translation_yxc(mov_yx[..., None], dy=dy, dx=dx, order=1)[..., 0]
-
-                            # Progress: 1 tick per 10 processed tiles; ensure we consume exactly tile_ticks.
-                            emitted_for_cycle = 0
-
-                            def _on_tile_processed(n_done: int) -> None:
-                                nonlocal emitted_for_cycle, completed_ticks
-                                if n_done > 0 and (n_done % 10 == 0):
-                                    emitted_for_cycle += 1
-                                    completed_ticks += 1
-                                    completed_ticks = min(int(completed_ticks), int(total_ticks))
-                                    _emit_tick(
-                                        f"Cycle {int(ci.cycle)}: registered {n_done}/{expected_tiles} tiles",
-                                        phase="tiles",
-                                        cycle=int(ci.cycle),
-                                    )
-
-                            transforms[int(ci.cycle)] = estimate_tiled_rigid_transforms(
-                                fixed_yx=ref_yx,
-                                moving_yx=mov_init,
-                                tile_size=int(tile_size_px),
-                                search_factor=2,
-                                angle_deg_max=5.0,
-                                angle_step=1.0,
-                                allow_rotation=bool(tiled_rigid_allow_rotation),
-                                on_tile_processed=_on_tile_processed,
-                            )
-
-                            # If the last partial batch (<10) didn't trigger a tick, advance remaining ticks.
-                            # We want exactly tile_ticks ticks for this cycle.
-                            need = int(tile_ticks) - int(emitted_for_cycle)
-                            if need > 0:
-                                completed_ticks += int(need)
-                                completed_ticks = min(int(completed_ticks), int(total_ticks))
-                                _emit_tick(
-                                    f"Cycle {int(ci.cycle)}: finished tiles",
-                                    phase="tiles_done",
-                                    cycle=int(ci.cycle),
-                                )
-                            _dbg(f"tiled rigid done: cycle={int(ci.cycle)}")
-
-            shifts[int(ci.cycle)] = (float(dy), float(dx))
-
-            # Register/write each channel plane directly into the final output.
-            for j in range(int(img.shape[2])):
-                _dbg(f"plane: cycle={int(ci.cycle)} ch={j}/{int(img.shape[2]) - 1} out_c={int(out_c)}")
-                plane = _pad_plane_to_canvas(img[..., j], canvas_yx, out_dtype=np.float32)
-                if reg_alg == "translation":
-                    if dy != 0.0 or dx != 0.0:
-                        # Use the existing translation implementation on a 1-channel stack to reuse code.
-                        plane_yxc = plane[..., None]
-                        plane_reg = apply_translation_yxc(plane_yxc, dy=dy, dx=dx, order=1)[..., 0]
-                    else:
-                        plane_reg = plane
-                else:
-                    t = transforms.get(int(ci.cycle))
-                    if t is None:
-                        plane_reg = plane
-                    else:
-                        # Apply tiled rigid reconstruction using precomputed tile transforms from the registration channel.
-                        _dbg(f"apply tiled rigid: cycle={int(ci.cycle)} ch={j}")
-                        # First apply the global translation (dy,dx) to the full plane, then tile-reconstruct.
-                        plane_init = plane
-                        if dy != 0.0 or dx != 0.0:
-                            plane_init = apply_translation_yxc(plane[..., None], dy=dy, dx=dx, order=1)[..., 0]
-                        plane_reg = apply_tiled_rigid_to_plane(plane_init, canvas_yx=canvas_yx, transforms=t)  # type: ignore[arg-type]
-                        _dbg(f"applied tiled rigid: cycle={int(ci.cycle)} ch={j}")
-
-                merged[..., int(out_c)] = _cast_preserve_dtype(plane_reg, base_dtype)
-
-                # Progress: applying transform to one channel (always 1 tick per channel, per spec)
-                if int(ci.cycle) != int(reference_cycle):
+                    # Progress: loading cycle image/registration channel
                     completed_ticks += 1
                     completed_ticks = min(int(completed_ticks), int(total_ticks))
-                    _emit_tick(
-                        f"Cycle {int(ci.cycle)}: applied channel {int(j)+1}/{int(img.shape[2])}",
-                        phase="apply_channel",
-                        cycle=int(ci.cycle),
-                    )
-                _append_channel_name(ci, ch_names[j], j)
-                out_c += 1
+                    _emit_tick(f"Loaded cycle {int(ci.cycle)}", phase="cycle_loaded", cycle=int(ci.cycle))
 
-            # No cycle-level tick here; tile-level ticks cover registration progress.
+                    # Determine shift for this cycle using only its registration channel.
+                    if ref_yx is None:
+                        dy, dx = (0.0, 0.0)
+                    else:
+                        marker = ci.registration_marker or default_registration_marker
+                        ch_idx = _find_channel_index(ch_names, marker)
+                        if ch_idx is None:
+                            dy, dx = (0.0, 0.0)
+                        else:
+                            mov_plane_native = load_single_channel_tiff_native(ci.path, int(ch_idx))
+                            mov_yx = _pad_plane_to_canvas(mov_plane_native, canvas_yx, out_dtype=np.float32)
+                            try:
+                                del mov_plane_native
+                            except Exception:
+                                pass
 
-            # Release non-reference cycle arrays ASAP.
-            if int(ci.cycle) != int(ref_ci.cycle):
-                try:
-                    del img
-                except Exception:
-                    pass
+                            _dbg(f"estimate translation: cycle={int(ci.cycle)}")
 
-        if progress_cb:
-            progress_cb("Writing OME-TIFF")
-        _dbg(f"write: start output_path={output_path!r}")
-        _emit_tick(f"Writing output: {output_path}", phase="write_start")
+                            # Always compute an initial translation (for reporting + as initialization for the tiled refinement).
+                            dy, dx = estimate_translation(
+                                ref_yx,
+                                mov_yx,
+                                downsample=int(downsample_for_registration),
+                                upsample_factor=int(upsample_factor),
+                            )
 
-        save_ome_tiff_yxc(output_path, merged, merged_names)
-        _dbg("write: done")
+                            _dbg(f"estimated translation: cycle={int(ci.cycle)} dy={float(dy):.3f} dx={float(dx):.3f}")
 
-        # Saving output file: 1 tick per cycle processed (including reference)
-        completed_ticks += int(n_cycles)
-        completed_ticks = min(int(completed_ticks), int(total_ticks))
-        _emit_tick(f"Wrote output: {output_path}", phase="write_done")
+                            # Progress: initial transform
+                            completed_ticks += 1
+                            completed_ticks = min(int(completed_ticks), int(total_ticks))
+                            _emit_tick(f"Cycle {int(ci.cycle)}: initial transform", phase="initial_transform", cycle=int(ci.cycle))
+
+                            if reg_alg == "tiled_rigid":
+                                # Tiled rigid refinement (rotation+translation per tile) on the registration channel.
+                                if progress_cb:
+                                    progress_cb(f"Tiled rigid registering cycle {int(ci.cycle)}")
+                                _dbg(f"tiled rigid compute: cycle={int(ci.cycle)}")
+                                mov_init = mov_yx
+                                if dy != 0.0 or dx != 0.0:
+                                    mov_init = apply_translation_yxc(mov_yx[..., None], dy=dy, dx=dx, order=1)[..., 0]
+
+                                # Progress: 1 tick per 10 processed tiles; ensure we consume exactly tile_ticks.
+                                emitted_for_cycle = 0
+
+                                def _on_tile_processed(n_done: int) -> None:
+                                    nonlocal emitted_for_cycle, completed_ticks
+                                    if n_done > 0 and (n_done % 10 == 0):
+                                        emitted_for_cycle += 1
+                                        completed_ticks += 1
+                                        completed_ticks = min(int(completed_ticks), int(total_ticks))
+                                        _emit_tick(
+                                            f"Cycle {int(ci.cycle)}: registered {n_done}/{expected_tiles} tiles",
+                                            phase="tiles",
+                                            cycle=int(ci.cycle),
+                                        )
+
+                                transforms[int(ci.cycle)] = estimate_tiled_rigid_transforms(
+                                    fixed_yx=ref_yx,
+                                    moving_yx=mov_init,
+                                    tile_size=int(tile_size_px),
+                                    search_factor=2,
+                                    angle_deg_max=5.0,
+                                    angle_step=1.0,
+                                    allow_rotation=bool(tiled_rigid_allow_rotation),
+                                    on_tile_processed=_on_tile_processed,
+                                )
+
+                                # If the last partial batch (<10) didn't trigger a tick, advance remaining ticks.
+                                # We want exactly tile_ticks ticks for this cycle.
+                                need = int(tile_ticks) - int(emitted_for_cycle)
+                                if need > 0:
+                                    completed_ticks += int(need)
+                                    completed_ticks = min(int(completed_ticks), int(total_ticks))
+                                    _emit_tick(
+                                        f"Cycle {int(ci.cycle)}: finished tiles",
+                                        phase="tiles_done",
+                                        cycle=int(ci.cycle),
+                                    )
+                                _dbg(f"tiled rigid done: cycle={int(ci.cycle)}")
+
+                            try:
+                                del mov_yx
+                            except Exception:
+                                pass
+
+                shifts[int(ci.cycle)] = (float(dy), float(dx))
+
+                # Register/write each channel plane directly into the final output.
+                for j in range(int(n_ch_cycle)):
+                    _dbg(f"plane: cycle={int(ci.cycle)} ch={j}/{int(n_ch_cycle) - 1} out_c={int(out_c)}")
+                    plane_native = load_single_channel_tiff_native(ci.path, int(j))
+                    plane = _pad_plane_to_canvas(plane_native, canvas_yx, out_dtype=np.float32)
+                    try:
+                        del plane_native
+                    except Exception:
+                        pass
+                    if reg_alg == "translation":
+                        if dy != 0.0 or dx != 0.0:
+                            # Use the existing translation implementation on a 1-channel stack to reuse code.
+                            plane_yxc = plane[..., None]
+                            plane_reg = apply_translation_yxc(plane_yxc, dy=dy, dx=dx, order=1)[..., 0]
+                        else:
+                            plane_reg = plane
+                    else:
+                        t = transforms.get(int(ci.cycle))
+                        if t is None:
+                            plane_reg = plane
+                        else:
+                            # Apply tiled rigid reconstruction using precomputed tile transforms from the registration channel.
+                            _dbg(f"apply tiled rigid: cycle={int(ci.cycle)} ch={j}")
+                            # First apply the global translation (dy,dx) to the full plane, then tile-reconstruct.
+                            plane_init = plane
+                            if dy != 0.0 or dx != 0.0:
+                                plane_init = apply_translation_yxc(plane[..., None], dy=dy, dx=dx, order=1)[..., 0]
+                            plane_reg = apply_tiled_rigid_to_plane(plane_init, canvas_yx=canvas_yx, transforms=t)  # type: ignore[arg-type]
+                            _dbg(f"applied tiled rigid: cycle={int(ci.cycle)} ch={j}")
+
+                    writer.write_channel(int(out_c), _cast_preserve_dtype(plane_reg, base_dtype))
+
+                    # Progress: applying transform to one channel (always 1 tick per channel, per spec)
+                    if int(ci.cycle) != int(reference_cycle):
+                        completed_ticks += 1
+                        completed_ticks = min(int(completed_ticks), int(total_ticks))
+                        _emit_tick(
+                            f"Cycle {int(ci.cycle)}: applied channel {int(j)+1}/{int(n_ch_cycle)}",
+                            phase="apply_channel",
+                            cycle=int(ci.cycle),
+                        )
+                    out_c += 1
+
+                # No cycle-level tick here; tile-level ticks cover registration progress.
+
+            if progress_cb:
+                progress_cb("Writing OME-TIFF")
+            _dbg(f"write: finalize output_path={output_path!r}")
+            _emit_tick(f"Writing output: {output_path}", phase="write_start")
+            writer.flush()
+            _dbg("write: done")
+
+            # Saving output file: 1 tick per cycle processed (including reference)
+            completed_ticks += int(n_cycles)
+            completed_ticks = min(int(completed_ticks), int(total_ticks))
+            _emit_tick(f"Wrote output: {output_path}", phase="write_done")
 
         return {
             "output_path": output_path,
@@ -1213,8 +1223,8 @@ def merge_cycles_to_ome_tiff(
             "shifts_yx": shifts,
             "canvas_yx": canvas_yx,
             "inputs": [{"cycle": int(ci.cycle), "path": ci.path} for ci in cycles],
-            "n_channels_out": int(merged.shape[2]),
-            "shape_yxc": tuple(int(x) for x in merged.shape),
+            "n_channels_out": int(total_ch),
+            "shape_yxc": (int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)),
             "low_mem": True,
         }
 

@@ -7,5 +7,6 @@ scikit-image
 scipy
 scikit-learn
 qtpy
+simpleitk
 superqt
 ome-types
