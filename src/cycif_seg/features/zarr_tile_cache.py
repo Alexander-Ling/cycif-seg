@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import hashlib
+import os
 import threading
 import time as _time
 import math
@@ -20,6 +21,64 @@ except Exception:  # pragma: no cover
     Blosc = None
 
 from cycif_seg.features.multiscale import build_features, features_per_channel
+
+# Debug logging for Step 2a Zarr feature cache.
+# Enable with:
+#   CYCIF_SEG_STEP2A_CACHE_DEBUG=1
+_STEP2A_CACHE_DEBUG = str(os.environ.get("CYCIF_SEG_STEP2A_CACHE_DEBUG", "0")).strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+
+def _dbg(msg: str) -> None:
+    if _STEP2A_CACHE_DEBUG:
+        try:
+           print(f"[Step2aCache] {msg}")
+        except Exception:
+            pass
+
+
+def _array_debug_summary(arr: np.ndarray) -> str:
+    """Compact summary string for debug logging."""
+    try:
+        a = np.asarray(arr)
+        if a.size == 0:
+            return "shape=() empty"
+        finite = np.isfinite(a)
+        n_finite = int(finite.sum())
+        n_total = int(a.size)
+        if n_finite == 0:
+            return f"shape={tuple(int(x) for x in a.shape)} finite=0/{n_total}"
+        af = a[finite]
+        amin = float(np.min(af))
+        amax = float(np.max(af))
+        amean = float(np.mean(af))
+        return (
+            f"shape={tuple(int(x) for x in a.shape)} "
+            f"finite={n_finite}/{n_total} "
+            f"min={amin:.6g} max={amax:.6g} mean={amean:.6g}"
+        )
+    except Exception as e:
+        return f"summary_failed:{type(e).__name__}"
+
+
+def _is_suspicious_array(arr: np.ndarray, *, nearly_constant_tol: float = 1e-6) -> tuple[bool, str]:
+    """Return (is_suspicious, reason) for debug logging."""
+    try:
+        a = np.asarray(arr)
+        if a.size == 0:
+            return True, "empty"
+        if not np.all(np.isfinite(a)):
+            return True, "nonfinite"
+        amin = float(np.min(a))
+        amax = float(np.max(a))
+        if amin == 0.0 and amax == 0.0:
+            return True, "all_zero"
+        if abs(amax - amin) <= float(nearly_constant_tol):
+            return True, f"nearly_constant(range={amax - amin:.3g})"
+        return False, ""
+    except Exception as e:
+        return True, f"summary_exception:{type(e).__name__}"
 
 
 def _sha1(s: str) -> str:
@@ -383,6 +442,81 @@ class ZarrTileFeatureCache:
             f"read={br/1e6:.1f}MB written={bw/1e6:.1f}MB"
         )
 
+    def _reset_channel_cache(
+        self,
+        zf,
+        zm,
+        *,
+        c: int,
+        compressor,
+        reason: str = "",
+    ) -> None:
+        """Rebuild both feature and mask datasets for one channel.
+
+        If the feature array is recreated, the tile-validity mask must also be
+        recreated. Otherwise tiles may remain marked as cached while their feature
+        values are blank/newly initialized.
+        """
+        _dbg(
+            "reset_channel_cache "
+            f"channel={int(c)} reason={reason or 'unspecified'} "
+            f"shape=({self.H},{self.W},{self.Fch}) tiles=({self.n_ty},{self.n_tx})"
+        )
+
+        try:
+            if "data" in zf:
+                del zf["data"]
+        except Exception as e:
+            raise RuntimeError(f"Unable to reset feature cache for channel {c}: {e}")
+
+        zf.create_dataset(
+            "data",
+            shape=(self.H, self.W, self.Fch),
+            chunks=(min(self.tile_size, self.H), min(self.tile_size, self.W), self.Fch),
+            dtype="float16",
+            compressor=compressor,
+            overwrite=False,
+        )
+        zf.attrs.update(
+            {
+                "channel_index": int(c),
+                "features_per_channel": int(self.Fch),
+                "tile_size": int(self.tile_size),
+                "feature_config_hash": str(self.cfg.hash()),
+                "image_fingerprint": str(self.image_fingerprint),
+            }
+        )
+
+        try:
+            if "mask" in zm:
+                del zm["mask"]
+        except Exception as e:
+            raise RuntimeError(f"Unable to reset mask cache for channel {c}: {e}")
+
+        zm.create_dataset(
+            "mask",
+            shape=(self.n_ty, self.n_tx),
+            chunks=(min(64, self.n_ty), min(64, self.n_tx)),
+            dtype="uint8",
+            compressor=compressor,
+            overwrite=False,
+        )
+        zm.attrs.update(
+            {
+                "channel_index": int(c),
+                "tile_size": int(self.tile_size),
+                "feature_config_hash": str(self.cfg.hash()),
+                "image_fingerprint": str(self.image_fingerprint),
+            }
+        )
+
+        _dbg(
+            "reset_channel_cache_done "
+            f"channel={int(c)} dtype=float16 "
+            f"feat_shape={(self.H, self.W, self.Fch)} "
+            f"mask_shape={(self.n_ty, self.n_tx)}"
+        )
+
     def _open_channel_arrays(self, c: int):
         """Open (features_array, mask_array) for channel c, creating if needed.
 
@@ -415,9 +549,12 @@ class ZarrTileFeatureCache:
             feat_path = ch_dir / "features.zarr"
             mask_path = ch_dir / "mask.zarr"
 
-            # Open/create arrays
-            # Use Zarr v2 for maximum compatibility with numcodecs.* codecs.
+            # Keep both stores in Zarr v2 for compatibility with numcodecs codecs.
             zf = zarr.open_group(str(feat_path), mode="a", zarr_format=2)
+            zm = zarr.open_group(str(mask_path), mode="a", zarr_format=2)
+
+            created_feat = False
+            created_mask = False
             if "data" not in zf:
                 zf.create_dataset(
                     "data",
@@ -437,41 +574,7 @@ class ZarrTileFeatureCache:
                         "image_fingerprint": str(self.image_fingerprint),
                     }
                 )
-            else:
-                # If a previous cache was created with float16 (can overflow CycIF intensities),
-                # rebuild it as float32 to avoid inf values during training.
-                try:
-                    arr0 = zf["data"]
-                    if str(arr0.dtype) != "float32":
-                        try:
-                            del zf["data"]
-                        except Exception:
-                            # If we cannot delete in-place, the safest option is to ignore this cache.
-                            raise RuntimeError(f"Unsupported cache dtype {arr0.dtype}; please delete {feat_path}")
-                        zf.create_dataset(
-                            "data",
-                            shape=(self.H, self.W, self.Fch),
-                            chunks=(min(self.tile_size, self.H), min(self.tile_size, self.W), self.Fch),
-                            dtype="float16",
-                            compressor=compressor,
-                            overwrite=False,
-                        )
-                        zf.attrs.update(
-                            {
-                                "channel_index": int(c),
-                                "features_per_channel": int(self.Fch),
-                                "tile_size": int(self.tile_size),
-                                "feature_config_hash": str(self.cfg.hash()),
-                                "image_fingerprint": str(self.image_fingerprint),
-                            }
-                        )
-                except Exception:
-                    # If anything goes wrong, leave as-is and let downstream detect mismatches.
-                    pass
-
-
-            # Keep mask store in Zarr v2 as well.
-            zm = zarr.open_group(str(mask_path), mode="a", zarr_format=2)
+                created_feat = True
             if "mask" not in zm:
                 zm.create_dataset(
                     "mask",
@@ -488,6 +591,78 @@ class ZarrTileFeatureCache:
                         "feature_config_hash": str(self.cfg.hash()),
                         "image_fingerprint": str(self.image_fingerprint),
                     }
+                )
+
+                created_mask = True
+
+            # Validate existing cache contents.
+            #
+            # Current design intentionally stores normalized features as float16.
+            # If an older/incompatible cache is found, rebuild BOTH the feature
+            # data and the tile mask so they cannot get out of sync.
+            try:
+                arr0 = zf["data"]
+                mask0 = zm["mask"]
+
+                arr_dtype = str(arr0.dtype)
+                arr_shape = tuple(int(x) for x in arr0.shape)
+                mask_shape = tuple(int(x) for x in mask0.shape)
+
+                zf_fch = _safe_int(zf.attrs.get("features_per_channel", -1))
+                zf_tile = _safe_int(zf.attrs.get("tile_size", -1))
+                zm_tile = _safe_int(zm.attrs.get("tile_size", -1))
+                zf_hash = str(zf.attrs.get("feature_config_hash", ""))
+                zm_hash = str(zm.attrs.get("feature_config_hash", ""))
+                zf_fp = str(zf.attrs.get("image_fingerprint", ""))
+                zm_fp = str(zm.attrs.get("image_fingerprint", ""))
+
+                reset_reasons: list[str] = []
+                if arr_dtype != "float16":
+                    reset_reasons.append(f"dtype={arr_dtype}")
+                if arr_shape != (self.H, self.W, self.Fch):
+                    reset_reasons.append(f"arr_shape={arr_shape}")
+                if mask_shape != (self.n_ty, self.n_tx):
+                    reset_reasons.append(f"mask_shape={mask_shape}")
+                if zf_fch != int(self.Fch):
+                    reset_reasons.append(f"features_per_channel={zf_fch}")
+                if zf_tile != int(self.tile_size):
+                    reset_reasons.append(f"zf_tile_size={zf_tile}")
+                if zm_tile != int(self.tile_size):
+                    reset_reasons.append(f"zm_tile_size={zm_tile}")
+                if zf_hash != str(self.cfg.hash()):
+                    reset_reasons.append("zf_feature_config_hash_mismatch")
+                if zm_hash != str(self.cfg.hash()):
+                    reset_reasons.append("zm_feature_config_hash_mismatch")
+                if zf_fp != str(self.image_fingerprint):
+                    reset_reasons.append("zf_image_fingerprint_mismatch")
+                if zm_fp != str(self.image_fingerprint):
+                    reset_reasons.append("zm_image_fingerprint_mismatch")
+
+                if _STEP2A_CACHE_DEBUG and (created_feat or created_mask):
+                    _dbg(
+                        "open_channel_created "
+                        f"channel={int(c)} created_feat={created_feat} created_mask={created_mask} "
+                        f"dtype={arr_dtype} arr_shape={arr_shape} mask_shape={mask_shape}"
+                    )
+
+                if reset_reasons:
+                    self._reset_channel_cache(
+                        zf,
+                        zm,
+                        c=int(c),
+                        compressor=compressor,
+                        reason=";".join(reset_reasons),
+                    )
+            except Exception as e:
+                _dbg(f"open_channel_validation_exception channel={int(c)} exc={e!r}")
+                # If validation fails for any reason, rebuild both stores to restore
+                # consistency rather than risk using a partially invalid cache.
+                self._reset_channel_cache(
+                    zf,
+                    zm,
+                    c=int(c),
+                    compressor=compressor,
+                    reason=f"validation_exception:{type(e).__name__}",
                 )
 
             arr = zf["data"]
@@ -608,6 +783,14 @@ class ZarrTileFeatureCache:
             except Exception:
                 missing.append(c)
 
+        if _STEP2A_CACHE_DEBUG and missing:
+            _dbg(
+                "tile_cache_miss "
+                f"tile=({ty},{tx}) yx=({y0}:{y1},{x0}:{x1}) "
+                f"use_channels={list(use_channels)} "
+                f"missing={list(missing)}"
+            )
+
         dy = int(y1 - y0)
         dx = int(x1 - x0)
         bytes_per_channel = dy * dx * int(self.Fch) * 2  # float16 stored (features bounded by normalization)
@@ -638,6 +821,16 @@ class ZarrTileFeatureCache:
                 use_hessian=self.cfg.use_hessian,
                 dog_sigma_ratio=self.cfg.dog_sigma_ratio,
             )
+            if _STEP2A_CACHE_DEBUG:
+                suspicious_all, suspicious_reason_all = _is_suspicious_array(X_all)
+                if suspicious_all:
+                    _dbg(
+                        "tile_compute_suspicious "
+                        f"tile=({ty},{tx}) reason={suspicious_reason_all} "
+                        f"X_all={_array_debug_summary(X_all)} "
+                        f"expected_lastdim={int(self.Fch) * int(len(use_channels))}"
+                    )
+
             dt_c = _time.perf_counter() - t0
             with self._stats_lock:
                 self._stats["t_compute_s"] += float(dt_c)
@@ -663,6 +856,14 @@ class ZarrTileFeatureCache:
                         masks[c][ty, tx] = 1
                     except Exception:
                         pass
+                    if _STEP2A_CACHE_DEBUG:
+                        suspicious_c, suspicious_reason_c = _is_suspicious_array(Xc)
+                        if suspicious_c:
+                            _dbg(
+                                "tile_write_suspicious "
+                                f"tile=({ty},{tx}) channel={int(c)} reason={suspicious_reason_c} "
+                                f"Xc={_array_debug_summary(Xc)}"
+                            )
                 dt_w = _time.perf_counter() - t1
                 with self._stats_lock:
                     self._stats["t_write_s"] += float(dt_w)
@@ -673,10 +874,29 @@ class ZarrTileFeatureCache:
         # Read all requested channels from cache and concatenate
         feats = []
         for c in use_channels:
-            feats.append(np.asarray(arrays[c][y0:y1, x0:x1, :], dtype=np.float32))
+            fc = np.asarray(arrays[c][y0:y1, x0:x1, :], dtype=np.float32)
+            feats.append(fc)
             with self._stats_lock:
                 self._stats["bytes_read"] += int(bytes_per_channel)
         dt_r = _time.perf_counter() - t2
         with self._stats_lock:
             self._stats["t_read_s"] += float(dt_r)
-        return np.concatenate(feats, axis=-1)
+        out = np.concatenate(feats, axis=-1)
+        if _STEP2A_CACHE_DEBUG:
+            suspicious_out, suspicious_reason_out = _is_suspicious_array(out)
+            if suspicious_out:
+                ch_summaries = []
+                for j, c in enumerate(use_channels):
+                    try:
+                        ch_summaries.append(
+                            f"c{int(c)}:{_array_debug_summary(feats[j])}"
+                        )
+                    except Exception:
+                        ch_summaries.append(f"c{int(c)}:summary_failed")
+                _dbg(
+                    "tile_read_suspicious "
+                    f"tile=({ty},{tx}) reason={suspicious_reason_out} "
+                    f"concat={_array_debug_summary(out)} "
+                    f"per_channel=[{'; '.join(ch_summaries)}]"
+                )
+        return out
