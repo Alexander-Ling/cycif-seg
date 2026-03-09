@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import math
+import os
+import tempfile
+from pathlib import Path
+from typing import Callable
+
 import numpy as np
 import tifffile
 
@@ -224,7 +230,7 @@ def load_multichannel_tiff(path: str) -> tuple[np.ndarray, list[str]]:
     Load a TIFF/OME-TIFF as (Y, X, C) float32 and return (img_yxc, channel_names).
     Attempts to read OME channel names via ome-types; falls back to "Channel i".
     """
-    arr = tifffile.imread(path)
+    arr = tifffile.imread(path, series=0, level=0)
     arr = _normalize_to_yxc(arr)
 
     img = arr.astype(np.float32, copy=False)
@@ -258,7 +264,7 @@ def load_multichannel_tiff_native(path: str) -> tuple[np.ndarray, list[str]]:
     original integer dtype (e.g., uint16) and only use float32 as a transient
     compute type.
     """
-    arr = tifffile.imread(path)
+    arr = tifffile.imread(path, series=0, level=0)
     arr = _normalize_to_yxc(arr)
     n_channels = int(arr.shape[2])
 
@@ -279,6 +285,281 @@ def load_multichannel_tiff_native(path: str) -> tuple[np.ndarray, list[str]]:
     return arr, ch_names
 
 
+def _base_series(tf: tifffile.TiffFile):
+    """Return the full-resolution image series for flat or pyramidal TIFFs."""
+    series0 = tf.series[0]
+    try:
+        levels = getattr(series0, "levels", None)
+        if levels:
+            return levels[0]
+    except Exception:
+        pass
+    return series0
+
+
+def inspect_tiff_pyramid(path: str) -> dict:
+    """Inspect whether a TIFF/OME-TIFF contains a multi-resolution pyramid."""
+    out_series: list[dict] = []
+    is_pyramidal = False
+    with tifffile.TiffFile(path) as tf:
+        for si, series in enumerate(tf.series):
+            try:
+                levels = list(getattr(series, 'levels', []) or [series])
+            except Exception:
+                levels = [series]
+            level_shapes = [tuple(int(v) for v in getattr(lvl, 'shape', ())) for lvl in levels]
+            axes = str(getattr(series, 'axes', '') or '')
+            try:
+                subifds = int(len(getattr(series.pages[0], 'subifds', None) or ()))
+            except Exception:
+                subifds = 0
+            if len(levels) > 1:
+                is_pyramidal = True
+            out_series.append({
+                'index': int(si),
+                'shape': tuple(int(v) for v in getattr(series, 'shape', ())),
+                'axes': axes,
+                'number_of_levels': int(len(levels)),
+                'level_shapes': level_shapes,
+                'subifds': subifds,
+            })
+        is_ome = bool(getattr(tf, 'is_ome', False))
+    return {
+        'is_ome': is_ome,
+        'number_of_series': int(len(out_series)),
+        'series': out_series,
+        'is_pyramidal': bool(is_pyramidal),
+    }
+
+
+def _compute_pyramid_subifds(shape_yx: tuple[int, int], *, min_size: int = 128) -> int:
+    y, x = (int(shape_yx[0]), int(shape_yx[1]))
+    n = 0
+    while y > int(min_size) and x > int(min_size):
+        y = max(1, (y + 1) // 2)
+        x = max(1, (x + 1) // 2)
+        n += 1
+    return int(n)
+
+
+def estimate_pyramid_conversion_ticks(shape_cyx: tuple[int, int, int], *, min_level_size: int = 128, out_chunk: int = 1024) -> int:
+    """Estimate progress ticks for flat->pyramid conversion."""
+    _c, y, x = (int(shape_cyx[0]), int(shape_cyx[1]), int(shape_cyx[2]))
+    subifds = _compute_pyramid_subifds((y, x), min_size=int(min_level_size))
+    ticks = 0
+    for _level in range(1, subifds + 1):
+        y = max(1, (y + 1) // 2)
+        x = max(1, (x + 1) // 2)
+        ny = max(1, int(math.ceil(float(y) / float(max(1, int(out_chunk))))))
+        nx = max(1, int(math.ceil(float(x) / float(max(1, int(out_chunk))))))
+        ticks += int(ny * nx)  # build this level chunk-by-chunk
+        ticks += 1             # write this level to the final TIFF
+    ticks += 1  # write base level
+    return int(max(1, ticks))
+
+
+def _cast_like_source(arr: np.ndarray, dtype: np.dtype) -> np.ndarray:
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        arr = np.rint(arr)
+        arr = np.clip(arr, info.min, info.max)
+        return arr.astype(dtype, copy=False)
+    return arr.astype(dtype, copy=False)
+
+
+def _block_average_2x2_cyx(arr_cyx: np.ndarray, out_dtype: np.dtype) -> np.ndarray:
+    """Downsample a CYX array by 2x in Y/X via true block averaging."""
+    if arr_cyx.ndim != 3:
+        raise ValueError(f"Expected CYX array, got {arr_cyx.shape}")
+    c, y, x = (int(arr_cyx.shape[0]), int(arr_cyx.shape[1]), int(arr_cyx.shape[2]))
+    oy = max(1, (y + 1) // 2)
+    ox = max(1, (x + 1) // 2)
+    acc = np.zeros((c, oy, ox), dtype=np.float32)
+    cnt = np.zeros((1, oy, ox), dtype=np.float32)
+    for ys in (0, 1):
+        for xs in (0, 1):
+            sl = np.asarray(arr_cyx[:, ys::2, xs::2], dtype=np.float32)
+            sy = sl.shape[1]
+            sx = sl.shape[2]
+            if sy == 0 or sx == 0:
+                continue
+            acc[:, :sy, :sx] += sl
+            cnt[:, :sy, :sx] += 1.0
+    acc /= np.maximum(cnt, 1.0)
+    return _cast_like_source(acc, np.dtype(out_dtype))
+
+
+def _raw_memmap(path: str, shape: tuple[int, ...], dtype: np.dtype, mode: str = 'w+') -> np.memmap:
+    return np.memmap(path, dtype=np.dtype(dtype), mode=mode, shape=tuple(int(v) for v in shape))
+
+
+def convert_flat_ome_to_pyramidal(
+    source_path: str,
+    output_path: str | None = None,
+    *,
+    channel_names: list[str] | None = None,
+    tile_size: int = 512,
+    compression: str | int | None = 'zlib',
+    min_level_size: int = 128,
+    out_chunk: int = 1024,
+    replace_source: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
+    progress_step_cb: Callable[[str, str], None] | None = None,
+    cancel_cb: Callable[[], bool] | None = None,
+) -> str:
+    """Convert a flat CYX OME-TIFF into a pyramidal OME-TIFF.
+
+    This implementation is RAM-efficient:
+      - the flat source is memory-mapped,
+      - each pyramid level is generated chunk-by-chunk via 2x2 block averaging,
+      - intermediate pyramid levels are stored as temporary raw memmaps,
+      - the final TIFF is written from those memmaps.
+    """
+    def _check_cancel() -> None:
+        try:
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError('Cancelled')
+        except RuntimeError:
+            raise
+        except Exception:
+            return
+
+    def _step(msg: str, phase: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+        if progress_step_cb:
+            progress_step_cb(msg, phase)
+
+    src = str(source_path)
+    if output_path is None:
+        fd, tmp_path = tempfile.mkstemp(suffix='.ome.tiff', prefix='cycif_pyramid_')
+        os.close(fd)
+        dst = tmp_path
+    else:
+        dst = str(output_path)
+
+    with tifffile.TiffFile(src) as tf:
+        series0 = _base_series(tf)
+        shape = tuple(int(v) for v in series0.shape)
+        axes = str(getattr(series0, 'axes', '') or str(getattr(tf.series[0], 'axes', '') or ''))
+        dtype = np.dtype(series0.dtype)
+        ome_xml = tf.ome_metadata
+
+    if len(shape) != 3:
+        raise ValueError(f'Expected 3D CYX/YXC image. Got shape={shape}, axes={axes!r}')
+
+    if axes and 'C' in axes:
+        cpos = axes.index('C')
+        if cpos == 0:
+            c, y, x = shape
+        elif cpos == 2:
+            y, x, c = shape
+        else:
+            raise ValueError(f'Unsupported channel axis placement: shape={shape}, axes={axes!r}')
+    else:
+        if shape[0] <= 64 and shape[1] > 64 and shape[2] > 64:
+            c, y, x = shape
+        elif shape[2] <= 64 and shape[0] > 64 and shape[1] > 64:
+            y, x, c = shape
+        else:
+            raise ValueError(f'Unable to infer channel axis from shape={shape}, axes={axes!r}')
+
+    if channel_names is None or len(channel_names) != int(c):
+        channel_names = _channel_names_from_ome(ome_xml, int(c)) or [f'Channel {i}' for i in range(int(c))]
+    channel_names = [(nm if nm and str(nm).strip() else f'Channel {i}') for i, nm in enumerate(channel_names)]
+
+    src_mm = tifffile.memmap(src)
+    if src_mm.ndim != 3:
+        raise ValueError(f'Expected 3D memmap-able TIFF. Got shape={getattr(src_mm, "shape", None)}')
+    if src_mm.shape[0] == int(c):
+        src_cyx = src_mm
+    elif src_mm.shape[-1] == int(c):
+        src_cyx = np.moveaxis(src_mm, -1, 0)
+    else:
+        raise ValueError(f'Unable to canonicalize source TIFF to CYX. shape={src_mm.shape}, expected channels={c}')
+
+    subifds = _compute_pyramid_subifds((int(y), int(x)), min_size=int(min_level_size))
+    metadata = {
+        'axes': 'CYX',
+        'Channel': {'Name': list(channel_names)},
+    }
+
+    tmpdir = Path(tempfile.mkdtemp(prefix='cycif_pyramid_levels_'))
+    level_arrays: list[np.ndarray] = []
+    level_paths: list[Path] = []
+    try:
+        prev = src_cyx
+        prev_y = int(y)
+        prev_x = int(x)
+        for level in range(1, subifds + 1):
+            _check_cancel()
+            out_y = max(1, (prev_y + 1) // 2)
+            out_x = max(1, (prev_x + 1) // 2)
+            lvl_path = tmpdir / f'level_{level:02d}.dat'
+            lvl = _raw_memmap(str(lvl_path), (int(c), int(out_y), int(out_x)), dtype, mode='w+')
+            step_y = max(1, int(out_chunk))
+            step_x = max(1, int(out_chunk))
+            for oy0 in range(0, int(out_y), step_y):
+                _check_cancel()
+                oy1 = min(int(out_y), oy0 + step_y)
+                for ox0 in range(0, int(out_x), step_x):
+                    _check_cancel()
+                    ox1 = min(int(out_x), ox0 + step_x)
+                    sy0, sy1 = int(oy0 * 2), int(min(prev_y, oy1 * 2))
+                    sx0, sx1 = int(ox0 * 2), int(min(prev_x, ox1 * 2))
+                    chunk = np.asarray(prev[:, sy0:sy1, sx0:sx1])
+                    lvl[:, oy0:oy1, ox0:ox1] = _block_average_2x2_cyx(chunk, dtype)
+                    _step(
+                        f'Building pyramid level {level}/{subifds} ({oy1}/{out_y} rows)',
+                        'pyramid_build_chunk',
+                    )
+            lvl.flush()
+            level_arrays.append(lvl)
+            level_paths.append(lvl_path)
+            prev = lvl
+            prev_y, prev_x = int(out_y), int(out_x)
+
+        options = dict(
+            photometric='minisblack',
+            tile=(int(tile_size), int(tile_size)),
+            compression=compression,
+            predictor=True if np.issubdtype(dtype, np.integer) else False,
+        )
+
+        with tifffile.TiffWriter(dst, bigtiff=True) as tif:
+            _check_cancel()
+            _step('Writing pyramid base level', 'pyramid_write_level')
+            tif.write(src_cyx, subifds=int(subifds), metadata=metadata, **options)
+            for level, lvl in enumerate(level_arrays, start=1):
+                _check_cancel()
+                _step(f'Writing pyramid level {level}/{subifds}', 'pyramid_write_level')
+                tif.write(lvl, subfiletype=1, metadata=None, **options)
+    finally:
+        try:
+            del src_mm
+        except Exception:
+            pass
+        for arr in level_arrays:
+            try:
+                arr.flush()
+            except Exception:
+                pass
+        for pth in level_paths:
+            try:
+                os.remove(pth)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+
+    if replace_source:
+        os.replace(dst, src)
+        return src
+    return dst
+
 
 def inspect_tiff_yxc(path: str) -> dict:
     """Inspect a TIFF/OME-TIFF without reading full pixel data.
@@ -291,7 +572,7 @@ def inspect_tiff_yxc(path: str) -> dict:
     """
     with tifffile.TiffFile(path) as tf:
         try:
-            series = tf.series[0]
+            series = _base_series(tf)
             shape = tuple(int(x) for x in series.shape)
             axes = str(getattr(series, "axes", "") or "")
             dtype = np.dtype(series.dtype)
@@ -357,7 +638,7 @@ def load_single_channel_tiff_native(path: str, channel_index: int) -> np.ndarray
 
     with tifffile.TiffFile(path) as tf:
         try:
-            series = tf.series[0]
+            series = _base_series(tf)
             shape = tuple(int(v) for v in series.shape)
             axes = str(getattr(series, "axes", "") or "")
         except Exception:
@@ -510,6 +791,17 @@ def load_multichannel_tiff_lazy(path: str):
     # Use tifffile's Zarr interface for on-demand IO.
     store = tifffile.imread(path, aszarr=True)
     z = zarr.open(store, mode="r")
+    try:
+        if hasattr(z, 'keys'):
+            keys = list(z.keys())
+            if keys:
+                z0 = z[keys[0]]
+                if hasattr(z0, 'shape'):
+                    z = z0
+        elif isinstance(z, (list, tuple)) and len(z) > 0:
+            z = z[0]
+    except Exception:
+        pass
     arr = da.from_zarr(z)
     arr_cyx = _normalize_to_cyx_lazy(arr)
 

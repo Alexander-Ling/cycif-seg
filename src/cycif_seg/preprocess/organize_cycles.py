@@ -28,12 +28,15 @@ import tifffile
 
 from cycif_seg.io.ome_tiff import (
     IncrementalOmeBigTiffWriter,
+    estimate_pyramid_conversion_ticks,
+    inspect_tiff_pyramid,
     inspect_tiff_yxc,
     load_channel_names_only,
     load_multichannel_tiff,
     load_multichannel_tiff_native,
     load_single_channel_tiff_native,
     save_ome_tiff_yxc,
+    convert_flat_ome_to_pyramidal,
 )
 
 
@@ -828,8 +831,15 @@ def merge_cycles_to_ome_tiff(
     registration_algorithm: str = "tiled_rigid",
     downsample_for_registration: int = 4,
     tiled_rigid_allow_rotation: bool = False,
+    tiled_rigid_tile_size: int = 2000,
+    tiled_rigid_search_factor: float = 3,
     upsample_factor: int = 10,
     low_mem: bool = False,
+    pyramidal_output: bool = False,
+    pyramidal_tile_size: int = 512,
+    pyramidal_compression: str | int | None = "zlib",
+    pyramidal_min_level_size: int = 128,
+    pyramid_progress_chunk: int = 1024,
     progress_cb: Callable[[str], None] | None = None,
     progress_event_cb: Optional[Callable[[dict], None]] = None,
     cancel_cb: Callable[[], bool] | None = None,
@@ -847,6 +857,13 @@ def merge_cycles_to_ome_tiff(
     if not cycles:
         raise ValueError("No cycles provided")
 
+    input_pyramid_info: dict[int, dict] = {}
+    for ci in cycles:
+        try:
+            input_pyramid_info[int(ci.cycle)] = inspect_tiff_pyramid(ci.path)
+        except Exception:
+            input_pyramid_info[int(ci.cycle)] = {"is_pyramidal": False, "series": []}
+
     if _STEP1_DEBUG:
         try:
             import faulthandler
@@ -858,7 +875,7 @@ def merge_cycles_to_ome_tiff(
 
     reg_alg = str(registration_algorithm or "tiled_rigid").strip().lower()
     _dbg(
-        f"merge_cycles_to_ome_tiff: start n_cycles={len(cycles)} low_mem={bool(low_mem)} alg={reg_alg!r} downsample={downsample_for_registration} allow_rotation={bool(tiled_rigid_allow_rotation)}"
+        f"merge_cycles_to_ome_tiff: start n_cycles={len(cycles)} low_mem={bool(low_mem)} alg={reg_alg!r} downsample={downsample_for_registration} allow_rotation={bool(tiled_rigid_allow_rotation)} tile_size={int(tiled_rigid_tile_size)} search_factor={float(tiled_rigid_search_factor):.3f}"
     )
 
     # Debug: report SimpleITK thread settings (helps diagnose low CPU usage).
@@ -941,7 +958,7 @@ def merge_cycles_to_ome_tiff(
         #   - +n_moving_cycles segments during tile registration (1 tick per 10 tiles)
         #   - +1 segment after writing output
         n_cycles = int(len(infos))
-        tile_size_px = 1000
+        tile_size_px = max(128, int(tiled_rigid_tile_size))
 
         completed_ticks = 0
         assert base_dtype is not None
@@ -969,6 +986,8 @@ def merge_cycles_to_ome_tiff(
             total_ticks += int(tile_ticks)  # tiled registration
             total_ticks += int(_shp_yxc[2])  # apply per channel
         total_ticks += int(n_cycles)  # saving output (1 tick per cycle)
+        if bool(pyramidal_output):
+            total_ticks += int(estimate_pyramid_conversion_ticks((int(total_ch), int(canvas_yx[0]), int(canvas_yx[1])), min_level_size=int(pyramidal_min_level_size), out_chunk=int(pyramid_progress_chunk)))
 
         def _emit_tick(msg: str, *, phase: str, cycle: int | None = None) -> None:
             if progress_event_cb:
@@ -1132,7 +1151,7 @@ def merge_cycles_to_ome_tiff(
                                     fixed_yx=ref_yx,
                                     moving_yx=mov_init,
                                     tile_size=int(tile_size_px),
-                                    search_factor=2,
+                                    search_factor=float(tiled_rigid_search_factor),
                                     angle_deg_max=5.0,
                                     angle_step=1.0,
                                     allow_rotation=bool(tiled_rigid_allow_rotation),
@@ -1216,6 +1235,33 @@ def merge_cycles_to_ome_tiff(
             completed_ticks = min(int(completed_ticks), int(total_ticks))
             _emit_tick(f"Wrote output: {output_path}", phase="write_done")
 
+        pyout = {"is_pyramidal": False, "series": []}
+        if bool(pyramidal_output):
+            def _pstep(msg: str, phase: str) -> None:
+                nonlocal completed_ticks
+                completed_ticks += 1
+                completed_ticks = min(int(completed_ticks), int(total_ticks))
+                _emit_tick(msg, phase=phase)
+
+            final_output_path = convert_flat_ome_to_pyramidal(
+                output_path,
+                output_path=None,
+                channel_names=merged_names,
+                tile_size=int(pyramidal_tile_size),
+                compression=pyramidal_compression,
+                min_level_size=int(pyramidal_min_level_size),
+                out_chunk=int(pyramid_progress_chunk),
+                replace_source=False,
+                progress_cb=progress_cb,
+                progress_step_cb=_pstep,
+                cancel_cb=cancel_cb,
+            )
+            os.replace(final_output_path, output_path)
+            try:
+                pyout = inspect_tiff_pyramid(output_path)
+            except Exception:
+                pyout = {"is_pyramidal": True, "series": []}
+
         return {
             "output_path": output_path,
             "reference_cycle": int(reference_cycle),
@@ -1226,6 +1272,9 @@ def merge_cycles_to_ome_tiff(
             "n_channels_out": int(total_ch),
             "shape_yxc": (int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)),
             "low_mem": True,
+            "pyramidal_output": bool(pyramidal_output),
+            "output_pyramid_info": pyout,
+            "input_pyramid_info": input_pyramid_info,
         }
 
     imgs: list[np.ndarray] = []
@@ -1369,6 +1418,26 @@ def merge_cycles_to_ome_tiff(
             merged_names.append(out_nm2)
 
     save_ome_tiff_yxc(output_path, merged, merged_names)
+    if bool(pyramidal_output):
+        def _simple_pstep(msg: str, phase: str) -> None:
+            if progress_event_cb:
+                progress_event_cb({"phase": str(phase), "idx": 0, "n": 0, "msg": str(msg)})
+            if progress_cb:
+                progress_cb(msg)
+        convert_path = convert_flat_ome_to_pyramidal(
+            output_path,
+            output_path=None,
+            channel_names=merged_names,
+            tile_size=int(pyramidal_tile_size),
+            compression=pyramidal_compression,
+            min_level_size=int(pyramidal_min_level_size),
+            out_chunk=int(pyramid_progress_chunk),
+            replace_source=False,
+            progress_cb=progress_cb,
+            progress_step_cb=_simple_pstep,
+            cancel_cb=cancel_cb,
+        )
+        os.replace(convert_path, output_path)
 
     if progress_event_cb:
         progress_event_cb(
@@ -1389,4 +1458,7 @@ def merge_cycles_to_ome_tiff(
         "inputs": [{"cycle": int(ci.cycle), "path": ci.path} for ci in cycles],
         "n_channels_out": int(merged.shape[2]),
         "shape_yxc": tuple(int(x) for x in merged.shape),
+        "pyramidal_output": bool(pyramidal_output),
+        "output_pyramid_info": inspect_tiff_pyramid(output_path) if bool(pyramidal_output) else {"is_pyramidal": False, "series": []},
+        "input_pyramid_info": input_pyramid_info,
     }

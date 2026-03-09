@@ -90,6 +90,9 @@ class BatchSample:
     cycles_enabled: list[bool] | None = None
     registration_algorithm: str = "tiled_rigid"
     tiled_rigid_allow_rotation: bool = False
+    tiled_rigid_tile_size: int = 2000
+    tiled_rigid_search_factor: float = 3.0
+    pyramidal_output: bool = True
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -108,6 +111,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self._samples: list[BatchSample] = []
         self._template_cfg: dict | None = None
         self._cancel_requested: bool = False
+        self._refreshing_table: bool = False
 
         root = QtWidgets.QVBoxLayout(self)
 
@@ -217,6 +221,11 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
         self.btn_stop.setEnabled(False)
 
+        # Keep model state synchronized with direct table edits, especially the
+        # output-path column. This avoids losing the current in-place editor
+        # contents if the user edits a cell and immediately runs the batch.
+        self.tbl.itemChanged.connect(self._on_table_item_changed)
+
     # -------------------- UI helpers --------------------
     def _apply_status(self, msg: str) -> None:
         self.lbl_status.setText(msg)
@@ -301,30 +310,58 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         )
 
     def _refresh_table(self) -> None:
-        self.tbl.setRowCount(len(self._samples))
-        for r, s in enumerate(self._samples):
-            # Run checkbox
-            chk = QtWidgets.QTableWidgetItem("")
-            chk.setFlags(chk.flags() | QtCore.Qt.ItemIsUserCheckable)
-            chk.setCheckState(QtCore.Qt.Checked if s.enabled else QtCore.Qt.Unchecked)
-            self.tbl.setItem(r, 0, chk)
-
-            it_name = QtWidgets.QTableWidgetItem(s.name)
-            it_name.setFlags(it_name.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.tbl.setItem(r, 1, it_name)
-
-            it_n = QtWidgets.QTableWidgetItem(str(len(s.files)))
-            it_n.setFlags(it_n.flags() & ~QtCore.Qt.ItemIsEditable)
-            self.tbl.setItem(r, 2, it_n)
-
-            self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(s.tissue or ""))
-            self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(s.species or ""))
-            self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.output_path or "")))
-
+        self._refreshing_table = True
         try:
-            self.tbl.resizeColumnsToContents()
+            self.tbl.setRowCount(len(self._samples))
+            for r, s in enumerate(self._samples):
+                # Run checkbox
+                chk = QtWidgets.QTableWidgetItem("")
+                chk.setFlags(chk.flags() | QtCore.Qt.ItemIsUserCheckable)
+                chk.setCheckState(QtCore.Qt.Checked if s.enabled else QtCore.Qt.Unchecked)
+                self.tbl.setItem(r, 0, chk)
+
+                it_name = QtWidgets.QTableWidgetItem(s.name)
+                it_name.setFlags(it_name.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.tbl.setItem(r, 1, it_name)
+
+                it_n = QtWidgets.QTableWidgetItem(str(len(s.files)))
+                it_n.setFlags(it_n.flags() & ~QtCore.Qt.ItemIsEditable)
+                self.tbl.setItem(r, 2, it_n)
+
+                self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(s.tissue or ""))
+                self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(s.species or ""))
+                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.output_path or "")))
+
+            try:
+                self.tbl.resizeColumnsToContents()
+            except Exception:
+                pass
+        finally:
+            self._refreshing_table = False
+
+    def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        if self._refreshing_table:
+            return
+        try:
+            r = int(item.row())
+            c = int(item.column())
         except Exception:
-            pass
+            return
+        if r < 0 or r >= len(self._samples):
+            return
+        s = self._samples[r]
+        try:
+            if c == 0:
+                s.enabled = (item.checkState() == QtCore.Qt.Checked)
+            elif c == 3:
+                s.tissue = (item.text() or "").strip()
+            elif c == 4:
+                s.species = (item.text() or "").strip()
+            elif c == 5:
+                op = (item.text() or "").strip()
+                s.output_path = Path(op).expanduser() if op else None
+        except Exception:
+            return
 
     def _apply_defaults(self) -> None:
         t = self.txt_default_tissue.text().strip()
@@ -488,6 +525,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "output_path": str(s.output_path or ""),
                 "registration_algorithm": str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
                 "tiled_rigid_allow_rotation": bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
+                "tiled_rigid_tile_size": int(getattr(s, 'tiled_rigid_tile_size', 2000) or 2000),
+                "tiled_rigid_search_factor": float(getattr(s, 'tiled_rigid_search_factor', 3.0) or 3.0),
+                "pyramidal_output": bool(getattr(s, 'pyramidal_output', True)),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -500,8 +540,14 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.tissue = str(cfg.get('tissue') or '').strip()
             if 'species' in cfg:
                 s.species = str(cfg.get('species') or '').strip()
+            if 'output_path' in cfg:
+                op = str(cfg.get('output_path') or '').strip()
+                s.output_path = Path(op).expanduser() if op else None
             s.registration_algorithm = str(cfg.get('registration_algorithm') or s.registration_algorithm or 'tiled_rigid').strip() or 'tiled_rigid'
             s.tiled_rigid_allow_rotation = bool(cfg.get('tiled_rigid_allow_rotation') if cfg.get('tiled_rigid_allow_rotation') is not None else getattr(s, 'tiled_rigid_allow_rotation', False))
+            s.tiled_rigid_tile_size = max(128, int(cfg.get('tiled_rigid_tile_size') if cfg.get('tiled_rigid_tile_size') is not None else getattr(s, 'tiled_rigid_tile_size', 2000) or 2000))
+            s.tiled_rigid_search_factor = max(1.0, float(cfg.get('tiled_rigid_search_factor') if cfg.get('tiled_rigid_search_factor') is not None else getattr(s, 'tiled_rigid_search_factor', 3.0) or 3.0))
+            s.pyramidal_output = bool(cfg.get('pyramidal_output') if cfg.get('pyramidal_output') is not None else getattr(s, 'pyramidal_output', True))
         except Exception:
             pass
 
@@ -553,7 +599,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             "output_dir": out_dir,
             "defaults": {
                 "registration_algorithm": "tiled_rigid",
-                                "tissue": self.txt_default_tissue.text().strip(),
+                "tiled_rigid_tile_size": 2000,
+                "tiled_rigid_search_factor": 3.0,
+                "tissue": self.txt_default_tissue.text().strip(),
                 "species": self.txt_default_species.text().strip(),
             },
             "samples": [],
@@ -575,6 +623,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "cycles_enabled": list(s.cycles_enabled or []),
                 "registration_algorithm": str(getattr(s, "registration_algorithm", "tiled_rigid") or "tiled_rigid"),
                 "tiled_rigid_allow_rotation": bool(getattr(s, "tiled_rigid_allow_rotation", False)),
+                "tiled_rigid_tile_size": int(getattr(s, "tiled_rigid_tile_size", 2000) or 2000),
+                "tiled_rigid_search_factor": float(getattr(s, "tiled_rigid_search_factor", 3.0) or 3.0),
+                "pyramidal_output": bool(getattr(s, "pyramidal_output", True)),
             }
             d["samples"].append(rec)
         return d
@@ -618,6 +669,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 registration_algorithm=str(rec.get("registration_algorithm") or defs.get("registration_algorithm") or "tiled_rigid"),
             )
             s.tiled_rigid_allow_rotation = bool(rec.get("tiled_rigid_allow_rotation", False))
+            s.tiled_rigid_tile_size = max(128, int(rec.get("tiled_rigid_tile_size", defs.get("tiled_rigid_tile_size", 2000)) or 2000))
+            s.tiled_rigid_search_factor = max(1.0, float(rec.get("tiled_rigid_search_factor", defs.get("tiled_rigid_search_factor", 3.0)) or 3.0))
+            s.pyramidal_output = bool(rec.get("pyramidal_output", True))
             s.cycles = list(rec.get("cycles") or []) or None
             s.registration_markers = list(rec.get("registration_markers") or []) or None
             s.channel_markers = list(rec.get("channel_markers") or []) or None
@@ -631,6 +685,14 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
     # -------------------- Running --------------------
     def _sync_table_to_models(self) -> None:
+        # Force any active in-place editor to commit before we read table values.
+        try:
+            self.tbl.clearFocus()
+            self.tbl.viewport().setFocus()
+            QtWidgets.QApplication.processEvents()
+        except Exception:
+            pass
+
         # Pull edits back from the table into self._samples.
         for r, s in enumerate(self._samples):
             try:
@@ -737,6 +799,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     default_registration_marker="DAPI",
                     registration_algorithm=str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
                     tiled_rigid_allow_rotation=bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
+                    tiled_rigid_tile_size=max(128, int(getattr(s, 'tiled_rigid_tile_size', 2000) or 2000)),
+                    tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', 3.0) or 3.0)),
+                    pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
                     progress_event_cb=_ev,
                     cancel_cb=lambda: bool(self._cancel_requested),
                     low_mem=True,

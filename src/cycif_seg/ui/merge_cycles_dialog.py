@@ -76,6 +76,47 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+        tiled_form = QtWidgets.QFormLayout()
+        self.spn_tile_size = QtWidgets.QSpinBox()
+        self.spn_tile_size.setRange(128, 20000)
+        self.spn_tile_size.setSingleStep(128)
+        self.spn_tile_size.setValue(2000)
+        self.spn_tile_size.setToolTip("Tile size in pixels for tile-wise rigid registration.")
+        self.spn_search_factor = QtWidgets.QDoubleSpinBox()
+        self.spn_search_factor.setRange(1.0, 10.0)
+        self.spn_search_factor.setDecimals(2)
+        self.spn_search_factor.setSingleStep(0.25)
+        self.spn_search_factor.setValue(3.0)
+        self.spn_search_factor.setToolTip("Search window size as a multiple of the tile size during tile-wise rigid registration.")
+        tiled_form.addRow("Tile size (px):", self.spn_tile_size)
+        tiled_form.addRow("Search factor:", self.spn_search_factor)
+        root.addLayout(tiled_form)
+        try:
+            if isinstance(self._initial_cfg, dict):
+                v_tile = self._initial_cfg.get("tiled_rigid_tile_size")
+                if v_tile is None:
+                    v_tile = self._initial_cfg.get("tile_size")
+                if v_tile is not None:
+                    self.spn_tile_size.setValue(max(128, int(v_tile)))
+                v_sf = self._initial_cfg.get("tiled_rigid_search_factor")
+                if v_sf is None:
+                    v_sf = self._initial_cfg.get("search_factor")
+                if v_sf is not None:
+                    self.spn_search_factor.setValue(max(1.0, float(v_sf)))
+        except Exception:
+            pass
+
+        self.chk_pyramidal_output = QtWidgets.QCheckBox("Write pyramidal OME-TIFF output")
+        self.chk_pyramidal_output.setChecked(True)
+        self.chk_pyramidal_output.setToolTip("Write step-1 output as a tiled pyramidal OME-TIFF for faster viewing in large-image viewers.")
+        root.addWidget(self.chk_pyramidal_output)
+        try:
+            if isinstance(self._initial_cfg, dict):
+                vp = self._initial_cfg.get("pyramidal_output")
+                if vp is not None:
+                    self.chk_pyramidal_output.setChecked(bool(vp))
+        except Exception:
+            pass
 
         self.scroll = QtWidgets.QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -258,6 +299,8 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         out_path = self.txt_output.text().strip()
         reg_algorithm = "tiled_rigid"
         tiled_allow_rotation = bool(getattr(self, 'chk_allow_rotation', None) and self.chk_allow_rotation.isChecked())
+        tiled_tile_size = int(getattr(self, 'spn_tile_size', None).value() if getattr(self, 'spn_tile_size', None) is not None else 2000)
+        tiled_search_factor = float(getattr(self, 'spn_search_factor', None).value() if getattr(self, 'spn_search_factor', None) is not None else 3.0)
         if not out_path:
             raise ValueError("Output path is required")
 
@@ -315,5 +358,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "output_path": out_path,
             "registration_algorithm": reg_algorithm,
             "tiled_rigid_allow_rotation": tiled_allow_rotation,
+            "pyramidal_output": bool(self.chk_pyramidal_output.isChecked()),
             "cycles": cycles_out,
         }
