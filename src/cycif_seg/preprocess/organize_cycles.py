@@ -44,6 +44,7 @@ from cycif_seg.io.ome_tiff import (
 
 # Enable very fine-grained debug prints for isolating native crashes (e.g., in SimpleITK/ITK).
 # Set env var CYCIF_SEG_STEP1_DEBUG=1 to turn on.
+# In powershell: $env:CYCIF_SEG_STEP1_DEBUG = "1"
 _STEP1_DEBUG = str(os.environ.get("CYCIF_SEG_STEP1_DEBUG", "0")).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
@@ -393,6 +394,21 @@ def estimate_tiled_rigid_transforms(
         as_completed = None  # type: ignore
 
     max_workers = max(1, (os.cpu_count() or 2) - 1)
+    # Windows stability guard:
+    # When rotation is enabled, repeated skimage.rotate() + match_template()
+    # calls inside worker threads can trigger a native access violation on
+    # Windows (observed as a hard crash with no Python traceback).
+    #
+    # To avoid that crash, force serial execution for the rotation-enabled
+    # path on Windows. Translation-only tiled rigid registration remains
+    # threaded.
+    force_serial = bool(allow_rotation) and (os.name == "nt")
+    if force_serial:
+        print(f"[WARNING] tiled rigid: forcing serial execution on Windows because allow_rotation=True")
+    if force_serial and _STEP1_DEBUG:
+        _dbg("tiled rigid: forcing serial execution on Windows because allow_rotation=True")
+
+    max_workers = 1 if force_serial else max(1, (os.cpu_count() or 2) - 1)
     processed = 0
 
     def _process_one(spec: tuple[int, int, int, int]) -> tuple[tuple[int, int], float, float, float, float, float]:
@@ -515,7 +531,7 @@ def estimate_tiled_rigid_transforms(
 
     # Process tiles row by row.
     ex = None
-    if ThreadPoolExecutor is not None:
+    if ThreadPoolExecutor is not None and max_workers > 1:
         ex = ThreadPoolExecutor(max_workers=int(max_workers))
 
     try:
