@@ -36,6 +36,7 @@ from cycif_seg.io.ome_tiff import (
     load_channel_names_only,
     load_multichannel_tiff,
     load_multichannel_tiff_native,
+    load_physical_pixel_sizes,
     load_single_channel_tiff_native,
     save_ome_tiff_yxc,
     convert_flat_ome_to_pyramidal,
@@ -1091,6 +1092,7 @@ def merge_cycles_to_ome_tiff(
         _dbg(f"load reference: cycle={int(ref_ci.cycle)} marker={ref_marker!r}")
         _emit_tick(f"Loading reference cycle {int(ref_ci.cycle)}", phase="load_ref", cycle=int(ref_ci.cycle))
         ref_names = load_channel_names_only(ref_ci.path)
+        ref_physical_pixel_sizes = load_physical_pixel_sizes(ref_ci.path)
         _dbg(f"loaded reference channel metadata: names={len(ref_names)}")
         ref_ch_idx = _find_channel_index(ref_names, ref_marker)
         ref_yx: np.ndarray | None
@@ -1134,6 +1136,7 @@ def merge_cycles_to_ome_tiff(
             (int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)),
             base_dtype,
             merged_names,
+            physical_pixel_sizes=ref_physical_pixel_sizes,
         ) as writer:
             # Write reference cycle first (unregistered)
             out_c = 0
@@ -1329,6 +1332,7 @@ def merge_cycles_to_ome_tiff(
                 output_path,
                 output_path=None,
                 channel_names=merged_names,
+                physical_pixel_sizes=ref_physical_pixel_sizes,
                 tile_size=int(pyramidal_tile_size),
                 compression=pyramidal_compression,
                 min_level_size=int(pyramidal_min_level_size),
@@ -1503,6 +1507,7 @@ def merge_cycles_to_ome_tiff(
 
     merged_names: list[str] = []
     seen: dict[str, int] = {}
+    ref_physical_pixel_sizes = load_physical_pixel_sizes(ref.path)
     for ci, ch in zip(cycles, names):
         cy = int(ci.cycle)
         markers = ci.channel_markers or []
@@ -1518,7 +1523,7 @@ def merge_cycles_to_ome_tiff(
             seen[out_nm] = k + 1
             merged_names.append(out_nm2)
 
-    save_ome_tiff_yxc(output_path, merged, merged_names)
+    save_ome_tiff_yxc(output_path, merged, merged_names, physical_pixel_sizes=ref_physical_pixel_sizes)
     if bool(pyramidal_output):
         def _simple_pstep(msg: str, phase: str) -> None:
             if progress_event_cb:
@@ -1529,6 +1534,7 @@ def merge_cycles_to_ome_tiff(
             output_path,
             output_path=None,
             channel_names=merged_names,
+            physical_pixel_sizes=ref_physical_pixel_sizes,
             tile_size=int(pyramidal_tile_size),
             compression=pyramidal_compression,
             min_level_size=int(pyramidal_min_level_size),

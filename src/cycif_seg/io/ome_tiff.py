@@ -97,6 +97,170 @@ def _channel_names_from_ome(ome_xml: str, n_channels: int) -> list[str] | None:
     except Exception:
         return None
 
+def _physical_pixel_sizes_from_ome(ome_xml: str) -> dict | None:
+    """Read OME physical pixel size metadata from the first image/pixels block."""
+    if not ome_xml:
+        return None
+
+    # First try ome-types (if available)
+    if from_xml is not None:
+        try:
+            ome = from_xml(ome_xml)
+            img0 = ome.images[0] if ome.images else None
+            px = img0.pixels if img0 else None
+            if px is not None:
+                psx = getattr(px, "physical_size_x", None)
+                psy = getattr(px, "physical_size_y", None)
+                ux = getattr(px, "physical_size_x_unit", None)
+                uy = getattr(px, "physical_size_y_unit", None)
+                out = {
+                    "PhysicalSizeX": float(psx) if psx is not None else None,
+                    "PhysicalSizeXUnit": (str(ux) if ux is not None else None),
+                    "PhysicalSizeY": float(psy) if psy is not None else None,
+                    "PhysicalSizeYUnit": (str(uy) if uy is not None else None),
+                }
+                if out["PhysicalSizeX"] is not None or out["PhysicalSizeY"] is not None:
+                    return out
+        except Exception:
+            pass
+
+    # Fallback: parse OME-XML directly.
+    try:
+        root = ET.fromstring(ome_xml)
+
+        def _strip(tag: str) -> str:
+            return tag.split("}", 1)[-1]
+
+        for el in root.iter():
+            if _strip(el.tag) == "Pixels":
+                out = {
+                    "PhysicalSizeX": None,
+                    "PhysicalSizeXUnit": (el.attrib.get("PhysicalSizeXUnit") or None),
+                    "PhysicalSizeY": None,
+                    "PhysicalSizeYUnit": (el.attrib.get("PhysicalSizeYUnit") or None),
+                }
+                try:
+                    if el.attrib.get("PhysicalSizeX") is not None:
+                        out["PhysicalSizeX"] = float(el.attrib.get("PhysicalSizeX"))
+                except Exception:
+                    out["PhysicalSizeX"] = None
+                try:
+                    if el.attrib.get("PhysicalSizeY") is not None:
+                        out["PhysicalSizeY"] = float(el.attrib.get("PhysicalSizeY"))
+                except Exception:
+                    out["PhysicalSizeY"] = None
+                if out["PhysicalSizeX"] is not None or out["PhysicalSizeY"] is not None:
+                    return out
+                return None
+    except Exception:
+        return None
+
+    return None
+
+
+def load_physical_pixel_sizes(path: str) -> dict | None:
+    """Read OME physical pixel size metadata from a TIFF/OME-TIFF."""
+    try:
+        with tifffile.TiffFile(path) as tf:
+            ome_xml = tf.ome_metadata
+    except Exception:
+        return None
+    return _physical_pixel_sizes_from_ome(ome_xml)
+
+
+def _unit_to_um(unit: str | None) -> float | None:
+    if unit is None:
+        return None
+    u = str(unit).strip().lower()
+    aliases = {
+        "µm": 1.0,
+        "um": 1.0,
+        "micrometer": 1.0,
+        "micrometre": 1.0,
+        "micrometers": 1.0,
+        "micrometres": 1.0,
+        "nm": 1e-3,
+        "nanometer": 1e-3,
+        "nanometre": 1e-3,
+        "nanometers": 1e-3,
+        "nanometres": 1e-3,
+        "mm": 1e3,
+        "millimeter": 1e3,
+        "millimetre": 1e3,
+        "millimeters": 1e3,
+        "millimetres": 1e3,
+        "cm": 1e4,
+        "centimeter": 1e4,
+        "centimetre": 1e4,
+        "centimeters": 1e4,
+        "centimetres": 1e4,
+        "m": 1e6,
+        "meter": 1e6,
+        "metre": 1e6,
+        "meters": 1e6,
+        "metres": 1e6,
+    }
+    return aliases.get(u)
+
+
+def _normalize_physical_pixel_sizes(meta: dict | None) -> dict | None:
+    if not meta:
+        return None
+    try:
+        psx = meta.get("PhysicalSizeX", None)
+        psy = meta.get("PhysicalSizeY", None)
+        ux = meta.get("PhysicalSizeXUnit", None) or "µm"
+        uy = meta.get("PhysicalSizeYUnit", None) or ux
+        psx = float(psx) if psx is not None else None
+        psy = float(psy) if psy is not None else None
+        if psx is not None and (not np.isfinite(psx) or psx <= 0):
+            psx = None
+        if psy is not None and (not np.isfinite(psy) or psy <= 0):
+            psy = None
+        if psx is None and psy is None:
+            return None
+        out = {}
+        if psx is not None:
+            out["PhysicalSizeX"] = float(psx)
+            out["PhysicalSizeXUnit"] = str(ux)
+        if psy is not None:
+            out["PhysicalSizeY"] = float(psy)
+            out["PhysicalSizeYUnit"] = str(uy)
+        return out or None
+    except Exception:
+        return None
+
+
+def _ome_physical_size_to_tiff_resolution(meta: dict | None) -> tuple[tuple[float, float] | None, str | None]:
+    """Convert OME PhysicalSizeX/Y metadata to TIFF resolution tags.
+
+    Returns
+    -------
+    (resolution, resolutionunit)
+        resolution is (xres, yres) in pixels per TIFF resolution unit.
+    """
+    norm = _normalize_physical_pixel_sizes(meta)
+    if not norm:
+        return None, None
+    psx = norm.get("PhysicalSizeX", None)
+    psy = norm.get("PhysicalSizeY", None)
+    ux = norm.get("PhysicalSizeXUnit", None)
+    uy = norm.get("PhysicalSizeYUnit", None)
+    if psx is None or psy is None:
+        return None, None
+    fac_x = _unit_to_um(ux)
+    fac_y = _unit_to_um(uy)
+    if fac_x is None or fac_y is None:
+        return None, None
+    psx_um = float(psx) * float(fac_x)
+    psy_um = float(psy) * float(fac_y)
+    if psx_um <= 0 or psy_um <= 0:
+        return None, None
+    # TIFF resolution tags are pixels per unit. Use centimeters to preserve
+    # common microscopy-scale spacing with good compatibility.
+    xres = 10000.0 / psx_um
+    yres = 10000.0 / psy_um
+    return (float(xres), float(yres)), "CENTIMETER"
 
 
 class IncrementalOmeBigTiffWriter:
@@ -112,7 +276,14 @@ class IncrementalOmeBigTiffWriter:
     - Internally the TIFF is stored as (C, Y, X) with OME axes="CYX".
     """
 
-    def __init__(self, path: str, shape_yxc: tuple[int, int, int], dtype: np.dtype, channel_names: list[str] | None = None):
+    def __init__(
+        self,
+        path: str,
+        shape_yxc: tuple[int, int, int],
+        dtype: np.dtype,
+        channel_names: list[str] | None = None,
+        physical_pixel_sizes: dict | None = None,
+    ):
         if len(shape_yxc) != 3:
             raise ValueError(f"Expected output shape (Y,X,C). Got {shape_yxc}")
         y, x, c = (int(shape_yxc[0]), int(shape_yxc[1]), int(shape_yxc[2]))
@@ -131,14 +302,27 @@ class IncrementalOmeBigTiffWriter:
             "Channel": {"Name": list(self.channel_names)},
         }
 
-        self._mm = tifffile.memmap(
-            self.path,
+        physical_pixel_sizes = _normalize_physical_pixel_sizes(physical_pixel_sizes)
+        if physical_pixel_sizes:
+            metadata.update(physical_pixel_sizes)
+        resolution, resolutionunit = _ome_physical_size_to_tiff_resolution(physical_pixel_sizes)
+
+        memmap_kwargs = dict(
             shape=(c, y, x),
             dtype=self.dtype,
             photometric="minisblack",
             metadata=metadata,
             ome=True,
             bigtiff=True,
+        )
+
+        if resolution is not None and resolutionunit is not None:
+            memmap_kwargs["resolution"] = resolution
+            memmap_kwargs["resolutionunit"] = resolutionunit
+
+        self._mm = tifffile.memmap(
+            self.path,
+            **memmap_kwargs,
         )
 
     def write_channel(self, channel_index: int, plane_yx: np.ndarray) -> None:
@@ -179,6 +363,7 @@ def save_ome_tiff_yxc(
     channel_names: list[str] | None = None,
     *,
     compress: bool | int = True,
+    physical_pixel_sizes: dict | None = None,
 ) -> None:
     """Save a (Y, X, C) array as an OME-TIFF with optional channel names.
 
@@ -208,6 +393,11 @@ def save_ome_tiff_yxc(
         "Channel": {"Name": list(channel_names)},
     }
 
+    physical_pixel_sizes = _normalize_physical_pixel_sizes(physical_pixel_sizes)
+    if physical_pixel_sizes:
+        metadata.update(physical_pixel_sizes)
+    resolution, resolutionunit = _ome_physical_size_to_tiff_resolution(physical_pixel_sizes)
+
     # Classic TIFF uses 32-bit offsets; BigTIFF is required once the written file
     # may exceed ~4 GiB. We conservatively decide based on the *uncompressed* size.
     try:
@@ -218,14 +408,22 @@ def save_ome_tiff_yxc(
 
     bigtiff = bool(est_uncompressed >= (2**32 - 1))
 
-    tifffile.imwrite(
-        path,
-        img_cyx,
+    imwrite_kwargs = dict(
         photometric="minisblack",
         metadata=metadata,
         ome=True,
         bigtiff=bigtiff,
         compression=("zlib" if compress is True else compress),
+    )
+
+    if resolution is not None and resolutionunit is not None:
+        imwrite_kwargs["resolution"] = resolution
+        imwrite_kwargs["resolutionunit"] = resolutionunit
+
+    tifffile.imwrite(
+        path,
+        img_cyx,
+        **imwrite_kwargs,
     )
 
 def load_multichannel_tiff(path: str) -> tuple[np.ndarray, list[str]]:
@@ -420,6 +618,7 @@ def convert_flat_ome_to_pyramidal(
     output_path: str | None = None,
     *,
     channel_names: list[str] | None = None,
+    physical_pixel_sizes: dict | None = None,
     tile_size: int = 512,
     compression: str | int | None = 'zlib',
     min_level_size: int = 128,
@@ -501,6 +700,9 @@ def convert_flat_ome_to_pyramidal(
     if channel_names is None or len(channel_names) != int(c):
         channel_names = _channel_names_from_ome(ome_xml, int(c)) or [f'Channel {i}' for i in range(int(c))]
     channel_names = [(nm if nm and str(nm).strip() else f'Channel {i}') for i, nm in enumerate(channel_names)]
+    if physical_pixel_sizes is None:
+        physical_pixel_sizes = _physical_pixel_sizes_from_ome(ome_xml)
+    physical_pixel_sizes = _normalize_physical_pixel_sizes(physical_pixel_sizes)
 
     src_mm = tifffile.memmap(src)
     if src_mm.ndim != 3:
@@ -517,6 +719,9 @@ def convert_flat_ome_to_pyramidal(
         'axes': 'CYX',
         'Channel': {'Name': list(channel_names)},
     }
+    if physical_pixel_sizes:
+        metadata.update(physical_pixel_sizes)
+    base_resolution, base_resolutionunit = _ome_physical_size_to_tiff_resolution(physical_pixel_sizes)
 
     tmpdir = work_dir / 'levels'
     tmpdir.mkdir(parents=True, exist_ok=True)
@@ -566,11 +771,23 @@ def convert_flat_ome_to_pyramidal(
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
             _check_cancel()
             _step('Writing pyramid base level', 'pyramid_write_level')
-            tif.write(src_cyx, subifds=int(subifds), metadata=metadata, **options)
+            write_kwargs = dict(options)
+            if base_resolution is not None and base_resolutionunit is not None:
+                write_kwargs['resolution'] = base_resolution
+                write_kwargs['resolutionunit'] = base_resolutionunit
+            tif.write(src_cyx, subifds=int(subifds), metadata=metadata, **write_kwargs)
             for level, lvl in enumerate(level_arrays, start=1):
                 _check_cancel()
                 _step(f'Writing pyramid level {level}/{subifds}', 'pyramid_write_level')
-                tif.write(lvl, subfiletype=1, metadata=None, **options)
+                write_kwargs = dict(options)
+                if base_resolution is not None and base_resolutionunit is not None:
+                    mag = float(2 ** int(level))
+                    write_kwargs['resolution'] = (
+                        float(base_resolution[0]) / mag,
+                        float(base_resolution[1]) / mag,
+                    )
+                    write_kwargs['resolutionunit'] = base_resolutionunit
+                tif.write(lvl, subfiletype=1, metadata=None, **write_kwargs)
     finally:
         # Release memmap references before attempting to delete the backing .dat files.
         try:
