@@ -5,6 +5,8 @@ from typing import Callable, Iterable, Optional
 
 import math
 import os
+import shutil
+from pathlib import Path
 
 import numpy as np
 
@@ -288,6 +290,7 @@ def estimate_tiled_rigid_transforms(
     min_foreground_frac: float = 0.01,
     allow_rotation: bool = False,
     on_tile_processed: Callable[[int], None] | None = None,
+    cancel_cb: Callable[[], bool] | None = None,
     smooth_iters: int = 2,
     min_score: float = 0.05,
     min_peak_ratio: float = 1.05,
@@ -304,6 +307,15 @@ def estimate_tiled_rigid_transforms(
     """
     if fixed_yx.ndim != 2 or moving_yx.ndim != 2:
         raise ValueError("estimate_tiled_rigid_transforms expects 2D arrays")
+
+    def _check_cancel_local() -> None:
+        try:
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError("Cancelled")
+        except RuntimeError:
+            raise
+        except Exception:
+            return
 
     H, W = fixed_yx.shape
     th = tw = int(tile_size)
@@ -385,6 +397,7 @@ def estimate_tiled_rigid_transforms(
 
     def _process_one(spec: tuple[int, int, int, int]) -> tuple[tuple[int, int], float, float, float, float, float]:
         # returns (r,c), dy, dx, angle, score ; dy/dx are relative to original tile top-left
+        _check_cancel_local()
         y0, x0, h, w = spec
         r = y0 // th
         c = x0 // tw
@@ -420,6 +433,7 @@ def estimate_tiled_rigid_transforms(
         best_x = x0
 
         for a in angles:
+            _check_cancel_local()
             if a == 0.0:
                 tile_r = tile
                 m_r = tmask.astype(np.float32, copy=False)
@@ -506,6 +520,7 @@ def estimate_tiled_rigid_transforms(
 
     try:
         for r in range(rows):
+            _check_cancel_local()
             y0 = int(r * th)
             h = int(min(th, H - y0))
             specs = []
@@ -514,8 +529,10 @@ def estimate_tiled_rigid_transforms(
                 w = int(min(tw, W - x0))
                 specs.append((y0, x0, h, w))
 
+            _check_cancel_local()
             if ex is None:
                 for spec in specs:
+                    _check_cancel_local()
                     (rr, cc), ddy, ddx, aa, sc, ww = _process_one(spec)
                     dy[rr, cc] = ddy
                     dx[rr, cc] = ddx
@@ -528,6 +545,7 @@ def estimate_tiled_rigid_transforms(
             else:
                 futs = [ex.submit(_process_one, spec) for spec in specs]
                 for fut in as_completed(futs):
+                    _check_cancel_local()
                     (rr, cc), ddy, ddx, aa, sc, ww = fut.result()
                     dy[rr, cc] = ddy
                     dx[rr, cc] = ddx
@@ -543,7 +561,10 @@ def estimate_tiled_rigid_transforms(
     finally:
         try:
             if ex is not None:
-                ex.shutdown(wait=True)
+                if cancel_cb is not None and bool(cancel_cb()):
+                    ex.shutdown(wait=False, cancel_futures=True)
+                else:
+                    ex.shutdown(wait=True)
         except Exception:
             pass
 
@@ -556,8 +577,10 @@ def estimate_tiled_rigid_transforms(
         # Iteratively expand coverage so that islands of background inherit motion from the nearest
         # confident region. A few passes are sufficient for typical slides.
         for _pass in range(3):
+            _check_cancel_local()
             changed = False
             for r in range(rows):
+                _check_cancel_local()
                 for c in range(cols):
                     if wt[r, c] > 0.0:
                         continue
@@ -590,11 +613,13 @@ def estimate_tiled_rigid_transforms(
     # distance penalty so distant/diagonal neighbors influence slightly less.
     if int(smooth_iters) > 0:
         for _ in range(int(smooth_iters)):
+            _check_cancel_local()
             dy_new = dy.copy()
             dx_new = dx.copy()
             ang_new = ang.copy()
 
             for r in range(rows):
+                _check_cancel_local()
                 for c in range(cols):
                     w0 = float(wt[r, c])
                     if w0 <= 0.0:
@@ -633,6 +658,7 @@ def estimate_tiled_rigid_transforms(
     # Convert grid to per-tile transforms
     out: list[TileTransform] = []
     for r in range(rows):
+        _check_cancel_local()
         for c in range(cols):
             y0 = int(r * th)
             x0 = int(c * tw)
@@ -671,6 +697,7 @@ def apply_tiled_rigid_to_plane(
     *,
     canvas_yx: tuple[int, int],
     transforms: list[TileTransform],
+    cancel_cb: Callable[[], bool] | None = None,
 ) -> np.ndarray:
     """Apply per-tile rigid (rotation + translation via placement) transforms to a 2D plane.
 
@@ -700,7 +727,17 @@ def apply_tiled_rigid_to_plane(
     else:
         plane = plane_yx
 
+    def _check_cancel_local() -> None:
+        try:
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError("Cancelled")
+        except RuntimeError:
+            raise
+        except Exception:
+            return
+
     for t in transforms:
+        _check_cancel_local()
         y0, x0, h, w = int(t.y0), int(t.x0), int(t.h), int(t.w)
         if h <= 0 or w <= 0:
             continue
@@ -978,7 +1015,23 @@ def merge_cycles_to_ome_tiff(
         #       process 10 tiles -> 1 tick (ceil(expected_tiles/10))
         #       apply transform per channel -> 1 tick per channel
         #   Final: saving output file -> 1 tick per cycle processed (including reference)
+        #   Optional pyramid conversion: reserve progress equal to roughly one full cycle,
+        #       scaled internally across pyramid-build/write steps.
         moving_infos = [t for t in infos if int(t[0].cycle) != int(reference_cycle)]
+        cycle_tick_candidates: list[int] = []
+        for (_ci, _shp_yxc, _dt) in moving_infos:
+            cycle_tick_candidates.append(1 + 1 + int(tile_ticks) + int(_shp_yxc[2]) + 1)
+        if not cycle_tick_candidates:
+            # Degenerate case: only the reference cycle is present.
+            ref_nch = int(infos[0][1][2]) if infos else 1
+            cycle_tick_candidates.append(1 + int(tile_ticks) + ref_nch + 1)
+        pyramid_alloc_ticks = int(max(1, round(sum(cycle_tick_candidates) / len(cycle_tick_candidates))))
+        pyramid_internal_ticks = int(max(1, estimate_pyramid_conversion_ticks(
+            (int(total_ch), int(canvas_y), int(canvas_x)),
+            min_level_size=int(pyramidal_min_level_size),
+            out_chunk=int(pyramid_progress_chunk),
+        )))
+
         total_ticks = 1  # load reference
         for (_ci, _shp_yxc, _dt) in moving_infos:
             total_ticks += 1  # load moving cycle
@@ -987,7 +1040,7 @@ def merge_cycles_to_ome_tiff(
             total_ticks += int(_shp_yxc[2])  # apply per channel
         total_ticks += int(n_cycles)  # saving output (1 tick per cycle)
         if bool(pyramidal_output):
-            total_ticks += int(estimate_pyramid_conversion_ticks((int(total_ch), int(canvas_yx[0]), int(canvas_yx[1])), min_level_size=int(pyramidal_min_level_size), out_chunk=int(pyramid_progress_chunk)))
+            total_ticks += int(pyramid_alloc_ticks)
 
         def _emit_tick(msg: str, *, phase: str, cycle: int | None = None) -> None:
             if progress_event_cb:
@@ -1156,6 +1209,7 @@ def merge_cycles_to_ome_tiff(
                                     angle_step=1.0,
                                     allow_rotation=bool(tiled_rigid_allow_rotation),
                                     on_tile_processed=_on_tile_processed,
+                                    cancel_cb=cancel_cb,
                                 )
 
                                 # If the last partial batch (<10) didn't trigger a tick, advance remaining ticks.
@@ -1180,6 +1234,7 @@ def merge_cycles_to_ome_tiff(
 
                 # Register/write each channel plane directly into the final output.
                 for j in range(int(n_ch_cycle)):
+                    _check_cancel()
                     _dbg(f"plane: cycle={int(ci.cycle)} ch={j}/{int(n_ch_cycle) - 1} out_c={int(out_c)}")
                     plane_native = load_single_channel_tiff_native(ci.path, int(j))
                     plane = _pad_plane_to_canvas(plane_native, canvas_yx, out_dtype=np.float32)
@@ -1205,7 +1260,7 @@ def merge_cycles_to_ome_tiff(
                             plane_init = plane
                             if dy != 0.0 or dx != 0.0:
                                 plane_init = apply_translation_yxc(plane[..., None], dy=dy, dx=dx, order=1)[..., 0]
-                            plane_reg = apply_tiled_rigid_to_plane(plane_init, canvas_yx=canvas_yx, transforms=t)  # type: ignore[arg-type]
+                            plane_reg = apply_tiled_rigid_to_plane(plane_init, canvas_yx=canvas_yx, transforms=t, cancel_cb=cancel_cb)  # type: ignore[arg-type]
                             _dbg(f"applied tiled rigid: cycle={int(ci.cycle)} ch={j}")
 
                     writer.write_channel(int(out_c), _cast_preserve_dtype(plane_reg, base_dtype))
@@ -1237,12 +1292,23 @@ def merge_cycles_to_ome_tiff(
 
         pyout = {"is_pyramidal": False, "series": []}
         if bool(pyramidal_output):
+            pyramid_steps_done = 0
+            pyramid_ticks_emitted = 0
+
             def _pstep(msg: str, phase: str) -> None:
-                nonlocal completed_ticks
-                completed_ticks += 1
-                completed_ticks = min(int(completed_ticks), int(total_ticks))
+                nonlocal completed_ticks, pyramid_steps_done, pyramid_ticks_emitted
+                if progress_cb:
+                    progress_cb(msg)
+                if phase in {"pyramid_build_chunk", "pyramid_write_level"}:
+                    pyramid_steps_done = min(int(pyramid_internal_ticks), int(pyramid_steps_done) + 1)
+                    scaled = int(math.floor((float(pyramid_steps_done) * float(pyramid_alloc_ticks)) / float(max(1, pyramid_internal_ticks))))
+                    if scaled > int(pyramid_ticks_emitted):
+                        completed_ticks += int(scaled - int(pyramid_ticks_emitted))
+                        completed_ticks = min(int(completed_ticks), int(total_ticks))
+                        pyramid_ticks_emitted = int(scaled)
                 _emit_tick(msg, phase=phase)
 
+            _out_parent = str(Path(output_path).resolve().parent)
             final_output_path = convert_flat_ome_to_pyramidal(
                 output_path,
                 output_path=None,
@@ -1252,15 +1318,34 @@ def merge_cycles_to_ome_tiff(
                 min_level_size=int(pyramidal_min_level_size),
                 out_chunk=int(pyramid_progress_chunk),
                 replace_source=False,
+                temp_dir=_out_parent,
                 progress_cb=progress_cb,
                 progress_step_cb=_pstep,
                 cancel_cb=cancel_cb,
             )
-            os.replace(final_output_path, output_path)
+            try:
+                os.replace(final_output_path, output_path)
+            except OSError as e:
+                raise OSError(
+                    e.errno,
+                    f'Failed to replace flat OME-TIFF with pyramidal output at {output_path!r}. '
+                    f'Temporary pyramid file was {final_output_path!r}. '
+                    'This usually means the output file is open in another program or the temporary file was created on a different volume.',
+                ) from e
+            finally:
+                try:
+                    shutil.rmtree(Path(final_output_path).parent, ignore_errors=True)
+                except Exception:
+                    pass
             try:
                 pyout = inspect_tiff_pyramid(output_path)
             except Exception:
                 pyout = {"is_pyramidal": True, "series": []}
+            if int(pyramid_ticks_emitted) < int(pyramid_alloc_ticks):
+                completed_ticks += int(pyramid_alloc_ticks - int(pyramid_ticks_emitted))
+                completed_ticks = min(int(completed_ticks), int(total_ticks))
+                pyramid_ticks_emitted = int(pyramid_alloc_ticks)
+            _emit_tick(f"Wrote pyramidal output: {output_path}", phase="pyramid_done")
 
         return {
             "output_path": output_path,
@@ -1438,6 +1523,10 @@ def merge_cycles_to_ome_tiff(
             cancel_cb=cancel_cb,
         )
         os.replace(convert_path, output_path)
+        try:
+            shutil.rmtree(Path(convert_path).parent, ignore_errors=True)
+        except Exception:
+            pass
 
     if progress_event_cb:
         progress_event_cb(

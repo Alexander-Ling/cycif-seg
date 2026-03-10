@@ -3,6 +3,9 @@ from __future__ import annotations
 import math
 import os
 import tempfile
+import shutil
+import time
+import gc
 from pathlib import Path
 from typing import Callable
 
@@ -394,6 +397,24 @@ def _raw_memmap(path: str, shape: tuple[int, ...], dtype: np.dtype, mode: str = 
     return np.memmap(path, dtype=np.dtype(dtype), mode=mode, shape=tuple(int(v) for v in shape))
 
 
+def _close_memmap(arr: np.ndarray | None) -> None:
+    """Best-effort close for numpy.memmap backing files on Windows."""
+    if arr is None:
+        return
+    try:
+        flush = getattr(arr, 'flush', None)
+        if callable(flush):
+            flush()
+    except Exception:
+        pass
+    try:
+        mm = getattr(arr, '_mmap', None)
+        if mm is not None:
+            mm.close()
+    except Exception:
+        pass
+
+
 def convert_flat_ome_to_pyramidal(
     source_path: str,
     output_path: str | None = None,
@@ -404,6 +425,7 @@ def convert_flat_ome_to_pyramidal(
     min_level_size: int = 128,
     out_chunk: int = 1024,
     replace_source: bool = False,
+    temp_dir: str | None = None,
     progress_cb: Callable[[str], None] | None = None,
     progress_step_cb: Callable[[str, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
@@ -432,12 +454,23 @@ def convert_flat_ome_to_pyramidal(
             progress_step_cb(msg, phase)
 
     src = str(source_path)
-    if output_path is None:
-        fd, tmp_path = tempfile.mkstemp(suffix='.ome.tiff', prefix='cycif_pyramid_')
-        os.close(fd)
-        dst = tmp_path
+    src_path = Path(src)
+    dst_path = Path(output_path) if output_path is not None else None
+
+    if temp_dir is None:
+        if dst_path is not None:
+            temp_base = dst_path.parent
+        else:
+            temp_base = src_path.parent
     else:
-        dst = str(output_path)
+        temp_base = Path(temp_dir)
+    temp_base.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix='cycif_pyramid_work_', dir=str(temp_base)))
+
+    if dst_path is None:
+        dst = str(work_dir / 'pyramidal_output.ome.tiff')
+    else:
+        dst = str(dst_path)
 
     with tifffile.TiffFile(src) as tf:
         series0 = _base_series(tf)
@@ -485,9 +518,12 @@ def convert_flat_ome_to_pyramidal(
         'Channel': {'Name': list(channel_names)},
     }
 
-    tmpdir = Path(tempfile.mkdtemp(prefix='cycif_pyramid_levels_'))
+    tmpdir = work_dir / 'levels'
+    tmpdir.mkdir(parents=True, exist_ok=True)
     level_arrays: list[np.ndarray] = []
     level_paths: list[Path] = []
+    prev = None
+    lvl = None
     try:
         prev = src_cyx
         prev_y = int(y)
@@ -536,27 +572,93 @@ def convert_flat_ome_to_pyramidal(
                 _step(f'Writing pyramid level {level}/{subifds}', 'pyramid_write_level')
                 tif.write(lvl, subfiletype=1, metadata=None, **options)
     finally:
+        # Release memmap references before attempting to delete the backing .dat files.
+        try:
+            _close_memmap(lvl)
+        except Exception:
+            pass
+        try:
+            _close_memmap(prev if isinstance(prev, np.memmap) else None)
+        except Exception:
+            pass
+        try:
+            _close_memmap(src_mm if isinstance(src_mm, np.memmap) else None)
+        except Exception:
+            pass
+        for arr in list(level_arrays):
+            try:
+                _close_memmap(arr)
+            except Exception:
+                pass
+
+        try:
+            del lvl
+        except Exception:
+            pass
+        try:
+            del prev
+        except Exception:
+            pass
         try:
             del src_mm
         except Exception:
             pass
-        for arr in level_arrays:
-            try:
-                arr.flush()
-            except Exception:
-                pass
-        for pth in level_paths:
-            try:
-                os.remove(pth)
-            except Exception:
-                pass
         try:
-            os.rmdir(tmpdir)
+            level_arrays.clear()
+        except Exception:
+            pass
+        try:
+            gc.collect()
         except Exception:
             pass
 
+        for pth in level_paths:
+            removed = False
+            for _ in range(10):
+                try:
+                    os.remove(pth)
+                    removed = True
+                    break
+                except FileNotFoundError:
+                    removed = True
+                    break
+                except PermissionError:
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+                except Exception:
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+            if not removed:
+                try:
+                    Path(pth).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        if dst_path is not None:
+            # Best-effort cleanup of the temporary work directory after a direct write.
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            except Exception:
+                pass
+
     if replace_source:
-        os.replace(dst, src)
+        try:
+            os.replace(dst, src)
+        except OSError as e:
+            raise OSError(
+                e.errno,
+                f'Failed to replace flat OME-TIFF with pyramidal output. Source={dst!r}, destination={src!r}. '
+                'The destination file may still be open in another program or the source/destination may be on different volumes.',
+            ) from e
         return src
     return dst
 
