@@ -358,6 +358,8 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "output_path": out_path,
             "registration_algorithm": reg_algorithm,
             "tiled_rigid_allow_rotation": tiled_allow_rotation,
+            "tiled_rigid_tile_size": int(tiled_tile_size),
+            "tiled_rigid_search_factor": float(tiled_search_factor),
             "pyramidal_output": bool(self.chk_pyramidal_output.isChecked()),
             "cycles": cycles_out,
         }
