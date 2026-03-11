@@ -533,14 +533,14 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         except Exception:
             return None
 
-    def _apply_cfg_to_sample(self, s: BatchSample, cfg: dict) -> None:
+    def _apply_cfg_to_sample(self, s: BatchSample, cfg: dict, preserve_paths: bool = False) -> None:
         # Update global metadata from the dialog/plan.
         try:
             if 'tissue' in cfg:
                 s.tissue = str(cfg.get('tissue') or '').strip()
             if 'species' in cfg:
                 s.species = str(cfg.get('species') or '').strip()
-            if 'output_path' in cfg:
+            if (not preserve_paths) and ('output_path' in cfg):
                 op = str(cfg.get('output_path') or '').strip()
                 s.output_path = Path(op).expanduser() if op else None
             s.registration_algorithm = str(cfg.get('registration_algorithm') or s.registration_algorithm or 'tiled_rigid').strip() or 'tiled_rigid'
@@ -552,8 +552,11 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             pass
 
         cycles_cfg = cfg.get("cycles") or []
-        # Map by file basename when possible, else fall back to order.
-        by_base = {Path(d.get("path") or "").name: d for d in cycles_cfg}
+        # When applying a copied template across samples, preserve each sample's
+        # own input paths by matching cycles only by position. For normal config
+        # application (e.g. loading a saved plan for the same sample), allow
+        # matching by basename first and then fall back to order.
+        by_base = {} if preserve_paths else {Path(d.get("path") or "").name: d for d in cycles_cfg}
 
         cycles: list[int] = []
         enableds: list[bool] = []
@@ -561,7 +564,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         chm: list[list[str]] = []
         cha: list[list[str]] = []
         for i, p in enumerate(s.files):
-            d = by_base.get(p.name)
+            d = by_base.get(p.name) if by_base else None
             if d is None and i < len(cycles_cfg):
                 d = cycles_cfg[i]
             if d is None:
@@ -585,9 +588,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             show_warning("No template configured yet. Use 'Configure cycles…' first.")
             return
         for s in self._samples:
-            self._apply_cfg_to_sample(s, self._template_cfg)
+            self._apply_cfg_to_sample(s, self._template_cfg, preserve_paths=True)
         self._refresh_table()
-        self._set_status("Copied cycle configuration to all samples.")
+        self._set_status("Copied cycle configuration to all samples (preserved sample input/output paths).")
 
     # -------------------- Plan I/O --------------------
     def _plan_dict(self) -> dict:

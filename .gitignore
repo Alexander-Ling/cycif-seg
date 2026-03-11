@@ -11,6 +11,7 @@
 *.sln.docstates
 cycif_env/
 Test_Project/
+src/cycif_seg.egg-info/
 
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
