@@ -17,6 +17,8 @@ from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 
 PLAN_SCHEMA_VERSION = 1
 
+default_tiled_rigid_tile_size: int = 1000
+default_tiled_rigid_search_factor: float = 5.0
 
 def _parse_cycle_number_from_filename(name: str) -> int | None:
     """Parse cycle number from stitched file names like ``C3_sample_...ome.tiff``."""
@@ -90,8 +92,8 @@ class BatchSample:
     cycles_enabled: list[bool] | None = None
     registration_algorithm: str = "tiled_rigid"
     tiled_rigid_allow_rotation: bool = False
-    tiled_rigid_tile_size: int = 2000
-    tiled_rigid_search_factor: float = 3.0
+    tiled_rigid_tile_size: int = default_tiled_rigid_tile_size
+    tiled_rigid_search_factor: float = default_tiled_rigid_search_factor
     pyramidal_output: bool = True
 
 
@@ -525,8 +527,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "output_path": str(s.output_path or ""),
                 "registration_algorithm": str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
                 "tiled_rigid_allow_rotation": bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
-                "tiled_rigid_tile_size": int(getattr(s, 'tiled_rigid_tile_size', 2000) or 2000),
-                "tiled_rigid_search_factor": float(getattr(s, 'tiled_rigid_search_factor', 3.0) or 3.0),
+                "tiled_rigid_tile_size": int(getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size),
+                "tiled_rigid_search_factor": float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor),
                 "pyramidal_output": bool(getattr(s, 'pyramidal_output', True)),
                 "cycles": cycles_out,
             }
@@ -545,8 +547,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.output_path = Path(op).expanduser() if op else None
             s.registration_algorithm = str(cfg.get('registration_algorithm') or s.registration_algorithm or 'tiled_rigid').strip() or 'tiled_rigid'
             s.tiled_rigid_allow_rotation = bool(cfg.get('tiled_rigid_allow_rotation') if cfg.get('tiled_rigid_allow_rotation') is not None else getattr(s, 'tiled_rigid_allow_rotation', False))
-            s.tiled_rigid_tile_size = max(128, int(cfg.get('tiled_rigid_tile_size') if cfg.get('tiled_rigid_tile_size') is not None else getattr(s, 'tiled_rigid_tile_size', 2000) or 2000))
-            s.tiled_rigid_search_factor = max(1.0, float(cfg.get('tiled_rigid_search_factor') if cfg.get('tiled_rigid_search_factor') is not None else getattr(s, 'tiled_rigid_search_factor', 3.0) or 3.0))
+            s.tiled_rigid_tile_size = max(128, int(cfg.get('tiled_rigid_tile_size') if cfg.get('tiled_rigid_tile_size') is not None else getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size))
+            s.tiled_rigid_search_factor = max(1.0, float(cfg.get('tiled_rigid_search_factor') if cfg.get('tiled_rigid_search_factor') is not None else getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor))
             s.pyramidal_output = bool(cfg.get('pyramidal_output') if cfg.get('pyramidal_output') is not None else getattr(s, 'pyramidal_output', True))
         except Exception:
             pass
@@ -602,8 +604,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             "output_dir": out_dir,
             "defaults": {
                 "registration_algorithm": "tiled_rigid",
-                "tiled_rigid_tile_size": 2000,
-                "tiled_rigid_search_factor": 3.0,
+                "tiled_rigid_tile_size": default_tiled_rigid_tile_size,
+                "tiled_rigid_search_factor": default_tiled_rigid_search_factor,
                 "tissue": self.txt_default_tissue.text().strip(),
                 "species": self.txt_default_species.text().strip(),
             },
@@ -626,8 +628,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "cycles_enabled": list(s.cycles_enabled or []),
                 "registration_algorithm": str(getattr(s, "registration_algorithm", "tiled_rigid") or "tiled_rigid"),
                 "tiled_rigid_allow_rotation": bool(getattr(s, "tiled_rigid_allow_rotation", False)),
-                "tiled_rigid_tile_size": int(getattr(s, "tiled_rigid_tile_size", 2000) or 2000),
-                "tiled_rigid_search_factor": float(getattr(s, "tiled_rigid_search_factor", 3.0) or 3.0),
+                "tiled_rigid_tile_size": int(getattr(s, "tiled_rigid_tile_size", default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size),
+                "tiled_rigid_search_factor": float(getattr(s, "tiled_rigid_search_factor", default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor),
                 "pyramidal_output": bool(getattr(s, "pyramidal_output", True)),
             }
             d["samples"].append(rec)
@@ -672,8 +674,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 registration_algorithm=str(rec.get("registration_algorithm") or defs.get("registration_algorithm") or "tiled_rigid"),
             )
             s.tiled_rigid_allow_rotation = bool(rec.get("tiled_rigid_allow_rotation", False))
-            s.tiled_rigid_tile_size = max(128, int(rec.get("tiled_rigid_tile_size", defs.get("tiled_rigid_tile_size", 2000)) or 2000))
-            s.tiled_rigid_search_factor = max(1.0, float(rec.get("tiled_rigid_search_factor", defs.get("tiled_rigid_search_factor", 3.0)) or 3.0))
+            s.tiled_rigid_tile_size = max(128, int(rec.get("tiled_rigid_tile_size", defs.get("tiled_rigid_tile_size", default_tiled_rigid_tile_size)) or default_tiled_rigid_tile_size))
+            s.tiled_rigid_search_factor = max(1.0, float(rec.get("tiled_rigid_search_factor", defs.get("tiled_rigid_search_factor", default_tiled_rigid_search_factor)) or default_tiled_rigid_search_factor))
             s.pyramidal_output = bool(rec.get("pyramidal_output", True))
             s.cycles = list(rec.get("cycles") or []) or None
             s.registration_markers = list(rec.get("registration_markers") or []) or None
@@ -802,8 +804,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     default_registration_marker="DAPI",
                     registration_algorithm=str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
                     tiled_rigid_allow_rotation=bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
-                    tiled_rigid_tile_size=max(128, int(getattr(s, 'tiled_rigid_tile_size', 2000) or 2000)),
-                    tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', 3.0) or 3.0)),
+                    tiled_rigid_tile_size=max(128, int(getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size)),
+                    tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
                     pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
                     progress_event_cb=_ev,
                     cancel_cb=lambda: bool(self._cancel_requested),
