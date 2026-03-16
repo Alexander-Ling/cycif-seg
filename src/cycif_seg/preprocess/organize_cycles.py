@@ -369,10 +369,9 @@ def estimate_tiled_rigid_transforms(
     """
     Register moving->fixed using independent tiles with optional rotation.
 
-    Robustness improvements:
+    Features:
       - z-score normalize fixed/moving (global)
       - Otsu foreground masks; skip tiles with little foreground
-      - smaller search window (search_factor ~2)
       - confidence gating (score + peak ratio); fallback to identity placement
       - smooth displacement field across tiles to discourage drifting
     """
