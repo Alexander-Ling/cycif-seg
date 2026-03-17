@@ -203,14 +203,61 @@ def _unit_to_um(unit: str | None) -> float | None:
     return aliases.get(u)
 
 
+def _canonical_ome_length_unit(unit: str | None) -> str:
+    u = str(unit or '').strip()
+    if not u:
+        return "µm"
+    ul = u.lower()
+    alias_map = {
+        "µm": "µm",
+        "um": "µm",
+        "μm": "µm",
+        "micron": "µm",
+        "microns": "µm",
+        "micrometer": "µm",
+        "micrometers": "µm",
+        "micrometre": "µm",
+        "micrometres": "µm",
+        "unitslength.micrometer": "µm",
+        "unitslength.micrometre": "µm",
+        "unitslength.micrometer.value": "µm",
+        "unitslength.micrometre.value": "µm",
+        "millimeter": "mm",
+        "millimeters": "mm",
+        "millimetre": "mm",
+        "millimetres": "mm",
+        "unitslength.millimeter": "mm",
+        "unitslength.millimetre": "mm",
+        "nanometer": "nm",
+        "nanometers": "nm",
+        "nanometre": "nm",
+        "nanometres": "nm",
+        "unitslength.nanometer": "nm",
+        "unitslength.nanometre": "nm",
+        "centimeter": "cm",
+        "centimeters": "cm",
+        "centimetre": "cm",
+        "centimetres": "cm",
+        "unitslength.centimeter": "cm",
+        "unitslength.centimetre": "cm",
+        "meter": "m",
+        "meters": "m",
+        "metre": "m",
+        "metres": "m",
+        "unitslength.meter": "m",
+        "unitslength.metre": "m",
+    }
+    return alias_map.get(ul, u)
+
+
 def _normalize_physical_pixel_sizes(meta: dict | None) -> dict | None:
     if not meta:
         return None
     try:
         psx = meta.get("PhysicalSizeX", None)
         psy = meta.get("PhysicalSizeY", None)
-        ux = meta.get("PhysicalSizeXUnit", None) or "µm"
-        uy = meta.get("PhysicalSizeYUnit", None) or ux
+        ux = _canonical_ome_length_unit(meta.get("PhysicalSizeXUnit", None) or "µm")
+        uy = _canonical_ome_length_unit(meta.get("PhysicalSizeYUnit", None) or ux)
         psx = float(psx) if psx is not None else None
         psy = float(psy) if psy is not None else None
         if psx is not None and (not np.isfinite(psx) or psx <= 0):

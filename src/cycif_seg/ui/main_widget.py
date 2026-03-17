@@ -36,7 +36,9 @@ from cycif_seg.ui.layer_manager import LayerManager
 from cycif_seg.ui.project_controller import ProjectController
 from cycif_seg.ui.image_controller import ImageController
 from cycif_seg.ui.rf_controller import RFController
+from cycif_seg.ui.steps.step0_stitch_panel import Step0StitchPanel
 from cycif_seg.ui.steps.step1_preprocess_panel import Step1PreprocessPanel
+from cycif_seg.ui.batch_stitch_dialog import BatchStitchDialog
 from cycif_seg.ui.batch_preprocess_dialog import BatchPreprocessDialog
 from cycif_seg.ui.steps.step2a_nuclei_panel import Step2aNucleiPanel
 from cycif_seg.ui.steps.step2b_edit_panel import Step2bEditPanel
@@ -48,8 +50,26 @@ class CycIFMVPWidget(QtWidgets.QWidget):
     # Thread-safe UI update signals (emitted from worker threads).
     sig_step1_status = QtCore.Signal(str)
     sig_step1_progress = QtCore.Signal(int, int)  # (idx, n)
+
+    def minimumSizeHint(self):
+        # Keep the dock shrinkable even when some child controls would prefer
+        # a much wider width. Users can drag narrower even if some controls
+        # become partially obscured.
+        return QtCore.QSize(120, 240)
+
+    def sizeHint(self):
+        # Provide a reasonable default width without forcing the dock to keep it.
+        return QtCore.QSize(360, 900)
+
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
+        # Let the dock compress horizontally beyond the natural width implied by
+        # the stacked right-side controls.
+        self.setMinimumWidth(0)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored,
+            QtWidgets.QSizePolicy.Preferred,
+        )
         # Name for the single multichannel image layer used when 'Display selected channels only' is OFF.
         # Using a single layer (channel_axis) is much faster than one layer per channel for large OME-TIFFs.
         self._all_channels_layer_name = "All Channels"
@@ -111,10 +131,17 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         layout.addLayout(proj_row)
 
         # ------------------------------------------------------------------
-        # Tabbed workspaces (Step 1..5)
+        # Tabbed workspaces (Stage 0, Step 1..5)
         # ------------------------------------------------------------------
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs, 1)
+
+        # -----------------------------
+        # Stage 0: Stitch
+        # -----------------------------
+        self.step0_panel = Step0StitchPanel()
+        self.btn_batch_stitch = self.step0_panel.btn_batch_stitch
+        self.tabs.addTab(self.step0_panel, "Stage 0: Stitch")
 
         # -----------------------------
         # Step 1: Preprocessing
@@ -219,6 +246,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_open_project.clicked.connect(self.on_open_project)
         self.btn_save_project.clicked.connect(self.on_save_project)
         self.btn_load.clicked.connect(self.image_ctrl.on_load)
+        self.btn_batch_stitch.clicked.connect(self.on_batch_stitch_cycles)
         self.btn_merge_cycles.clicked.connect(self.on_merge_cycles)
         self.btn_batch_merge.clicked.connect(self.on_batch_merge_cycles)
         self.tabs.currentChanged.connect(lambda _idx: self._mark_project_dirty())
@@ -469,6 +497,18 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 pass
 
         worker.start()
+
+    def on_batch_stitch_cycles(self):
+        """Stage 0 batch mode: stitch tiled cycle folders for many samples."""
+        dlg = BatchStitchDialog(self)
+        if dlg.exec_() != QtWidgets.QDialog.Accepted:
+            pass
+
+        reports = dlg.get_reports()
+        if not reports:
+            return
+
+        self.set_status(f"Stitched {len(reports)} cycle image(s).")
 
     def on_batch_merge_cycles(self):
         """Step (1) batch mode: scan a folder-of-folders and preprocess multiple samples."""
