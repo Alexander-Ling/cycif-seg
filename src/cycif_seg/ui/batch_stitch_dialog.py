@@ -42,7 +42,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Batch stitch (Stage 0)')
+        self.setWindowTitle('Batch stitch (Step 0)')
         self.setModal(True)
         self._samples: list[StitchSample] = []
         self._reports: list[dict] = []

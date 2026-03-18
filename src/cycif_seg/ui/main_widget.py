@@ -131,17 +131,17 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         layout.addLayout(proj_row)
 
         # ------------------------------------------------------------------
-        # Tabbed workspaces (Stage 0, Step 1..5)
+        # Tabbed workspaces (Step 0..5)
         # ------------------------------------------------------------------
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs, 1)
 
         # -----------------------------
-        # Stage 0: Stitch
+        # Step 0: Stitch
         # -----------------------------
         self.step0_panel = Step0StitchPanel()
         self.btn_batch_stitch = self.step0_panel.btn_batch_stitch
-        self.tabs.addTab(self.step0_panel, "Stage 0: Stitch")
+        self.tabs.addTab(self.step0_panel, "Step 0: Stitch")
 
         # -----------------------------
         # Step 1: Preprocessing
@@ -500,7 +500,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         worker.start()
 
     def on_batch_stitch_cycles(self):
-        """Stage 0 batch mode: stitch tiled cycle folders for many samples."""
+        """Step 0 batch mode: stitch tiled cycle folders for many samples."""
         dlg = BatchStitchDialog(self)
         if dlg.exec_() != QtWidgets.QDialog.Accepted:
             pass

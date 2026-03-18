@@ -4,7 +4,7 @@ from qtpy import QtWidgets
 
 
 class Step0StitchPanel(QtWidgets.QWidget):
-    """UI panel for Stage 0 (tile stitching)."""
+    """UI panel for Step 0 (tile stitching)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -18,7 +18,7 @@ class Step0StitchPanel(QtWidgets.QWidget):
 
         layout.addWidget(
             QtWidgets.QLabel(
-                "Stage 0 (Stitch): find area_{x}_{y}.ome.tiff tiles inside each cycle folder, "
+                "Step 0 (Stitch): find tile files each cycle folder, "
                 "estimate translations on a chosen stitch channel, and write a stitched "
                 "pyramidal OME-TIFF back into each cycle folder."
             )
