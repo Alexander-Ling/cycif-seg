@@ -11,14 +11,14 @@ from napari.utils.notifications import show_info, show_warning
 from napari.qt.threading import thread_worker
 
 from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
-from cycif_seg.io.ome_tiff import load_channel_names_only
+from cycif_seg.io.ome_tiff import load_channel_names_only_fast
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 
 
 PLAN_SCHEMA_VERSION = 1
 
-default_tiled_rigid_tile_size: int = 2000
-default_tiled_rigid_search_factor: float = 3.0
+default_tiled_rigid_tile_size: int = 1000
+default_tiled_rigid_search_factor: float = 5.0
 
 def _parse_cycle_number_from_filename(name: str) -> int | None:
     """Parse cycle number from stitched file names like ``C3_sample_...ome.tiff``."""
@@ -115,6 +115,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self._template_cfg: dict | None = None
         self._cancel_requested: bool = False
         self._refreshing_table: bool = False
+        self._channel_name_cache: dict[str, list[str]] = {}
 
         root = QtWidgets.QVBoxLayout(self)
 
@@ -418,7 +419,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             out: dict[str, list[str]] = {}
             for i, p in enumerate(s.files, start=1):
                 try:
-                    out[str(p)] = list(load_channel_names_only(str(p)) or [])
+                    out[str(p)] = list(self._channel_name_cache.get(str(p)) or load_channel_names_only_fast(str(p)) or [])
+                    self._channel_name_cache[str(p)] = list(out[str(p)])
                 except Exception:
                     out[str(p)] = []
                 self.sig_set_cycle_progress.emit(int(i), int(len(s.files)))

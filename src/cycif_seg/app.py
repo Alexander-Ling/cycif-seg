@@ -1,5 +1,5 @@
 import napari
-from qtpy import QtWidgets
+from qtpy import QtWidgets, QtCore
 from cycif_seg.ui.main_widget import CycIFMVPWidget
 
 
@@ -19,6 +19,17 @@ def main():
         dock.setSizePolicy(
             QtWidgets.QSizePolicy.Ignored,
             QtWidgets.QSizePolicy.Preferred,
+        )
+    except Exception:
+        pass
+    try:
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: viewer.window._qt_window.resizeDocks(
+                [dock],
+                [720], #Default width for right dock widget housing all of our tools
+                QtCore.Qt.Horizontal,
+            ),
         )
     except Exception:
         pass

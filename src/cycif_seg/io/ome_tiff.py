@@ -97,6 +97,57 @@ def _channel_names_from_ome(ome_xml: str, n_channels: int) -> list[str] | None:
     except Exception:
         return None
 
+
+
+def _channel_names_from_ome_all(ome_xml: str) -> list[str] | None:
+    """Read all channel names from OME-XML without inspecting TIFF series/layout."""
+    if not ome_xml:
+        return None
+
+    # First try ome-types (if available)
+    if from_xml is not None:
+        try:
+            ome = from_xml(ome_xml)
+            img0 = ome.images[0] if ome.images else None
+            px = img0.pixels if img0 else None
+            if not px or not px.channels:
+                return None
+            names = [str((ch.name or "").strip()) for ch in px.channels]
+            if all(n == "" for n in names):
+                return None
+            return names
+        except Exception:
+            pass
+
+    # Fallback: parse OME-XML directly.
+    try:
+        root = ET.fromstring(ome_xml)
+
+        def _strip(tag: str) -> str:
+            return tag.split("}", 1)[-1]
+
+        # Prefer channel tags nested under the first Pixels block.
+        for el in root.iter():
+            if _strip(el.tag) == "Pixels":
+                names: list[str] = []
+                for child in el.iter():
+                    if _strip(child.tag) == "Channel":
+                        names.append((child.attrib.get("Name") or "").strip())
+                if names and not all(n == "" for n in names):
+                    return names
+                break
+
+        # Fallback: any Channel tags in document order.
+        names = []
+        for el in root.iter():
+            if _strip(el.tag) == "Channel":
+                names.append((el.attrib.get("Name") or "").strip())
+        if not names or all(n == "" for n in names):
+            return None
+        return names
+    except Exception:
+        return None
+
 def _physical_pixel_sizes_from_ome(ome_xml: str) -> dict | None:
     """Read OME physical pixel size metadata from the first image/pixels block."""
     if not ome_xml:
@@ -1102,6 +1153,37 @@ class LazyChannelImage:
             y, x = np.asarray(self.get_channel(0)[yk, xk]).shape[:2]
             return np.empty((y, x, 0), dtype=self.dtype)
         return np.stack(planes, axis=-1)
+
+
+def load_channel_names_only_fast(path: str) -> list[str]:
+    """Read channel names using only OME-XML, avoiding full TIFF series inspection when possible."""
+    try:
+        with tifffile.TiffFile(path) as tf:
+            ome_xml = None
+            try:
+                first_page = tf.pages.first
+            except Exception:
+                first_page = tf.pages[0]
+            try:
+                ome_xml = first_page.description
+            except Exception:
+                ome_xml = None
+            if not ome_xml:
+                try:
+                    ome_xml = first_page.tags["ImageDescription"].value
+                except Exception:
+                    ome_xml = None
+            if not ome_xml:
+                try:
+                    ome_xml = tf.ome_metadata
+                except Exception:
+                    ome_xml = None
+        names = _channel_names_from_ome_all(str(ome_xml or ""))
+        if names:
+            return list(names)
+    except Exception:
+        pass
+    return load_channel_names_only(path)
 
 
 def load_channel_names_only(path: str) -> list[str]:
