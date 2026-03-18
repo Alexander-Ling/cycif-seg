@@ -10,9 +10,16 @@ from napari.qt.threading import thread_worker
 from napari.utils.notifications import show_warning
 
 from cycif_seg.io.ome_tiff import load_channel_names_only
-from cycif_seg.stitch.stitch_core import discover_sample_cycles, stitch_cycle_tiles
+from cycif_seg.stitch.stitch_core import (
+    _DEFAULT_TILE_RE,
+    _DEFAULT_X_GROUP,
+    _DEFAULT_Y_GROUP,
+    discover_cycle_tiles,
+    discover_sample_cycles,
+    stitch_cycle_tiles,
+)
 
-PLAN_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -31,6 +38,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
     sig_set_status = QtCore.Signal(str)
     sig_set_cycle_progress = QtCore.Signal(int, int)
     sig_set_sample_progress = QtCore.Signal(int, int)
+    sig_show_warning = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -38,6 +46,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self.setModal(True)
         self._samples: list[StitchSample] = []
         self._reports: list[dict] = []
+        self._failures: list[dict] = []
         self._cancel_requested = False
         self._refreshing_table = False
         self._channel_template_index: int | None = None
@@ -71,6 +80,32 @@ class BatchStitchDialog(QtWidgets.QDialog):
         defaults.addWidget(self.btn_apply_defaults)
         defaults.addStretch(1)
         root.addLayout(defaults)
+
+        self.grp_advanced = QtWidgets.QGroupBox('Advanced tile filename parsing')
+        self.grp_advanced.setCheckable(True)
+        self.grp_advanced.setChecked(False)
+        adv = QtWidgets.QGridLayout(self.grp_advanced)
+        self.txt_tile_regex = QtWidgets.QLineEdit(_DEFAULT_TILE_RE.pattern)
+        self.spin_x_group = QtWidgets.QSpinBox()
+        self.spin_x_group.setMinimum(1)
+        self.spin_x_group.setMaximum(99)
+        self.spin_x_group.setValue(int(_DEFAULT_X_GROUP))
+        self.spin_y_group = QtWidgets.QSpinBox()
+        self.spin_y_group.setMinimum(1)
+        self.spin_y_group.setMaximum(99)
+        self.spin_y_group.setValue(int(_DEFAULT_Y_GROUP))
+        adv.addWidget(QtWidgets.QLabel('Tile filename regex:'), 0, 0)
+        adv.addWidget(self.txt_tile_regex, 0, 1, 1, 3)
+        adv.addWidget(QtWidgets.QLabel('X capture group:'), 1, 0)
+        adv.addWidget(self.spin_x_group, 1, 1)
+        adv.addWidget(QtWidgets.QLabel('Y capture group:'), 1, 2)
+        adv.addWidget(self.spin_y_group, 1, 3)
+        adv.addWidget(
+            QtWidgets.QLabel('Default behavior when advanced parsing is off: use the last two underscore-separated integer fields before .ome.tif/.ome.tiff as x and y.'),
+            2, 0, 1, 4
+        )
+        adv.setColumnStretch(1, 1)
+        root.addWidget(self.grp_advanced)
 
         self.tbl = QtWidgets.QTableWidget()
         self.tbl.setColumnCount(7)
@@ -129,8 +164,27 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self.sig_set_status.connect(self._apply_status)
         self.sig_set_cycle_progress.connect(self._apply_cycle_progress)
         self.sig_set_sample_progress.connect(self._apply_sample_progress)
+        self.sig_show_warning.connect(show_warning)
         self.tbl.itemChanged.connect(self._on_table_item_changed)
         self.btn_stop.setEnabled(False)
+
+    def _tile_parse_settings(self) -> tuple[str | None, int, int]:
+        if not self.grp_advanced.isChecked():
+            return None, int(_DEFAULT_X_GROUP), int(_DEFAULT_Y_GROUP)
+        return (
+            self.txt_tile_regex.text().strip() or _DEFAULT_TILE_RE.pattern,
+            int(self.spin_x_group.value()),
+            int(self.spin_y_group.value()),
+        )
+
+    def _discover_cycle_tiles_for_dir(self, cycle_dir: Path) -> dict[tuple[int, int], Path]:
+        tile_filename_regex, x_group, y_group = self._tile_parse_settings()
+        return discover_cycle_tiles(
+            cycle_dir,
+            tile_filename_regex=tile_filename_regex,
+            x_group=int(x_group),
+            y_group=int(y_group),
+        )
 
     def get_reports(self) -> list[dict]:
         return list(self._reports)
@@ -175,14 +229,20 @@ class BatchStitchDialog(QtWidgets.QDialog):
         for sub in sorted(root_dir.iterdir()):
             if not sub.is_dir():
                 continue
-            cycle_dirs = discover_sample_cycles(sub)
+            tile_filename_regex, x_group, y_group = self._tile_parse_settings()
+            cycle_dirs = discover_sample_cycles(
+                sub,
+                tile_filename_regex=tile_filename_regex,
+                x_group=int(x_group),
+                y_group=int(y_group),
+            )
             if not cycle_dirs:
                 continue
             n_cycles += len(cycle_dirs)
             tile_counts = []
             for cdir in cycle_dirs:
                 try:
-                    tile_counts.append(sum(1 for p in cdir.iterdir() if p.is_file() and p.name.lower().startswith('area_') and '.ome.' in p.name.lower()))
+                    tile_counts.append(len(self._discover_cycle_tiles_for_dir(cdir)))
                 except Exception:
                     tile_counts.append(0)
             avg_tiles = (float(sum(tile_counts)) / float(len(tile_counts))) if tile_counts else 0.0
@@ -282,7 +342,8 @@ class BatchStitchDialog(QtWidgets.QDialog):
             show_warning('Selected sample has no cycle folders.')
             return
         first_cycle = s.cycle_dirs[0]
-        tile_files = sorted(p for p in first_cycle.iterdir() if p.is_file() and p.name.lower().startswith('area_') and '.ome.' in p.name.lower())
+        tile_map = self._discover_cycle_tiles_for_dir(first_cycle)
+        tile_files = [tile_map[k] for k in sorted(tile_map.keys(), key=lambda t: (t[1], t[0]))]
         if not tile_files:
             show_warning('Selected sample has no tile files.')
             return
@@ -323,6 +384,10 @@ class BatchStitchDialog(QtWidgets.QDialog):
                 'output_suffix': self.txt_default_suffix.text().strip() or 'stitched',
                 'stitch_channel': int(self.spin_default_channel.value()),
                 'pyramidal_output': bool(self.chk_default_pyramidal.isChecked()),
+                'use_custom_filename_parsing': bool(self.grp_advanced.isChecked()),
+                'tile_filename_regex': self.txt_tile_regex.text().strip() or _DEFAULT_TILE_RE.pattern,
+                'x_group': int(self.spin_x_group.value()),
+                'y_group': int(self.spin_y_group.value()),
             },
             'samples': [
                 {
@@ -354,7 +419,8 @@ class BatchStitchDialog(QtWidgets.QDialog):
         if not path:
             return
         d = json.loads(Path(path).read_text(encoding='utf-8'))
-        if int(d.get('schema_version') or 0) != PLAN_SCHEMA_VERSION:
+        schema_version = int(d.get('schema_version') or 0)
+        if schema_version not in {1, PLAN_SCHEMA_VERSION}:
             show_warning(f"Unsupported plan schema version: {d.get('schema_version')}")
             return
         self.txt_root.setText(str(d.get('root_dir') or ''))
@@ -362,6 +428,10 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self.txt_default_suffix.setText(str(defs.get('output_suffix') or 'stitched'))
         self.spin_default_channel.setValue(max(0, int(defs.get('stitch_channel') or 0)))
         self.chk_default_pyramidal.setChecked(bool(defs.get('pyramidal_output', True)))
+        self.grp_advanced.setChecked(bool(defs.get('use_custom_filename_parsing', False)))
+        self.txt_tile_regex.setText(str(defs.get('tile_filename_regex') or _DEFAULT_TILE_RE.pattern))
+        self.spin_x_group.setValue(max(1, int(defs.get('x_group') or _DEFAULT_X_GROUP)))
+        self.spin_y_group.setValue(max(1, int(defs.get('y_group') or _DEFAULT_Y_GROUP)))
         self._samples = [
             StitchSample(
                 name=str(rec.get('name') or ''),
@@ -428,51 +498,79 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self.btn_copy_channel_to_all.setEnabled(False)
         self._cancel_requested = False
         self._reports = []
+        self._failures = []
 
         @thread_worker
         def _worker():
             reports: list[dict] = []
+            failures: list[dict] = []
             for si, s in enumerate(enabled, start=1):
                 if self._cancel_requested:
                     raise RuntimeError('Cancelled')
                 self.sig_set_sample_progress.emit(int(si - 1), int(n_samp))
                 n_cycles_this_sample = max(1, len(s.cycle_dirs))
-                self.sig_set_cycle_progress.emit(0, int(n_cycles_this_sample))
-                for ci, cdir in enumerate(s.cycle_dirs, start=1):
+                try:
+                    self.sig_set_cycle_progress.emit(0, int(n_cycles_this_sample))
+                    for ci, cdir in enumerate(s.cycle_dirs, start=1):
+                        if self._cancel_requested:
+                            raise RuntimeError('Cancelled')
+                        self.sig_set_cycle_progress.emit(int(ci - 1), int(n_cycles_this_sample))
+
+                        def _progress(msg: str, _si=si, _name=s.name, _cdir=cdir, _ci=ci, _nci=n_cycles_this_sample):
+                            self.sig_set_status.emit(f"[{_si}/{n_samp}] {_name} [{_ci}/{_nci}] / {_cdir.name}: {msg}")
+
+                        tile_filename_regex, x_group, y_group = self._tile_parse_settings()
+                        rep = stitch_cycle_tiles(
+                            cdir,
+                            output_suffix=s.output_suffix,
+                            stitch_channel=int(s.stitch_channel),
+                            pyramidal_output=bool(s.pyramidal_output),
+                            tile_filename_regex=tile_filename_regex,
+                            x_group=int(x_group),
+                            y_group=int(y_group),
+                            progress_cb=_progress,
+                            cancel_cb=lambda: bool(self._cancel_requested),
+                        )
+                        rep['sample_name'] = s.name
+                        reports.append(rep)
+                        self.sig_set_cycle_progress.emit(int(ci), int(n_cycles_this_sample))
+                except Exception as e:
                     if self._cancel_requested:
-                        raise RuntimeError('Cancelled')
-                    self.sig_set_cycle_progress.emit(int(ci - 1), int(n_cycles_this_sample))
-
-                    def _progress(msg: str, _si=si, _name=s.name, _cdir=cdir, _ci=ci, _nci=n_cycles_this_sample):
-                        self.sig_set_status.emit(f"[{_si}/{n_samp}] {_name} [{_ci}/{_nci}] / {_cdir.name}: {msg}")
-
-                    rep = stitch_cycle_tiles(
-                        cdir,
-                        output_suffix=s.output_suffix,
-                        stitch_channel=int(s.stitch_channel),
-                        pyramidal_output=bool(s.pyramidal_output),
-                        progress_cb=_progress,
-                        cancel_cb=lambda: bool(self._cancel_requested),
+                        raise
+                    msg = f"Sample '{s.name}' failed during batch stitch: {e}"
+                    failures.append(
+                        {
+                            'sample_name': str(s.name),
+                            'error': str(e),
+                        }
                     )
-                    rep['sample_name'] = s.name
-                    reports.append(rep)
-                    self.sig_set_cycle_progress.emit(int(ci), int(n_cycles_this_sample))
+                    self.sig_show_warning.emit(msg)
+                    self.sig_set_status.emit(msg)
                 self.sig_set_sample_progress.emit(int(si), int(n_samp))
-            return reports
+                self.sig_set_cycle_progress.emit(0, 1)
+            return {'reports': reports, 'failures': failures}
 
         worker = _worker()
 
         @worker.returned.connect
-        def _done(reports: list[dict]):
-            self._reports = list(reports or [])
-            self._set_status(f'Finished stitching {len(self._reports)} cycle image(s).')
+        def _done(result):
+            result = result or {}
+            self._reports = list(result.get('reports') or [])
+            self._failures = list(result.get('failures') or [])
+            if self._failures:
+                self._set_status(
+                    f"Finished stitching {len(self._reports)} cycle image(s) with "
+                    f"{len(self._failures)} failed sample(s)."
+                )
+            else:
+                self._set_status(f'Finished stitching {len(self._reports)} cycle image(s).')
             self.btn_run.setEnabled(True)
             self.btn_stop.setEnabled(False)
             self.btn_scan.setEnabled(True)
             self.btn_choose_channel.setEnabled(True)
             self.btn_copy_channel_to_all.setEnabled(True)
             self.prog_samples.setValue(self.prog_samples.maximum())
-            self.prog_cycles.setValue(self.prog_cycles.maximum())
+            self.prog_cycles.setValue(0)
 
         @worker.errored.connect
         def _err(e):
@@ -483,5 +581,6 @@ class BatchStitchDialog(QtWidgets.QDialog):
             self.btn_scan.setEnabled(True)
             self.btn_choose_channel.setEnabled(True)
             self.btn_copy_channel_to_all.setEnabled(True)
+            self.prog_cycles.setValue(0)
 
         worker.start()

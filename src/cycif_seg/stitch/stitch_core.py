@@ -24,7 +24,9 @@ from cycif_seg.io.ome_tiff import (
     load_single_channel_tiff_native,
 )
 
-_TILE_RE = re.compile(r"^area_(\d+)_(\d+)\.ome\.tif{1,2}$", re.IGNORECASE)
+_DEFAULT_TILE_RE = re.compile(r"^(?:area|raw).*_(\d+)_(\d+)\.ome\.tiff?$", re.IGNORECASE)
+_DEFAULT_X_GROUP = 1
+_DEFAULT_Y_GROUP = 2
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,7 @@ class NeighborEstimate:
     overlap_px: float
     score: float
     used_fallback: bool = False
+    used_unmasked: bool = False
 
 
 class RunningOverlap:
@@ -68,28 +71,76 @@ class RunningOverlap:
             self._y.append(float(overlap_px))
 
 
-def discover_cycle_tiles(cycle_dir: str | Path) -> dict[tuple[int, int], Path]:
+def _compile_tile_regex(tile_filename_regex: str | None) -> re.Pattern[str]:
+    if tile_filename_regex is None or not str(tile_filename_regex).strip():
+        return _DEFAULT_TILE_RE
+    return re.compile(str(tile_filename_regex), re.IGNORECASE)
+
+
+def _parse_tile_xy(
+    filename: str,
+    *,
+    tile_re: re.Pattern[str],
+    x_group: int,
+    y_group: int,
+) -> tuple[int, int] | None:
+    m = tile_re.match(filename)
+    if not m:
+        return None
+    try:
+        x = int(m.group(int(x_group)))
+        y = int(m.group(int(y_group)))
+    except Exception:
+        return None
+    return (x, y)
+
+
+def discover_cycle_tiles(
+    cycle_dir: str | Path,
+    *,
+    tile_filename_regex: str | None = None,
+    x_group: int = _DEFAULT_X_GROUP,
+    y_group: int = _DEFAULT_Y_GROUP,
+) -> dict[tuple[int, int], Path]:
     out: dict[tuple[int, int], Path] = {}
     cdir = Path(cycle_dir)
+    tile_re = _compile_tile_regex(tile_filename_regex)
     for p in sorted(cdir.iterdir()):
         if not p.is_file():
             continue
-        m = _TILE_RE.match(p.name)
-        if not m:
+        xy = _parse_tile_xy(
+            p.name,
+            tile_re=tile_re,
+            x_group=int(x_group),
+            y_group=int(y_group),
+        )
+        if xy is None:
             continue
-        x = int(m.group(1))
-        y = int(m.group(2))
+        x, y = xy
+        if (x, y) in out:
+            continue
         out[(x, y)] = p
     return out
 
 
-def discover_sample_cycles(sample_dir: str | Path) -> list[Path]:
+def discover_sample_cycles(
+    sample_dir: str | Path,
+    *,
+    tile_filename_regex: str | None = None,
+    x_group: int = _DEFAULT_X_GROUP,
+    y_group: int = _DEFAULT_Y_GROUP,
+) -> list[Path]:
     out: list[Path] = []
     sdir = Path(sample_dir)
     for p in sorted(sdir.iterdir()):
         if not p.is_dir():
             continue
-        if discover_cycle_tiles(p):
+        if discover_cycle_tiles(
+            p,
+            tile_filename_regex=tile_filename_regex,
+            x_group=int(x_group),
+            y_group=int(y_group),
+        ):
             out.append(p)
     return out
 
@@ -189,33 +240,43 @@ def _estimate_strip_pair(
     candidates: list[int] = sorted(set([nom] + list(range(min_ov, max_ov + 1, max(1, base // 100)))))
     best: tuple[float, float, float, float] | None = None  # objective, overlap, dy, dx
     best_score = -1.0
+    used_unmasked = False
 
-    for ov in candidates:
-        if axis == 'x':
-            a = src[:, w - ov : w]
-            b = dst[:, :ov]
-        else:
-            a = src[h - ov : h, :]
-            b = dst[:ov, :]
-        if a.size == 0 or b.size == 0:
-            continue
-        if _foreground_fraction(a, thr) < min_fg_frac or _foreground_fraction(b, thr) < min_fg_frac:
-            continue
-        try:
-            shift, _err, _ph = phase_cross_correlation(a, b, upsample_factor=10, normalization=None)
-            dy = float(shift[0])
-            dx = float(shift[1])
-        except Exception:
-            dy = 0.0
-            dx = 0.0
-        sc = _normalized_score(a, _shift_int(b, int(round(dy)), int(round(dx))))
-        if axis == 'x':
-            objective = abs(dx) + 0.25 * abs(dy)
-        else:
-            objective = abs(dy) + 0.25 * abs(dx)
-        if (best is None) or (objective < best[0] - 1e-6) or (abs(objective - best[0]) <= 1e-6 and sc > best_score):
-            best = (float(objective), float(ov), float(dy), float(dx))
-            best_score = float(sc)
+    def _search(*, require_foreground: bool) -> tuple[tuple[float, float, float, float] | None, float]:
+        local_best: tuple[float, float, float, float] | None = None
+        local_best_score = -1.0
+        for ov in candidates:
+            if axis == 'x':
+                a = src[:, w - ov : w]
+                b = dst[:, :ov]
+            else:
+                a = src[h - ov : h, :]
+                b = dst[:ov, :]
+            if a.size == 0 or b.size == 0:
+                continue
+            if require_foreground and (_foreground_fraction(a, thr) < min_fg_frac or _foreground_fraction(b, thr) < min_fg_frac):
+                continue
+            try:
+                shift, _err, _ph = phase_cross_correlation(a, b, upsample_factor=10, normalization=None)
+                dy = float(shift[0])
+                dx = float(shift[1])
+            except Exception:
+                dy = 0.0
+                dx = 0.0
+            sc = _normalized_score(a, _shift_int(b, int(round(dy)), int(round(dx))))
+            if axis == 'x':
+                objective = abs(dx) + 0.25 * abs(dy)
+            else:
+                objective = abs(dy) + 0.25 * abs(dx)
+            if (local_best is None) or (objective < local_best[0] - 1e-6) or (abs(objective - local_best[0]) <= 1e-6 and sc > local_best_score):
+                local_best = (float(objective), float(ov), float(dy), float(dx))
+                local_best_score = float(sc)
+        return local_best, float(local_best_score)
+
+    best, best_score = _search(require_foreground=True)
+    if best is None:
+        best, best_score = _search(require_foreground=False)
+        used_unmasked = best is not None
 
     if best is None:
         return None
@@ -229,7 +290,17 @@ def _estimate_strip_pair(
         global_dy = float(h - ov + dy)
         global_dx = float(dx)
         overlap = float(h - global_dy)
-    return NeighborEstimate(axis=axis, src=(0, 0), dst=(0, 0), dy=global_dy, dx=global_dx, overlap_px=float(overlap), score=float(best_score), used_fallback=False)
+    return NeighborEstimate(
+        axis=axis,
+        src=(0, 0),
+        dst=(0, 0),
+        dy=global_dy,
+        dx=global_dx,
+        overlap_px=float(overlap),
+        score=float(best_score),
+        used_fallback=False,
+        used_unmasked=bool(used_unmasked),
+    )
 
 
 def _feather_weights(h: int, w: int) -> np.ndarray:
@@ -279,6 +350,7 @@ def _build_neighbor_estimates(
 
     estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate] = {}
     any_signal = False
+    any_unmasked = False
     for _score, axis, src_xy, dst_xy in pairs:
         src = _img(src_xy)
         dst = _img(dst_xy)
@@ -293,17 +365,29 @@ def _build_neighbor_estimates(
                 dy, dx = float(tile_h - overlap), 0.0
             est = NeighborEstimate(axis=axis, src=src_xy, dst=dst_xy, dy=dy, dx=dx, overlap_px=overlap, score=-1.0, used_fallback=True)
         else:
-            est = NeighborEstimate(axis=axis, src=src_xy, dst=dst_xy, dy=est.dy, dx=est.dx, overlap_px=est.overlap_px, score=est.score, used_fallback=False)
+            est = NeighborEstimate(
+                axis=axis,
+                src=src_xy,
+                dst=dst_xy,
+                dy=est.dy,
+                dx=est.dx,
+                overlap_px=est.overlap_px,
+                score=est.score,
+                used_fallback=False,
+                used_unmasked=bool(getattr(est, 'used_unmasked', False)),
+            )
             running.add(axis, est.overlap_px)
             any_signal = True
+            any_unmasked = any_unmasked or bool(est.used_unmasked)
         estimates[(src_xy, dst_xy)] = est
         if progress_cb is not None:
             try:
-                progress_cb(f"Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px)")
+                extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
+                progress_cb(f"Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px){extra}")
             except Exception:
                 pass
     if not any_signal:
-        raise RuntimeError('No tile pairs had enough foreground signal for overlap estimation in this cycle/channel.')
+        raise RuntimeError('Unable to estimate tile overlaps for this cycle/channel, including unmasked fallback registration.')
     return estimates, running, tile_h, tile_w, n_channels
 
 
@@ -358,6 +442,9 @@ def stitch_cycle_tiles(
     output_suffix: str = 'stitched',
     stitch_channel: int = 0,
     pyramidal_output: bool = True,
+    tile_filename_regex: str | None = None,
+    x_group: int = _DEFAULT_X_GROUP,
+    y_group: int = _DEFAULT_Y_GROUP,
     progress_cb: Callable[[str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
 ) -> dict:
@@ -366,9 +453,20 @@ def stitch_cycle_tiles(
             raise RuntimeError('Cancelled')
 
     cycle_dir = Path(cycle_dir)
-    tiles = discover_cycle_tiles(cycle_dir)
+    tiles = discover_cycle_tiles(
+        cycle_dir,
+        tile_filename_regex=tile_filename_regex,
+        x_group=int(x_group),
+        y_group=int(y_group),
+    )
     if not tiles:
-        raise ValueError(f'No tile files matching area_{{x}}_{{y}}.ome.tiff found in: {cycle_dir}')
+        if tile_filename_regex is None or not str(tile_filename_regex).strip():
+            raise ValueError(
+                f'No tile files found in {cycle_dir} with filenames ending in underscore-separated integer fields for x and y, e.g. *_<x>_<y>.ome.tif[f]'
+            )
+        raise ValueError(
+            f'No tile files found in {cycle_dir} matching the custom tile filename regex.'
+        )
 
     tile_paths = [tiles[k] for k in sorted(tiles.keys(), key=lambda t: (t[1], t[0]))]
     first = tile_paths[0]
@@ -405,6 +503,7 @@ def stitch_cycle_tiles(
     feather = _feather_weights(tile_h, tile_w)
 
     used_fallback_pairs = sum(1 for e in estimates.values() if bool(e.used_fallback))
+    used_unmasked_pairs = sum(1 for e in estimates.values() if bool(getattr(e, 'used_unmasked', False)))
     try:
         with IncrementalOmeBigTiffWriter(str(out_flat), shape_yxc, info['dtype'], channel_names=channel_names, physical_pixel_sizes=phys) as writer:
             for ch in range(int(n_channels)):
@@ -464,9 +563,13 @@ def stitch_cycle_tiles(
         'n_tiles': int(len(tiles)),
         'n_channels': int(n_channels),
         'stitch_channel': int(stitch_channel),
+        'tile_filename_regex': str(tile_filename_regex) if tile_filename_regex is not None else '',
+        'x_group': int(x_group),
+        'y_group': int(y_group),
         'threshold': float(thr),
         'running_overlap_x_px': float(running.overlap_x),
         'running_overlap_y_px': float(running.overlap_y),
         'used_fallback_pairs': int(used_fallback_pairs),
+        'used_unmasked_pairs': int(used_unmasked_pairs),
         'positions': {f'{k[0]},{k[1]}': [int(v[0]), int(v[1])] for k, v in positions.items()},
     }

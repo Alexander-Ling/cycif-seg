@@ -358,7 +358,7 @@ def estimate_tiled_rigid_transforms(
     search_factor: float = 2,
     angle_deg_max: float = 5.0,
     angle_step: float = 1.0,
-    min_foreground_frac: float = 0.01,
+    min_foreground_frac: float = 0.001,
     allow_rotation: bool = False,
     on_tile_processed: Callable[[int], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
