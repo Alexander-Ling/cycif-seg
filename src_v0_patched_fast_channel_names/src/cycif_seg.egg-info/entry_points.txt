@@ -1,0 +1,2 @@
+[console_scripts]
+cycif-seg = cycif_seg.app:main
