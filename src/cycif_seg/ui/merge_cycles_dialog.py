@@ -5,7 +5,7 @@ from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 
-from cycif_seg.io.ome_tiff import load_channel_names_only
+from cycif_seg.io.ome_tiff import load_channel_names_only_fast
 
 
 @dataclass
@@ -192,7 +192,12 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         # Load channel names for each file and create UI group.
         self._cycles.clear()
         for i, p in enumerate(self._paths, start=1):
-            ch = list(self._channel_name_cache.get(p) or load_channel_names_only(p) or [])
+            cached = self._channel_name_cache.get(p)
+            if cached is None:
+                ch = list(load_channel_names_only_fast(p) or [])
+                self._channel_name_cache[p] = list(ch)
+            else:
+                ch = list(cached)
 
             # If we have a prior config for this file, prefer it.
             prior = init_by_path.get(p) or init_by_name.get(Path(p).name)

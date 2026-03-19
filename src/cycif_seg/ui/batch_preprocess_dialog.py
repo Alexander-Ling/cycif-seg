@@ -209,6 +209,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self.btn_pick_root.clicked.connect(self._pick_root)
         self.btn_pick_out.clicked.connect(self._pick_outdir)
         self.btn_scan.clicked.connect(self._scan)
+        self.txt_root.textChanged.connect(self._update_scan_button_enabled)
+        self.txt_outdir.textChanged.connect(self._on_output_dir_changed)
         self.btn_apply_defaults.clicked.connect(self._apply_defaults)
         self.btn_config_selected.clicked.connect(self._configure_selected)
         self.btn_apply_template.clicked.connect(self._apply_template_to_all)
@@ -224,6 +226,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self.sig_set_sample_progress.connect(self._apply_sample_progress)
 
         self.btn_stop.setEnabled(False)
+        self._update_scan_button_enabled()
 
         # Keep model state synchronized with direct table edits, especially the
         # output-path column. This avoids losing the current in-place editor
@@ -257,6 +260,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
     def _request_cancel(self) -> None:
         self._cancel_requested = True
         self.btn_stop.setEnabled(False)
+        self._update_scan_button_enabled()
         self._set_status("Cancel requested… finishing current step.")
 
     def _pick_root(self) -> None:
@@ -268,6 +272,36 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select batch output folder", self.txt_outdir.text() or str(Path.cwd()))
         if d:
             self.txt_outdir.setText(d)
+
+    def _update_scan_button_enabled(self) -> None:
+        try:
+            has_root = bool(self.txt_root.text().strip())
+            has_out = bool(self.txt_outdir.text().strip())
+            self.btn_scan.setEnabled(has_root and has_out)
+        except Exception:
+            pass
+
+    def _rebase_sample_output_paths(self, new_outdir: str | Path) -> None:
+        try:
+            out_dir = Path(str(new_outdir or "").strip()).expanduser()
+        except Exception:
+            return
+        if not str(out_dir):
+            return
+        for s in self._samples:
+            try:
+                current_name = Path(str(s.output_path)).name if s.output_path else f"{s.name}.ome.tiff"
+                if not current_name:
+                    current_name = f"{s.name}.ome.tiff"
+                s.output_path = out_dir / current_name
+            except Exception:
+                continue
+
+    def _on_output_dir_changed(self, text: str) -> None:
+        self._update_scan_button_enabled()
+        self._rebase_sample_output_paths(text)
+        if self._samples:
+            self._refresh_table()
 
     def _scan(self) -> None:
         root_dir = Path(self.txt_root.text().strip() or "").expanduser()
@@ -335,7 +369,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
                 self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(s.tissue or ""))
                 self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(s.species or ""))
-                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.output_path or "")))
+                out_name = Path(str(s.output_path)).name if s.output_path else ""
+                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(out_name))
 
             try:
                 self.tbl.resizeColumnsToContents()
@@ -363,8 +398,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             elif c == 4:
                 s.species = (item.text() or "").strip()
             elif c == 5:
-                op = (item.text() or "").strip()
-                s.output_path = Path(op).expanduser() if op else None
+                op_name = Path((item.text() or "").strip()).name
+                out_dir = Path(self.txt_outdir.text().strip() or "").expanduser() if self.txt_outdir.text().strip() else None
+                s.output_path = ((out_dir / op_name) if (out_dir and op_name) else None)
         except Exception:
             return
 
@@ -701,7 +737,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             samples.append(s)
 
         self._samples = samples
+        self._rebase_sample_output_paths(self.txt_outdir.text().strip())
         self._refresh_table()
+        self._update_scan_button_enabled()
         self._set_status(f"Loaded plan: {path}")
 
     # -------------------- Running --------------------
@@ -721,8 +759,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.enabled = (it_run.checkState() == QtCore.Qt.Checked) if it_run else True
                 s.tissue = (self.tbl.item(r, 3).text() if self.tbl.item(r, 3) else "").strip()
                 s.species = (self.tbl.item(r, 4).text() if self.tbl.item(r, 4) else "").strip()
-                op = (self.tbl.item(r, 5).text() if self.tbl.item(r, 5) else "").strip()
-                s.output_path = Path(op).expanduser() if op else None
+                op_name = Path((self.tbl.item(r, 5).text() if self.tbl.item(r, 5) else "").strip()).name
+                out_dir = Path(self.txt_outdir.text().strip() or "").expanduser() if self.txt_outdir.text().strip() else None
+                s.output_path = ((out_dir / op_name) if (out_dir and op_name) else None)
             except Exception:
                 continue
 
@@ -842,7 +881,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             self.btn_stop.setEnabled(False)
             self.btn_config_selected.setEnabled(True)
             self.btn_apply_template.setEnabled(True)
-            self.btn_scan.setEnabled(True)
+            self._update_scan_button_enabled()
             self._set_status(f"Batch complete: {len(reports)} sample(s) processed.")
             show_info(f"Batch complete: {len(reports)} sample(s) processed.")
             self.btn_run.setEnabled(True)
@@ -863,7 +902,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             self.btn_stop.setEnabled(False)
             self.btn_config_selected.setEnabled(True)
             self.btn_apply_template.setEnabled(True)
-            self.btn_scan.setEnabled(True)
+            self._update_scan_button_enabled()
 
         w.start()
 
