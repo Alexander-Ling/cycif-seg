@@ -383,7 +383,7 @@ def _tile_has_signal(tile: np.ndarray, *, min_nonzero_frac: float = 0.01) -> boo
 def _default_tile_overlap_px(tile_size: int) -> int:
     """Small symmetric overlap budget used to absorb inter-tile seams."""
     ts = max(1, int(tile_size))
-    return max(2, int(math.ceil(0.01 * ts)))
+    return max(5, int(math.ceil(0.01 * ts)))
 
 
 def _limit_neighbor_offsets(
