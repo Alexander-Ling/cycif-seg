@@ -26,6 +26,11 @@ try:
 except Exception:  # pragma: no cover
     ndi_shift = None
 
+try:
+    from scipy.signal import correlate2d  # type: ignore
+except Exception:  # pragma: no cover
+    correlate2d = None  # type: ignore
+
 import tifffile
 
 from cycif_seg.io.ome_tiff import (
@@ -47,6 +52,7 @@ from cycif_seg.io.ome_tiff import (
 # Set env var CYCIF_SEG_STEP1_DEBUG=1 to turn on.
 # In powershell: $env:CYCIF_SEG_STEP1_DEBUG = "1"
 _STEP1_DEBUG = str(os.environ.get("CYCIF_SEG_STEP1_DEBUG", "0")).strip().lower() not in {"0", "false", "no", "off", ""}
+_STEP1_DEBUG_OTSU = str(os.environ.get("CYCIF_SEG_STEP1_OTSU_DEBUG", "0")).strip().lower() not in {"0", "false", "no", "off", ""}
 _DEBUG_WRITTEN_OTSU_MASKS: set[str] = set()
 
 
@@ -104,7 +110,7 @@ def _maybe_write_debug_otsu_mask(
     channel_index: int | None,
     channel_name: str | None,
 ) -> None:
-    if not _STEP1_DEBUG or not source_path:
+    if not _STEP1_DEBUG_OTSU or not source_path:
         return
     try:
         out_path = _format_debug_otsu_mask_path(
@@ -520,6 +526,152 @@ def estimate_tiled_rigid_transforms(
             thr = 0.0
         return (v > thr), thr
 
+    def _legacy_zero_mask_score_map(
+        fixed_win: np.ndarray,
+        fixed_mask_win: np.ndarray,
+        tile_r: np.ndarray,
+        tile_mask_r: np.ndarray,
+    ) -> np.ndarray:
+        """Legacy scoring path: zero masked background, then score using all pixels."""
+        return match_template(
+            fixed_win * fixed_mask_win.astype(np.float32, copy=False),
+            tile_r * tile_mask_r.astype(np.float32, copy=False),
+            pad_input=False,
+        )
+
+    def _sample_mask_points(mask_bool: np.ndarray, max_points: int = 256) -> np.ndarray:
+        coords = np.argwhere(mask_bool)
+        if coords.shape[0] <= max_points:
+            return coords.astype(np.int32, copy=False)
+        # Deterministic subsampling across the foreground support.
+        idx = np.linspace(0, coords.shape[0] - 1, num=max_points, dtype=np.int64)
+        return coords[idx].astype(np.int32, copy=False)
+
+    def _candidate_offsets_from_mask_points(
+        fixed_mask_win: np.ndarray,
+        tile_mask_r: np.ndarray,
+        *,
+        out_h: int,
+        out_w: int,
+        expected_top: tuple[int, int] | None = None,
+        max_candidates: int = 100,
+        max_fixed_points: int = 384,
+        max_moving_points: int = 256,
+    ) -> np.ndarray:
+        fm_pts = _sample_mask_points(np.asarray(fixed_mask_win > 0.5, dtype=bool), max_points=max_fixed_points)
+        tm_pts = _sample_mask_points(np.asarray(tile_mask_r > 0.5, dtype=bool), max_points=max_moving_points)
+        if fm_pts.size == 0 or tm_pts.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        # Translation voting from sparse foreground point pairs.
+        # Each vote corresponds to a candidate tile top-left offset (iy, ix)
+        # within the fixed search window.
+        dy = fm_pts[:, None, 0].astype(np.int32) - tm_pts[None, :, 0].astype(np.int32)
+        dx = fm_pts[:, None, 1].astype(np.int32) - tm_pts[None, :, 1].astype(np.int32)
+        valid = (dy >= 0) & (dy < out_h) & (dx >= 0) & (dx < out_w)
+        if not np.any(valid):
+            return np.empty((0, 2), dtype=np.int32)
+
+        flat = (dy[valid].astype(np.int64) * int(out_w)) + dx[valid].astype(np.int64)
+        if flat.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        votes = np.bincount(flat, minlength=int(out_h) * int(out_w))
+        nz = np.flatnonzero(votes)
+        if nz.size == 0:
+            return np.empty((0, 2), dtype=np.int32)
+
+        k = int(min(max_candidates, nz.size))
+        if nz.size > k:
+            part = np.argpartition(votes[nz], -k)[-k:]
+            cand_flat = nz[part]
+        else:
+            cand_flat = nz
+
+        exp_yx = expected_top if expected_top is not None else (0, 0)
+
+        def _sort_key(flat_idx: int) -> tuple[float, float]:
+            iy = int(flat_idx) // int(out_w)
+            ix = int(flat_idx) % int(out_w)
+            dist2 = float((iy - exp_yx[0]) ** 2 + (ix - exp_yx[1]) ** 2)
+            return (float(votes[int(flat_idx)]), -dist2)
+
+        cand_flat = np.array(sorted((int(v) for v in cand_flat), key=_sort_key, reverse=True), dtype=np.int64)
+        iy = (cand_flat // int(out_w)).astype(np.int32, copy=False)
+        ix = (cand_flat % int(out_w)).astype(np.int32, copy=False)
+        return np.stack([iy, ix], axis=1)
+
+    def _masked_overlap_score_map(
+        fixed_win: np.ndarray,
+        fixed_mask_win: np.ndarray,
+        tile_r: np.ndarray,
+        tile_mask_r: np.ndarray,
+        *,
+        expected_top: tuple[int, int] | None = None,
+        max_candidates: int = 100,
+        min_overlap_frac: float = 0.10,
+        min_overlap_px_abs: int = 20,
+        displacement_penalty: float = 1e-3,
+    ) -> np.ndarray:
+        """
+        Score sparse-foreground tiles using sparse foreground-point voting to
+        generate candidate translations, then exact masked rescoring on only the
+        strongest candidates.
+        """
+        fz = fixed_win.astype(np.float32, copy=False)
+        fm_bool = np.asarray(fixed_mask_win > 0.5, dtype=bool)
+        tz = tile_r.astype(np.float32, copy=False)
+        tm_bool = np.asarray(tile_mask_r > 0.5, dtype=bool)
+
+        out_h = fz.shape[0] - tz.shape[0] + 1
+        out_w = fz.shape[1] - tz.shape[1] + 1
+        if out_h <= 0 or out_w <= 0:
+            return np.empty((0, 0), dtype=np.float32)
+
+        moving_fg_px = int(np.count_nonzero(tm_bool))
+        if moving_fg_px <= 0:
+            return np.full((out_h, out_w), -np.inf, dtype=np.float32)
+
+        min_overlap_px = max(int(min_overlap_px_abs), int(math.ceil(float(min_overlap_frac) * float(moving_fg_px))))
+        score = np.full((out_h, out_w), -np.inf, dtype=np.float32)
+
+        candidates = _candidate_offsets_from_mask_points(
+            fm_bool,
+            tm_bool,
+            out_h=out_h,
+            out_w=out_w,
+            expected_top=expected_top,
+            max_candidates=max_candidates,
+        )
+        if candidates.size == 0:
+            return score
+
+        for iy, ix in candidates:
+            iy = int(iy)
+            ix = int(ix)
+            fixed_patch = fz[iy : iy + tz.shape[0], ix : ix + tz.shape[1]]
+            overlap_bool = fm_bool[iy : iy + tz.shape[0], ix : ix + tz.shape[1]] & tm_bool
+            ov_px = int(np.count_nonzero(overlap_bool))
+            if ov_px < min_overlap_px:
+                continue
+
+            fv = fixed_patch[overlap_bool].astype(np.float32, copy=False)
+            tv = tz[overlap_bool].astype(np.float32, copy=False)
+            if fv.size == 0 or tv.size == 0:
+                continue
+
+            fv = fv - float(fv.mean())
+            tv = tv - float(tv.mean())
+            denom = float(np.linalg.norm(fv) * np.linalg.norm(tv))
+            if not np.isfinite(denom) or denom <= 1e-8:
+                continue
+
+            corr = float(np.dot(fv, tv) / denom)
+            if expected_top is not None and displacement_penalty > 0.0:
+                dist = math.hypot(float(iy - expected_top[0]), float(ix - expected_top[1]))
+                corr -= float(displacement_penalty) * dist
+            score[iy, ix] = np.float32(corr)
+        return score
+
     fixed_z = _zscore(fixed_yx)
     moving_z = _zscore(moving_yx)
 
@@ -571,6 +723,11 @@ def estimate_tiled_rigid_transforms(
             f"tiled rigid: grid={rows}x{cols} tiles={rows*cols} tile_size={tile_size} "
             f"search_factor={sf:.3f} allow_rotation={bool(allow_rotation)} overlap_px={int(overlap_px)}"
         )
+        _dbg(
+            "tiled rigid: hybrid scoring enabled; use legacy zero-masked template matching "
+            "for tiles with >5% and >200 foreground pixels; otherwise use sparse foreground-point voting "
+            "to propose up to 100 candidates, then exact masked rescoring (min overlap 10%, >=20 px, mild distance prior)"
+        )
 
     # Storage in row-major grid
     dy = np.zeros((rows, cols), dtype=np.float32)
@@ -615,6 +772,8 @@ def estimate_tiled_rigid_transforms(
         tile = moving_z[y0 : y0 + h, x0 : x0 + w]
         tmask = moving_mask[y0 : y0 + h, x0 : x0 + w]
         fg_frac = float(tmask.mean()) if tmask.size else 0.0
+        fg_px = int(np.count_nonzero(tmask)) if tmask.size else 0
+        use_legacy_zero_mask_scoring = (fg_frac > 0.05) and (fg_px > 200)
         if fg_frac < float(min_foreground_frac):
             return (r, c), 0.0, 0.0, 0.0, float("-inf"), 0.0
 
@@ -632,9 +791,6 @@ def estimate_tiled_rigid_transforms(
 
         fixed_win = fixed_z[wy0:wy1, wx0:wx1]
         fixed_m = fixed_mask[wy0:wy1, wx0:wx1].astype(np.float32, copy=False)
-
-        # Mask fixed window to reduce background ambiguity.
-        fixed_win = fixed_win * fixed_m
 
         best_score = -np.inf
         second_score = -np.inf
@@ -667,11 +823,21 @@ def estimate_tiled_rigid_transforms(
                     cval=0.0,
                 ).astype(np.float32, copy=False)
 
-            # Mask the tile too.
-            tile_r = tile_r * m_r
-
             try:
-                resp = match_template(fixed_win, tile_r, pad_input=False)
+                if use_legacy_zero_mask_scoring:
+                    resp = _legacy_zero_mask_score_map(fixed_win, fixed_m, tile_r, m_r)
+                else:
+                    resp = _masked_overlap_score_map(
+                        fixed_win,
+                        fixed_m,
+                        tile_r,
+                        m_r,
+                        expected_top=(int(y0 - wy0), int(x0 - wx0)),
+                        max_candidates=100,
+                        min_overlap_frac=0.10,
+                        min_overlap_px_abs=20,
+                        displacement_penalty=1e-3,
+                    )
             except Exception:
                 continue
             if resp.size == 0:

@@ -17,8 +17,8 @@ from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 
 PLAN_SCHEMA_VERSION = 1
 
-default_tiled_rigid_tile_size: int = 1000
-default_tiled_rigid_search_factor: float = 5.0
+default_tiled_rigid_tile_size: int = 2000
+default_tiled_rigid_search_factor: float = 3.0
 
 def _parse_cycle_number_from_filename(name: str) -> int | None:
     """Parse cycle number from stitched file names like ``C3_sample_...ome.tiff``."""

@@ -94,7 +94,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.spn_tile_size = QtWidgets.QSpinBox()
         self.spn_tile_size.setRange(10, 50000)
         self.spn_tile_size.setSingleStep(250)
-        self.spn_tile_size.setValue(1000)
+        self.spn_tile_size.setValue(2000)
         self.spn_tile_size.setToolTip("Tile size in pixels for tile-wise rigid registration.")
         self.spn_search_factor = QtWidgets.QDoubleSpinBox()
         self.spn_search_factor.setRange(1.0, 50.0)
