@@ -49,6 +49,21 @@ class NeighborEstimate:
     used_unmasked: bool = False
 
 
+
+
+@dataclass(frozen=True)
+class DirectedEdge:
+    src: tuple[int, int]
+    dst: tuple[int, int]
+    dy: float
+    dx: float
+    weight: float
+    overlap_px: float
+    score: float
+    used_fallback: bool = False
+    used_unmasked: bool = False
+
+
 class RunningOverlap:
     def __init__(self, tile_h: int, tile_w: int, frac: float = 0.05):
         self._x: list[float] = [max(8.0, float(tile_w) * float(frac))]
@@ -391,15 +406,121 @@ def _build_neighbor_estimates(
     return estimates, running, tile_h, tile_w, n_channels
 
 
-def _solve_positions(
+
+
+def _edge_weight(est: NeighborEstimate) -> float:
+    overlap_term = max(0.0, float(est.overlap_px))
+    score = float(est.score)
+    score_term = max(0.0, min(1.0, (score + 1.0) / 2.0))
+    if score < -0.5:
+        score_term *= 0.1
+    weight = max(1.0, overlap_term) * (0.25 + 0.75 * score_term)
+    if bool(est.used_unmasked):
+        weight *= 0.85
+    if bool(est.used_fallback):
+        weight *= 0.05
+    return float(max(weight, 1e-6))
+
+
+def _is_valid_voting_edge(est: NeighborEstimate) -> bool:
+    if bool(est.used_fallback):
+        return False
+    if not np.isfinite(est.dy) or not np.isfinite(est.dx):
+        return False
+    if float(est.overlap_px) <= 0.0:
+        return False
+    if float(est.score) < -0.35:
+        return False
+    return True
+
+
+def _build_adjacency(
+    estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate],
+) -> dict[tuple[int, int], list[DirectedEdge]]:
+    adj: dict[tuple[int, int], list[DirectedEdge]] = {}
+    for (src_xy, dst_xy), est in estimates.items():
+        w = _edge_weight(est)
+        adj.setdefault(src_xy, []).append(
+            DirectedEdge(
+                src=src_xy,
+                dst=dst_xy,
+                dy=float(est.dy),
+                dx=float(est.dx),
+                weight=w,
+                overlap_px=float(est.overlap_px),
+                score=float(est.score),
+                used_fallback=bool(est.used_fallback),
+                used_unmasked=bool(getattr(est, 'used_unmasked', False)),
+            )
+        )
+        adj.setdefault(dst_xy, []).append(
+            DirectedEdge(
+                src=dst_xy,
+                dst=src_xy,
+                dy=float(-est.dy),
+                dx=float(-est.dx),
+                weight=w,
+                overlap_px=float(est.overlap_px),
+                score=float(est.score),
+                used_fallback=bool(est.used_fallback),
+                used_unmasked=bool(getattr(est, 'used_unmasked', False)),
+            )
+        )
+    return adj
+
+
+def _choose_seed_tile(
+    tiles: dict[tuple[int, int], Path],
+    adjacency: dict[tuple[int, int], list[DirectedEdge]],
+    channel_index: int,
+    threshold: float,
+) -> tuple[int, int]:
+    if not tiles:
+        raise ValueError('No tile files found')
+
+    fg_cache: dict[tuple[int, int], float] = {}
+
+    def _tile_fg_fraction(xy: tuple[int, int]) -> float:
+        if xy not in fg_cache:
+            arr = np.asarray(load_single_channel_tiff_native(str(tiles[xy]), int(channel_index)), dtype=np.float32)
+            fg_cache[xy] = _foreground_fraction(arr, float(threshold))
+        return float(fg_cache[xy])
+
+    best_xy: tuple[int, int] | None = None
+    best_key: tuple[float, float, float, float, float, int, int] | None = None
+    for xy in sorted(tiles.keys(), key=lambda t: (t[1], t[0])):
+        edges = adjacency.get(xy, [])
+        valid_edges = [e for e in edges if _is_valid_voting_edge(NeighborEstimate(
+            axis='x', src=e.src, dst=e.dst, dy=e.dy, dx=e.dx, overlap_px=e.overlap_px, score=e.score,
+            used_fallback=e.used_fallback, used_unmasked=e.used_unmasked
+        ))]
+        valid_degree = len(valid_edges)
+        support_sum = float(sum(e.weight for e in valid_edges))
+        overlap_sum = float(sum(max(0.0, e.overlap_px) for e in valid_edges))
+        raw_degree = len(edges)
+        fg_frac = _tile_fg_fraction(xy)
+        key = (
+            float(valid_degree),
+            float(support_sum),
+            float(overlap_sum),
+            float(raw_degree),
+            float(fg_frac),
+            -int(xy[1]),
+            -int(xy[0]),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_xy = xy
+    assert best_xy is not None
+    return best_xy
+
+
+def _initial_positions_from_seed(
     tiles: dict[tuple[int, int], Path],
     estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate],
-) -> dict[tuple[int, int], tuple[int, int]]:
-    pos: dict[tuple[int, int], tuple[float, float]] = {}
-    seeds = sorted(tiles.keys(), key=lambda t: (t[1], t[0]))
-    if not seeds:
-        return {}
-    pos[seeds[0]] = (0.0, 0.0)
+    seed_xy: tuple[int, int],
+) -> dict[tuple[int, int], tuple[float, float]]:
+    pos: dict[tuple[int, int], tuple[float, float]] = {seed_xy: (0.0, 0.0)}
     changed = True
     while changed:
         changed = False
@@ -412,6 +533,7 @@ def _solve_positions(
                 y1, x1 = pos[dst_xy]
                 pos[src_xy] = (float(y1 - est.dy), float(x1 - est.dx))
                 changed = True
+    seeds = sorted(tiles.keys(), key=lambda t: (t[1], t[0]))
     for xy in seeds:
         if xy not in pos:
             x, y = xy
@@ -428,6 +550,87 @@ def _solve_positions(
                 pos[xy] = (float(np.mean([g[0] for g in guesses])), float(np.mean([g[1] for g in guesses])))
             else:
                 pos[xy] = (0.0, 0.0)
+    return pos
+
+
+def _refine_positions_multi_neighbor(
+    positions: dict[tuple[int, int], tuple[float, float]],
+    adjacency: dict[tuple[int, int], list[DirectedEdge]],
+    seed_xy: tuple[int, int],
+    *,
+    n_iter: int = 8,
+    damping: float = 0.7,
+    outlier_px: float = 12.0,
+) -> dict[tuple[int, int], tuple[float, float]]:
+    pos = {k: (float(v[0]), float(v[1])) for k, v in positions.items()}
+    if seed_xy not in pos:
+        pos[seed_xy] = (0.0, 0.0)
+    for _ in range(max(1, int(n_iter))):
+        updated = dict(pos)
+        for xy in pos.keys():
+            if xy == seed_xy:
+                updated[xy] = (0.0, 0.0)
+                continue
+            edges = adjacency.get(xy, [])
+            if not edges:
+                continue
+            candidates_real: list[tuple[float, float, float]] = []
+            candidates_fallback: list[tuple[float, float, float]] = []
+            for edge in edges:
+                if edge.dst not in pos:
+                    continue
+                nbr_y, nbr_x = pos[edge.dst]
+                cand_y = float(nbr_y - edge.dy)
+                cand_x = float(nbr_x - edge.dx)
+                item = (cand_y, cand_x, float(edge.weight))
+                if _is_valid_voting_edge(NeighborEstimate(axis='x', src=edge.src, dst=edge.dst, dy=edge.dy, dx=edge.dx, overlap_px=edge.overlap_px, score=edge.score, used_fallback=edge.used_fallback, used_unmasked=edge.used_unmasked)):
+                    candidates_real.append(item)
+                else:
+                    candidates_fallback.append(item)
+            candidates = candidates_real if candidates_real else candidates_fallback
+            if not candidates:
+                continue
+            if len(candidates) >= 3:
+                ys = np.asarray([c[0] for c in candidates], dtype=np.float32)
+                xs = np.asarray([c[1] for c in candidates], dtype=np.float32)
+                med_y = float(np.median(ys))
+                med_x = float(np.median(xs))
+                filtered = []
+                for cand_y, cand_x, cand_w in candidates:
+                    dist = math.hypot(float(cand_y - med_y), float(cand_x - med_x))
+                    if dist <= float(outlier_px):
+                        filtered.append((cand_y, cand_x, cand_w))
+                if filtered:
+                    candidates = filtered
+            weights = np.asarray([max(1e-6, c[2]) for c in candidates], dtype=np.float64)
+            ys = np.asarray([c[0] for c in candidates], dtype=np.float64)
+            xs = np.asarray([c[1] for c in candidates], dtype=np.float64)
+            target_y = float(np.average(ys, weights=weights))
+            target_x = float(np.average(xs, weights=weights))
+            old_y, old_x = pos[xy]
+            new_y = float((1.0 - damping) * old_y + damping * target_y)
+            new_x = float((1.0 - damping) * old_x + damping * target_x)
+            updated[xy] = (new_y, new_x)
+        pos = updated
+        seed_y, seed_x = pos.get(seed_xy, (0.0, 0.0))
+        if seed_y != 0.0 or seed_x != 0.0:
+            for xy, (yy, xx) in list(pos.items()):
+                pos[xy] = (float(yy - seed_y), float(xx - seed_x))
+            pos[seed_xy] = (0.0, 0.0)
+    return pos
+
+
+def _solve_positions(
+    tiles: dict[tuple[int, int], Path],
+    estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate],
+    *,
+    channel_index: int,
+    threshold: float,
+) -> dict[tuple[int, int], tuple[int, int]]:
+    adjacency = _build_adjacency(estimates)
+    seed_xy = _choose_seed_tile(tiles, adjacency, int(channel_index), float(threshold))
+    pos = _initial_positions_from_seed(tiles, estimates, seed_xy)
+    pos = _refine_positions_multi_neighbor(pos, adjacency, seed_xy, n_iter=8, damping=0.7, outlier_px=12.0)
     min_y = min(float(v[0]) for v in pos.values())
     min_x = min(float(v[1]) for v in pos.values())
     out: dict[tuple[int, int], tuple[int, int]] = {}
@@ -491,7 +694,7 @@ def stitch_cycle_tiles(
         float(thr),
         progress_cb=progress_cb,
     )
-    positions = _solve_positions(tiles, estimates)
+    positions = _solve_positions(tiles, estimates, channel_index=int(stitch_channel), threshold=float(thr))
 
     max_y = max(int(v[0]) for v in positions.values()) + int(tile_h)
     max_x = max(int(v[1]) for v in positions.values()) + int(tile_w)
