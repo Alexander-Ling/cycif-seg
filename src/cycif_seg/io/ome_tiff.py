@@ -148,6 +148,71 @@ def _channel_names_from_ome_all(ome_xml: str) -> list[str] | None:
     except Exception:
         return None
 
+def _channel_count_from_ome(ome_xml: str) -> int | None:
+    """Read SizeC from OME-XML without touching TIFF series metadata."""
+    if not ome_xml:
+        return None
+
+    if from_xml is not None:
+        try:
+            ome = from_xml(ome_xml)
+            img0 = ome.images[0] if ome.images else None
+            px = img0.pixels if img0 else None
+            size_c = getattr(px, "size_c", None) if px is not None else None
+            if size_c is not None:
+                return int(size_c)
+        except Exception:
+            pass
+
+    try:
+        root = ET.fromstring(ome_xml)
+
+        def _strip(tag: str) -> str:
+            return tag.split("}", 1)[-1]
+
+        for el in root.iter():
+            if _strip(el.tag) == "Pixels":
+                try:
+                    size_c = el.attrib.get("SizeC")
+                    return int(size_c) if size_c is not None else None
+                except Exception:
+                    return None
+    except Exception:
+        return None
+    return None
+
+
+def _read_ome_xml_fast(path: str) -> str | None:
+    """Read OME-XML from TIFF description tags without series inspection."""
+    try:
+        with tifffile.TiffFile(path) as tf:
+            try:
+                first_page = tf.pages.first
+            except Exception:
+                first_page = tf.pages[0]
+
+            # Important for batch step 1 channel selection: keep this on the
+            # fast metadata-only path. Do not replace this with series/shape
+            # inspection here, because that regression makes cycle config slow.
+            for getter in (
+                lambda: first_page.description,
+                lambda: first_page.tags["ImageDescription"].value,
+            ):
+                try:
+                    xml = getter()
+                except Exception:
+                    xml = None
+                if isinstance(xml, bytes):
+                    try:
+                        xml = xml.decode("utf-8", errors="replace")
+                    except Exception:
+                        xml = None
+                if xml:
+                    return str(xml)
+    except Exception:
+        return None
+    return None
+
 def _physical_pixel_sizes_from_ome(ome_xml: str) -> dict | None:
     """Read OME physical pixel size metadata from the first image/pixels block."""
     if not ome_xml:
@@ -1156,34 +1221,30 @@ class LazyChannelImage:
 
 
 def load_channel_names_only_fast(path: str) -> list[str]:
-    """Read channel names using only OME-XML, avoiding full TIFF series inspection when possible."""
-    try:
-        with tifffile.TiffFile(path) as tf:
-            ome_xml = None
-            try:
-                first_page = tf.pages.first
-            except Exception:
-                first_page = tf.pages[0]
-            try:
-                ome_xml = first_page.description
-            except Exception:
-                ome_xml = None
-            if not ome_xml:
-                try:
-                    ome_xml = first_page.tags["ImageDescription"].value
-                except Exception:
-                    ome_xml = None
-            if not ome_xml:
-                try:
-                    ome_xml = tf.ome_metadata
-                except Exception:
-                    ome_xml = None
-        names = _channel_names_from_ome_all(str(ome_xml or ""))
-        if names:
-            return list(names)
-    except Exception:
-        pass
-    return load_channel_names_only(path)
+    """Read channel names from OME-XML only, without TIFF series inspection.
+
+    This function exists specifically for the batch step-1 cycle configuration
+    flow, where users may point at many large OME-TIFFs and only need channel
+    labels. Do not change this back to ``inspect_tiff_yxc``/``load_channel_names_only``
+    in that path unless you explicitly want the slower behavior.
+    """
+    ome_xml = _read_ome_xml_fast(path)
+    if not ome_xml:
+        return []
+
+    names = list(_channel_names_from_ome_all(ome_xml) or [])
+    n_channels = _channel_count_from_ome(ome_xml)
+
+    if n_channels is None:
+        return [nm for nm in names if nm]
+
+    if len(names) < int(n_channels):
+        names += [""] * (int(n_channels) - len(names))
+
+    return [
+        (str(nm).strip() if str(nm).strip() else f"Channel {i}")
+        for i, nm in enumerate(names[:int(n_channels)])
+    ]
 
 
 def load_channel_names_only(path: str) -> list[str]:

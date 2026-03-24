@@ -455,6 +455,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             out: dict[str, list[str]] = {}
             for i, p in enumerate(s.files, start=1):
                 try:
+                    # Keep batch cycle configuration on the fast OME-XML-only
+                    # channel-name path; do not swap this back to the slower
+                    # full TIFF inspection helpers.
                     out[str(p)] = list(self._channel_name_cache.get(str(p)) or load_channel_names_only_fast(str(p)) or [])
                     self._channel_name_cache[str(p)] = list(out[str(p)])
                 except Exception:
