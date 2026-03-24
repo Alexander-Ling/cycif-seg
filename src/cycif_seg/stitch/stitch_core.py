@@ -47,6 +47,8 @@ class NeighborEstimate:
     score: float
     used_fallback: bool = False
     used_unmasked: bool = False
+    fg_overlap_pixels: float = 0.0
+    fg_overlap_frac: float = 0.0
 
 
 
@@ -62,6 +64,8 @@ class DirectedEdge:
     score: float
     used_fallback: bool = False
     used_unmasked: bool = False
+    fg_overlap_pixels: float = 0.0
+    fg_overlap_frac: float = 0.0
 
 
 class RunningOverlap:
@@ -224,6 +228,23 @@ def _normalized_score(a: np.ndarray, b: np.ndarray) -> float:
         return -1.0
     return float(np.dot(aa, bb) / den)
 
+def _foreground_overlap_metrics(a: np.ndarray, b: np.ndarray, thr: float) -> tuple[float, float]:
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if a.shape != b.shape or a.size == 0:
+        return 0.0, 0.0
+    mask = np.isfinite(a) & np.isfinite(b)
+    if not np.any(mask):
+        return 0.0, 0.0
+    af = (a > thr) & mask
+    bf = (b > thr) & mask
+    both = af & bf
+    both_n = float(np.count_nonzero(both))
+    denom = float(np.count_nonzero(mask))
+    if denom <= 0.0:
+        return both_n, 0.0
+    return both_n, float(both_n / denom)
+
 
 def _estimate_strip_pair(
     src: np.ndarray,
@@ -278,13 +299,17 @@ def _estimate_strip_pair(
             except Exception:
                 dy = 0.0
                 dx = 0.0
-            sc = _normalized_score(a, _shift_int(b, int(round(dy)), int(round(dx))))
+            b_shifted = _shift_int(b, int(round(dy)), int(round(dx)))
+            sc = _normalized_score(a, b_shifted)
+            fg_overlap_pixels, fg_overlap_frac = _foreground_overlap_metrics(a, b_shifted, thr)
             if axis == 'x':
                 objective = abs(dx) + 0.25 * abs(dy)
             else:
                 objective = abs(dy) + 0.25 * abs(dx)
+            if fg_overlap_pixels <= 0.0:
+                objective += 1e6
             if (local_best is None) or (objective < local_best[0] - 1e-6) or (abs(objective - local_best[0]) <= 1e-6 and sc > local_best_score):
-                local_best = (float(objective), float(ov), float(dy), float(dx))
+                local_best = (float(objective), float(ov), float(dy), float(dx), float(fg_overlap_pixels), float(fg_overlap_frac))
                 local_best_score = float(sc)
         return local_best, float(local_best_score)
 
@@ -296,7 +321,7 @@ def _estimate_strip_pair(
     if best is None:
         return None
 
-    _obj, ov, dy, dx = best
+    _obj, ov, dy, dx, fg_overlap_pixels, fg_overlap_frac = best
     if axis == 'x':
         global_dx = float(w - ov + dx)
         global_dy = float(dy)
@@ -315,6 +340,8 @@ def _estimate_strip_pair(
         score=float(best_score),
         used_fallback=False,
         used_unmasked=bool(used_unmasked),
+        fg_overlap_pixels=float(fg_overlap_pixels),
+        fg_overlap_frac=float(fg_overlap_frac),
     )
 
 
@@ -378,7 +405,7 @@ def _build_neighbor_estimates(
             else:
                 overlap = float(running.overlap_y)
                 dy, dx = float(tile_h - overlap), 0.0
-            est = NeighborEstimate(axis=axis, src=src_xy, dst=dst_xy, dy=dy, dx=dx, overlap_px=overlap, score=-1.0, used_fallback=True)
+            est = NeighborEstimate(axis=axis, src=src_xy, dst=dst_xy, dy=dy, dx=dx, overlap_px=overlap, score=-1.0, used_fallback=True, fg_overlap_pixels=0.0, fg_overlap_frac=0.0)
         else:
             est = NeighborEstimate(
                 axis=axis,
@@ -390,6 +417,8 @@ def _build_neighbor_estimates(
                 score=est.score,
                 used_fallback=False,
                 used_unmasked=bool(getattr(est, 'used_unmasked', False)),
+                fg_overlap_pixels=float(getattr(est, 'fg_overlap_pixels', 0.0)),
+                fg_overlap_frac=float(getattr(est, 'fg_overlap_frac', 0.0)),
             )
             running.add(axis, est.overlap_px)
             any_signal = True
@@ -398,7 +427,7 @@ def _build_neighbor_estimates(
         if progress_cb is not None:
             try:
                 extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
-                progress_cb(f"Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px){extra}")
+                progress_cb(f"Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px, fg_overlap={getattr(est, 'fg_overlap_pixels', 0.0):.0f}px){extra}")
             except Exception:
                 pass
     if not any_signal:
@@ -431,6 +460,10 @@ def _is_valid_voting_edge(est: NeighborEstimate) -> bool:
         return False
     if float(est.score) < -0.35:
         return False
+    if float(getattr(est, 'fg_overlap_pixels', 0.0)) < 16.0:
+        return False
+    if float(getattr(est, 'fg_overlap_frac', 0.0)) < 1e-4:
+        return False
     return True
 
 
@@ -451,6 +484,8 @@ def _build_adjacency(
                 score=float(est.score),
                 used_fallback=bool(est.used_fallback),
                 used_unmasked=bool(getattr(est, 'used_unmasked', False)),
+                fg_overlap_pixels=float(getattr(est, 'fg_overlap_pixels', 0.0)),
+                fg_overlap_frac=float(getattr(est, 'fg_overlap_frac', 0.0)),
             )
         )
         adj.setdefault(dst_xy, []).append(
@@ -464,6 +499,8 @@ def _build_adjacency(
                 score=float(est.score),
                 used_fallback=bool(est.used_fallback),
                 used_unmasked=bool(getattr(est, 'used_unmasked', False)),
+                fg_overlap_pixels=float(getattr(est, 'fg_overlap_pixels', 0.0)),
+                fg_overlap_frac=float(getattr(est, 'fg_overlap_frac', 0.0)),
             )
         )
     return adj
@@ -492,7 +529,8 @@ def _choose_seed_tile(
         edges = adjacency.get(xy, [])
         valid_edges = [e for e in edges if _is_valid_voting_edge(NeighborEstimate(
             axis='x', src=e.src, dst=e.dst, dy=e.dy, dx=e.dx, overlap_px=e.overlap_px, score=e.score,
-            used_fallback=e.used_fallback, used_unmasked=e.used_unmasked
+            used_fallback=e.used_fallback, used_unmasked=e.used_unmasked,
+            fg_overlap_pixels=e.fg_overlap_pixels, fg_overlap_frac=e.fg_overlap_frac,
         ))]
         valid_degree = len(valid_edges)
         support_sum = float(sum(e.weight for e in valid_edges))
@@ -514,6 +552,56 @@ def _choose_seed_tile(
     assert best_xy is not None
     return best_xy
 
+def _nominal_axis_steps(
+    estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate],
+) -> tuple[float, float]:
+    x_steps = [float(est.dx) for est in estimates.values() if est.axis == 'x' and _is_valid_voting_edge(est)]
+    y_steps = [float(est.dy) for est in estimates.values() if est.axis == 'y' and _is_valid_voting_edge(est)]
+    if not x_steps:
+        x_steps = [float(est.dx) for est in estimates.values() if est.axis == 'x' and np.isfinite(est.dx)]
+    if not y_steps:
+        y_steps = [float(est.dy) for est in estimates.values() if est.axis == 'y' and np.isfinite(est.dy)]
+    step_x = float(np.median(np.asarray(x_steps, dtype=np.float64))) if x_steps else 0.0
+    step_y = float(np.median(np.asarray(y_steps, dtype=np.float64))) if y_steps else 0.0
+    return step_y, step_x
+
+
+def _interpolate_unplaced_tiles(
+    tiles: dict[tuple[int, int], Path],
+    pos: dict[tuple[int, int], tuple[float, float]],
+    step_y: float,
+    step_x: float,
+) -> dict[tuple[int, int], tuple[float, float]]:
+    pending = {xy for xy in tiles.keys() if xy not in pos}
+    while pending:
+        progress = False
+        for xy in sorted(list(pending), key=lambda t: (t[1], t[0])):
+            x, y = xy
+            guesses: list[tuple[float, float]] = []
+            if (x - 1, y) in pos:
+                py, px = pos[(x - 1, y)]
+                guesses.append((float(py), float(px + step_x)))
+            if (x + 1, y) in pos:
+                py, px = pos[(x + 1, y)]
+                guesses.append((float(py), float(px - step_x)))
+            if (x, y - 1) in pos:
+                py, px = pos[(x, y - 1)]
+                guesses.append((float(py + step_y), float(px)))
+            if (x, y + 1) in pos:
+                py, px = pos[(x, y + 1)]
+                guesses.append((float(py - step_y), float(px)))
+            if guesses:
+                pos[xy] = (
+                    float(np.mean([g[0] for g in guesses])),
+                    float(np.mean([g[1] for g in guesses])),
+                )
+                pending.remove(xy)
+                progress = True
+        if not progress:
+            for xy in sorted(pending, key=lambda t: (t[1], t[0])):
+                pos[xy] = (0.0, 0.0)
+            break
+    return pos
 
 def _initial_positions_from_seed(
     tiles: dict[tuple[int, int], Path],
@@ -525,6 +613,8 @@ def _initial_positions_from_seed(
     while changed:
         changed = False
         for (src_xy, dst_xy), est in estimates.items():
+            if not _is_valid_voting_edge(est):
+                continue
             if src_xy in pos and dst_xy not in pos:
                 y0, x0 = pos[src_xy]
                 pos[dst_xy] = (float(y0 + est.dy), float(x0 + est.dx))
@@ -533,23 +623,8 @@ def _initial_positions_from_seed(
                 y1, x1 = pos[dst_xy]
                 pos[src_xy] = (float(y1 - est.dy), float(x1 - est.dx))
                 changed = True
-    seeds = sorted(tiles.keys(), key=lambda t: (t[1], t[0]))
-    for xy in seeds:
-        if xy not in pos:
-            x, y = xy
-            guesses: list[tuple[float, float]] = []
-            if (x - 1, y) in pos and (((x - 1, y), (x, y)) in estimates):
-                p = pos[(x - 1, y)]
-                e = estimates[((x - 1, y), (x, y))]
-                guesses.append((p[0] + e.dy, p[1] + e.dx))
-            if (x, y - 1) in pos and (((x, y - 1), (x, y)) in estimates):
-                p = pos[(x, y - 1)]
-                e = estimates[((x, y - 1), (x, y))]
-                guesses.append((p[0] + e.dy, p[1] + e.dx))
-            if guesses:
-                pos[xy] = (float(np.mean([g[0] for g in guesses])), float(np.mean([g[1] for g in guesses])))
-            else:
-                pos[xy] = (0.0, 0.0)
+    step_y, step_x = _nominal_axis_steps(estimates)
+    pos = _interpolate_unplaced_tiles(tiles, pos, step_y, step_x)
     return pos
 
 
@@ -583,11 +658,11 @@ def _refine_positions_multi_neighbor(
                 cand_y = float(nbr_y - edge.dy)
                 cand_x = float(nbr_x - edge.dx)
                 item = (cand_y, cand_x, float(edge.weight))
-                if _is_valid_voting_edge(NeighborEstimate(axis='x', src=edge.src, dst=edge.dst, dy=edge.dy, dx=edge.dx, overlap_px=edge.overlap_px, score=edge.score, used_fallback=edge.used_fallback, used_unmasked=edge.used_unmasked)):
+                if _is_valid_voting_edge(NeighborEstimate(axis='x', src=edge.src, dst=edge.dst, dy=edge.dy, dx=edge.dx, overlap_px=edge.overlap_px, score=edge.score, used_fallback=edge.used_fallback, used_unmasked=edge.used_unmasked, fg_overlap_pixels=edge.fg_overlap_pixels, fg_overlap_frac=edge.fg_overlap_frac)):
                     candidates_real.append(item)
                 else:
                     candidates_fallback.append(item)
-            candidates = candidates_real if candidates_real else candidates_fallback
+            candidates = candidates_real
             if not candidates:
                 continue
             if len(candidates) >= 3:
@@ -631,6 +706,8 @@ def _solve_positions(
     seed_xy = _choose_seed_tile(tiles, adjacency, int(channel_index), float(threshold))
     pos = _initial_positions_from_seed(tiles, estimates, seed_xy)
     pos = _refine_positions_multi_neighbor(pos, adjacency, seed_xy, n_iter=8, damping=0.7, outlier_px=12.0)
+    step_y, step_x = _nominal_axis_steps(estimates)
+    pos = _interpolate_unplaced_tiles(tiles, pos, step_y, step_x)
     min_y = min(float(v[0]) for v in pos.values())
     min_x = min(float(v[1]) for v in pos.values())
     out: dict[tuple[int, int], tuple[int, int]] = {}
