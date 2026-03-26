@@ -268,7 +268,7 @@ def _estimate_strip_pair(
         base = w
     else:
         base = h
-    min_ov = max(8, int(round(base * 0.02)))
+    min_ov = max(100, int(round(base * 0.05)))
     max_ov = max(min_ov + 1, int(round(base * float(max_search_frac))))
     nom = int(round(nominal_overlap_px))
     nom = min(max(nom, min_ov), max_ov)
@@ -458,11 +458,11 @@ def _is_valid_voting_edge(est: NeighborEstimate) -> bool:
         return False
     if float(est.overlap_px) <= 0.0:
         return False
-    if float(est.score) < -0.35:
+    if float(est.score) < 0.5:
         return False
-    if float(getattr(est, 'fg_overlap_pixels', 0.0)) < 16.0:
+    if float(getattr(est, 'fg_overlap_pixels', 0.0)) < 100:
         return False
-    if float(getattr(est, 'fg_overlap_frac', 0.0)) < 1e-4:
+    if float(getattr(est, 'fg_overlap_frac', 0.0)) < .02:
         return False
     return True
 
