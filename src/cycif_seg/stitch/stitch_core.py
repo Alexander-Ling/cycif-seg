@@ -458,7 +458,7 @@ def _is_valid_voting_edge(est: NeighborEstimate) -> bool:
         return False
     if float(est.overlap_px) <= 0.0:
         return False
-    if float(est.score) < 0.5:
+    if float(est.score) < 0.9:
         return False
     if float(getattr(est, 'fg_overlap_pixels', 0.0)) < 100:
         return False
