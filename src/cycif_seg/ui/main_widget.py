@@ -422,7 +422,18 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
                 if msg:
                     self.sig_step1_status.emit(f"[Step 1] {msg}")
-                if n > 0:
+                phase = str(ev.get("phase") or "")
+                top_level_phases = {
+                    "load_ref",
+                    "load_cycle",
+                    "global_registration",
+                    "foreground_mask",
+                    "identify_islands",
+                    "foreground_island_refine",
+                    "write_cycle",
+                    "pyramid",
+                }
+                if n > 0 and phase in top_level_phases:
                     self.sig_step1_progress.emit(int(idx), int(n))
 
             return merge_cycles_to_ome_tiff(
@@ -445,8 +456,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         @worker.returned.connect
         def _done(report):
             # report contains shifts etc. Show a small summary.
-            shifts = report.get("shifts_yx", {})
-            msg = f"Wrote merged OME-TIFF: {report.get('output_path')} (shape={report.get('shape_yxc')}, C={report.get('n_channels_out')})."
+            shifts = report.get("cycle_global_shifts", {})
+            msg = f"Wrote merged OME-TIFF: {report.get('output_path')} (shape={report.get('canvas_shape_yx')}, C={report.get('n_channels_total')})."
             if shifts:
                 msg += "\nPer-cycle shifts (dy,dx px): " + ", ".join(
                     f"cy{k}={tuple(round(float(vv), 2) for vv in v)}" for k, v in shifts.items()
@@ -471,7 +482,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                         cycle_inputs=cycle_inputs,
                         tissue=tissue,
                         species=species,
-                        canvas_yx=tuple(report.get("canvas_yx") or ()),
+                        canvas_yx=tuple(report.get("canvas_shape_yx") or ()),
                     )
                     self._update_project_label()
                 except Exception:

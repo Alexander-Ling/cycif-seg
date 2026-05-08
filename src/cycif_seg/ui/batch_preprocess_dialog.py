@@ -105,6 +105,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
     sig_set_status = QtCore.Signal(str)
     sig_set_cycle_progress = QtCore.Signal(int, int)  # (idx, n)
     sig_set_sample_progress = QtCore.Signal(int, int)  # (idx, n)
+    sig_set_sample_label = QtCore.Signal(str)
+    sig_set_cycle_label = QtCore.Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -114,6 +116,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self._samples: list[BatchSample] = []
         self._template_cfg: dict | None = None
         self._cancel_requested: bool = False
+        self._running: bool = False
         self._refreshing_table: bool = False
         self._channel_name_cache: dict[str, list[str]] = {}
 
@@ -187,11 +190,17 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
         # Progress bars
         root.addWidget(QtWidgets.QLabel("Progress:"))
+        self.lbl_sample_progress = QtWidgets.QLabel("Samples: idle")
+        self.lbl_cycle_progress = QtWidgets.QLabel("Current sample: idle")
         self.prog_samples = QtWidgets.QProgressBar()
         self.prog_cycles = QtWidgets.QProgressBar()
         self.prog_samples.setVisible(False)
         self.prog_cycles.setVisible(False)
+        self.lbl_sample_progress.setVisible(False)
+        self.lbl_cycle_progress.setVisible(False)
+        root.addWidget(self.lbl_sample_progress)
         root.addWidget(self.prog_samples)
+        root.addWidget(self.lbl_cycle_progress)
         root.addWidget(self.prog_cycles)
 
         self.lbl_status = QtWidgets.QLabel("")
@@ -219,14 +228,21 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self.btn_run.clicked.connect(self._run_batch)
         self.btn_stop.clicked.connect(self._request_cancel)
         self.btn_close.clicked.connect(self.reject)
+        try:
+            self.tbl.selectionModel().selectionChanged.connect(lambda *_: self._update_action_buttons())
+        except Exception:
+            pass
 
         # Signals -> UI slots
         self.sig_set_status.connect(self._apply_status)
         self.sig_set_cycle_progress.connect(self._apply_cycle_progress)
         self.sig_set_sample_progress.connect(self._apply_sample_progress)
+        self.sig_set_sample_label.connect(self.lbl_sample_progress.setText)
+        self.sig_set_cycle_label.connect(self.lbl_cycle_progress.setText)
 
         self.btn_stop.setEnabled(False)
         self._update_scan_button_enabled()
+        self._update_action_buttons()
 
         # Keep model state synchronized with direct table edits, especially the
         # output-path column. This avoids losing the current in-place editor
@@ -246,6 +262,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             if n > 0:
                 self.prog_cycles.setRange(0, n)
                 self.prog_cycles.setValue(max(0, min(int(idx), int(n))))
+                self.prog_cycles.setFormat(f"%v/%m")
         except Exception:
             pass
 
@@ -254,13 +271,13 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             if n > 0:
                 self.prog_samples.setRange(0, n)
                 self.prog_samples.setValue(max(0, min(int(idx), int(n))))
+                self.prog_samples.setFormat(f"%v/%m")
         except Exception:
             pass
 
     def _request_cancel(self) -> None:
         self._cancel_requested = True
         self.btn_stop.setEnabled(False)
-        self._update_scan_button_enabled()
         self._set_status("Cancel requested… finishing current step.")
 
     def _pick_root(self) -> None:
@@ -277,9 +294,40 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         try:
             has_root = bool(self.txt_root.text().strip())
             has_out = bool(self.txt_outdir.text().strip())
-            self.btn_scan.setEnabled(has_root and has_out)
+            self.btn_scan.setEnabled((not self._running) and has_root and has_out)
         except Exception:
             pass
+
+    def _update_action_buttons(self) -> None:
+        try:
+            has_samples = bool(self._samples)
+            has_selection = self._selected_row() is not None
+            self.btn_config_selected.setEnabled((not self._running) and has_samples and has_selection)
+            self.btn_apply_template.setEnabled((not self._running) and has_samples and bool(self._template_cfg))
+            self.btn_save_plan.setEnabled(not self._running)
+            self.btn_load_plan.setEnabled(not self._running)
+            self.btn_apply_defaults.setEnabled(not self._running)
+            self.btn_pick_root.setEnabled(not self._running)
+            self.btn_pick_out.setEnabled(not self._running)
+            self.txt_root.setEnabled(not self._running)
+            self.txt_outdir.setEnabled(not self._running)
+            self.txt_default_tissue.setEnabled(not self._running)
+            self.txt_default_species.setEnabled(not self._running)
+            self.tbl.setEnabled(not self._running)
+            self.btn_run.setEnabled((not self._running) and has_samples)
+            self.btn_stop.setEnabled(self._running and not self._cancel_requested)
+            self.btn_close.setEnabled(not self._running)
+        except Exception:
+            pass
+        self._update_scan_button_enabled()
+
+    def _set_running_ui(self, running: bool) -> None:
+        self._running = bool(running)
+        self.lbl_sample_progress.setVisible(bool(running))
+        self.lbl_cycle_progress.setVisible(bool(running))
+        self.prog_samples.setVisible(bool(running))
+        self.prog_cycles.setVisible(bool(running))
+        self._update_action_buttons()
 
     def _rebase_sample_output_paths(self, new_outdir: str | Path) -> None:
         try:
@@ -378,6 +426,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 pass
         finally:
             self._refreshing_table = False
+        self._update_action_buttons()
 
     def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._refreshing_table:
@@ -403,6 +452,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.output_path = ((out_dir / op_name) if (out_dir and op_name) else None)
         except Exception:
             return
+        self._update_action_buttons()
 
     def _apply_defaults(self) -> None:
         t = self.txt_default_tissue.text().strip()
@@ -641,6 +691,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             self._apply_cfg_to_sample(s, self._template_cfg, preserve_paths=True)
         self._refresh_table()
         self._set_status("Copied cycle configuration to all samples (preserved sample input/output paths).")
+        self._update_action_buttons()
 
     # -------------------- Plan I/O --------------------
     def _plan_dict(self) -> dict:
@@ -796,25 +847,29 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
         self.prog_samples.setVisible(True)
         self.prog_cycles.setVisible(True)
+        self.lbl_sample_progress.setVisible(True)
+        self.lbl_cycle_progress.setVisible(True)
         self._apply_sample_progress(0, n_samp)
         self._apply_cycle_progress(0, 1)
+        self.lbl_sample_progress.setText(f"Samples: 0/{n_samp}")
+        self.lbl_cycle_progress.setText("Current sample: waiting")
 
-        self.btn_run.setEnabled(False)
-        self.btn_stop.setEnabled(True)
-        self.btn_config_selected.setEnabled(False)
-        self.btn_apply_template.setEnabled(False)
-        self.btn_scan.setEnabled(False)
         self._cancel_requested = False
+        self._reports = []  # type: ignore[attr-defined]
+        self._failures = []  # type: ignore[attr-defined]
+        self._set_running_ui(True)
 
         @thread_worker
         def _worker():
             reports: list[dict] = []
+            failures: list[dict] = []
             for si, s in enumerate(enabled, start=1):
                 if self._cancel_requested:
                     raise RuntimeError("Cancelled")
 
                 # sample-level progress
                 self.sig_set_sample_progress.emit(int(si - 1), int(n_samp))
+                self.sig_set_sample_label.emit(f"Samples: {si - 1}/{n_samp}")
                 out_path = Path(str(s.output_path)).expanduser()
                 out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -836,8 +891,10 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     )
 
                 # Reset per-sample cycle progress before starting.
+                sample_total = 1 + max(0, len(cycles_in) - 1) * 4 + len(cycles_in) + (1 if bool(getattr(s, 'pyramidal_output', False)) else 0)
                 try:
-                    self.sig_set_cycle_progress.emit(0, int(len(cycles_in) + 1))
+                    self.sig_set_cycle_progress.emit(0, int(max(1, sample_total)))
+                    self.sig_set_cycle_label.emit(f"Current sample: {s.name} (0/{max(1, sample_total)})")
                 except Exception:
                     pass
 
@@ -852,60 +909,91 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
                     if msg:
                         self.sig_set_status.emit(f"[{si}/{n_samp}] {s.name}: {msg}")
-                    if n > 0:
+                    phase = str(ev.get("phase") or "")
+                    top_level_phases = {
+                        "load_ref",
+                        "load_cycle",
+                        "global_registration",
+                        "foreground_mask",
+                        "identify_islands",
+                        "foreground_island_refine",
+                        "write_cycle",
+                        "pyramid",
+                    }
+                    if n > 0 and phase in top_level_phases:
                         self.sig_set_cycle_progress.emit(int(idx), int(n))
+                        self.sig_set_cycle_label.emit(f"Current sample: {s.name} ({max(0, min(int(idx), int(n)))}/{int(n)})")
 
                 # Run merge
-                rep = merge_cycles_to_ome_tiff(
-                    cycles_in,
-                    str(out_path),
-                    default_registration_marker="DAPI",
-                    registration_algorithm=str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
-                    global_translation_only=bool(getattr(s, 'global_translation_only', False)),
-                    tiled_rigid_allow_rotation=bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
-                    tiled_rigid_tile_size=max(128, int(getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size)),
-                    tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
-                    pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
-                    progress_event_cb=_ev,
-                    cancel_cb=lambda: bool(self._cancel_requested),
-                    low_mem=True,
-                )
-                rep["sample_name"] = s.name
-                reports.append(rep)
+                try:
+                    rep = merge_cycles_to_ome_tiff(
+                        cycles_in,
+                        str(out_path),
+                        default_registration_marker="DAPI",
+                        registration_algorithm=str(getattr(s, 'registration_algorithm', 'tiled_rigid') or 'tiled_rigid'),
+                        global_translation_only=bool(getattr(s, 'global_translation_only', False)),
+                        tiled_rigid_allow_rotation=bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
+                        tiled_rigid_tile_size=max(128, int(getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size)),
+                        tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
+                        pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
+                        progress_event_cb=_ev,
+                        cancel_cb=lambda: bool(self._cancel_requested),
+                        low_mem=True,
+                    )
+                    rep["sample_name"] = s.name
+                    reports.append(rep)
+                except Exception as e:
+                    if self._cancel_requested:
+                        raise
+                    failures.append({"sample_name": str(s.name), "error": str(e)})
+                    self.sig_set_status.emit(f"[{si}/{n_samp}] {s.name}: failed: {e}")
 
                 self.sig_set_sample_progress.emit(int(si), int(n_samp))
-            return reports
+                self.sig_set_sample_label.emit(f"Samples: {si}/{n_samp}")
+                self.sig_set_cycle_progress.emit(0, 1)
+                self.sig_set_cycle_label.emit("Current sample: waiting")
+            return {"reports": reports, "failures": failures}
 
         w = _worker()
 
         @w.returned.connect
-        def _done(reports: list[dict]):
-            self.btn_run.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self.btn_config_selected.setEnabled(True)
-            self.btn_apply_template.setEnabled(True)
-            self._update_scan_button_enabled()
-            self._set_status(f"Batch complete: {len(reports)} sample(s) processed.")
-            show_info(f"Batch complete: {len(reports)} sample(s) processed.")
-            self.btn_run.setEnabled(True)
-            self.btn_close.setText("Done")
-            # stash result for parent
+        def _done(result):
+            result = result or {}
+            reports = list(result.get("reports") or [])
+            failures = list(result.get("failures") or [])
             self._reports = reports  # type: ignore[attr-defined]
+            self._failures = failures  # type: ignore[attr-defined]
+            self._set_running_ui(False)
+            self.lbl_sample_progress.setVisible(True)
+            self.lbl_cycle_progress.setVisible(True)
+            self.prog_samples.setVisible(True)
+            self.prog_cycles.setVisible(True)
+            self.prog_samples.setValue(self.prog_samples.maximum())
+            self.prog_cycles.setValue(0)
+            self.lbl_sample_progress.setText(f"Samples: {len(reports) + len(failures)}/{n_samp}")
+            self.lbl_cycle_progress.setText("Current sample: complete")
+            if failures:
+                self._set_status(f"Batch complete: {len(reports)} sample(s) processed, {len(failures)} failed.")
+                show_warning(f"Batch complete with {len(failures)} failed sample(s). See status for details.")
+            else:
+                self._set_status(f"Batch complete: {len(reports)} sample(s) processed.")
+                show_info(f"Batch complete: {len(reports)} sample(s) processed.")
+            self.btn_close.setText("Done")
 
         @w.errored.connect
         def _err(e):
             msg = str(e)
+            self._set_running_ui(False)
+            self.lbl_sample_progress.setVisible(True)
+            self.lbl_cycle_progress.setVisible(True)
+            self.prog_samples.setVisible(True)
+            self.prog_cycles.setVisible(True)
             if "Cancelled" in msg:
                 self._set_status("Batch cancelled.")
                 show_info("Batch cancelled.")
             else:
                 show_warning(f"Batch failed: {e}")
                 self._set_status(f"Batch failed: {e}")
-            self.btn_run.setEnabled(True)
-            self.btn_stop.setEnabled(False)
-            self.btn_config_selected.setEnabled(True)
-            self.btn_apply_template.setEnabled(True)
-            self._update_scan_button_enabled()
 
         w.start()
 

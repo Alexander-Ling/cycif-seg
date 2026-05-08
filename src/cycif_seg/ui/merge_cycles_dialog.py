@@ -59,52 +59,21 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             )
         )
 
-        # Registration mode
-        self.chk_global_translation_only = QtWidgets.QCheckBox("Global translation only (skip tiled rigid refinement)")
-        self.chk_global_translation_only.setChecked(False)
-        self.chk_global_translation_only.setToolTip("Use only the initial whole-image translation and skip tile-wise rigid refinement.")
-        root.addWidget(self.chk_global_translation_only)
-        try:
-            if isinstance(self._initial_cfg, dict):
-                v = self._initial_cfg.get("global_translation_only")
-                if v is None:
-                    v = str(self._initial_cfg.get("registration_algorithm") or "").strip().lower() == "translation"
-                self.chk_global_translation_only.setChecked(bool(v))
-        except Exception:
-            pass
-
-        # Tiled rigid options
-        self.chk_allow_rotation = QtWidgets.QCheckBox("Enable rotation during tile registration")
-        self.chk_allow_rotation.setChecked(False)
-        root.addWidget(self.chk_allow_rotation)
-        # Seed from initial config if present
-        try:
-            if isinstance(self._initial_cfg, dict):
-                v = self._initial_cfg.get("tiled_rigid_allow_rotation")
-                if v is None:
-                    v = self._initial_cfg.get("allow_rotation")
-                if v is None:
-                    v = self._initial_cfg.get("enable_rotation")
-                if v is not None:
-                    self.chk_allow_rotation.setChecked(bool(v))
-        except Exception:
-            pass
-
-        tiled_form = QtWidgets.QFormLayout()
+        refine_form = QtWidgets.QFormLayout()
         self.spn_tile_size = QtWidgets.QSpinBox()
-        self.spn_tile_size.setRange(10, 50000)
+        self.spn_tile_size.setRange(128, 50000)
         self.spn_tile_size.setSingleStep(250)
         self.spn_tile_size.setValue(2000)
-        self.spn_tile_size.setToolTip("Tile size in pixels for tile-wise rigid registration.")
+        self.spn_tile_size.setToolTip("Approximate foreground-island size in pixels. Larger values merge nearby tissue into fewer local correction regions.")
         self.spn_search_factor = QtWidgets.QDoubleSpinBox()
         self.spn_search_factor.setRange(1.0, 50.0)
         self.spn_search_factor.setDecimals(1)
         self.spn_search_factor.setSingleStep(0.5)
         self.spn_search_factor.setValue(3.0)
-        self.spn_search_factor.setToolTip("Search window size as a multiple of the tile size during tile-wise rigid registration.")
-        tiled_form.addRow("Tile size (px):", self.spn_tile_size)
-        tiled_form.addRow("Search factor:", self.spn_search_factor)
-        root.addLayout(tiled_form)
+        self.spn_search_factor.setToolTip("Local correction search radius is tile size times this factor divided by 4.")
+        refine_form.addRow("Foreground island size (px):", self.spn_tile_size)
+        refine_form.addRow("Local search factor:", self.spn_search_factor)
+        root.addLayout(refine_form)
         try:
             if isinstance(self._initial_cfg, dict):
                 v_tile = self._initial_cfg.get("tiled_rigid_tile_size")
@@ -316,9 +285,9 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         tissue = self.txt_tissue.text().strip()
         species = self.txt_species.text().strip()
         out_path = self.txt_output.text().strip()
-        global_translation_only = bool(getattr(self, 'chk_global_translation_only', None) and self.chk_global_translation_only.isChecked())
-        reg_algorithm = "translation" if global_translation_only else "tiled_rigid"
-        tiled_allow_rotation = bool(getattr(self, 'chk_allow_rotation', None) and self.chk_allow_rotation.isChecked())
+        global_translation_only = False
+        reg_algorithm = "tiled_rigid"
+        tiled_allow_rotation = False
         tiled_tile_size = int(getattr(self, 'spn_tile_size', None).value() if getattr(self, 'spn_tile_size', None) is not None else 2000)
         tiled_search_factor = float(getattr(self, 'spn_search_factor', None).value() if getattr(self, 'spn_search_factor', None) is not None else 3.0)
         if not out_path:

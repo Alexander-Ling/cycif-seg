@@ -28,7 +28,7 @@ class Step1PreprocessPanel(QtWidgets.QWidget):
         layout.addWidget(
             QtWidgets.QLabel(
                 "Step 1 (Preprocess): merge 1+ cycle OME-TIFFs into one co-registered OME-TIFF.\n"
-                "Current MVP does translation-only registration using a chosen nuclear marker (default: DAPI).\n"
+                "Registration uses a chosen marker channel (default: DAPI), global translation, and foreground-island local refinement.\n"
                 "Single-slide mode records per-slide metadata; batch mode runs the same pipeline over many samples."
             )
         )
