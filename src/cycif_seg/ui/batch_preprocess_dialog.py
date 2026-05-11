@@ -989,6 +989,15 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             self.lbl_sample_progress.setText(f"Samples: {len(reports) + len(failures)}/{n_samp}")
             self.lbl_cycle_progress.setText("Current sample: complete")
             if failures:
+                print("Batch preprocess completed with failed sample(s):", flush=True)
+                for fail in failures:
+                    try:
+                        print(
+                            f"  - {fail.get('sample_name', '<unknown sample>')}: {fail.get('error', '<unknown error>')}",
+                            flush=True,
+                        )
+                    except Exception:
+                        print(f"  - {fail!r}", flush=True)
                 self._set_status(f"Batch complete: {len(reports)} sample(s) processed, {len(failures)} failed.")
                 show_warning(f"Batch complete with {len(failures)} failed sample(s). See status for details.")
             else:
