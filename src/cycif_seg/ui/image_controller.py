@@ -128,6 +128,7 @@ class ImageController:
                     name=nm,
                     blending="additive",
                     opacity=0.6,
+                    gamma=0.3,
                     colormap=w._colormap_for_channel(i),
                 )
                 try:
@@ -246,6 +247,7 @@ class ImageController:
                         name=nm,
                         blending="additive",
                         opacity=0.6,
+                        gamma=0.3,
                         colormap=w._colormap_for_channel(i),
                     )
                     try:

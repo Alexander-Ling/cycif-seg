@@ -445,6 +445,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 tiled_rigid_allow_rotation=bool(cfg.get("tiled_rigid_allow_rotation") or False),
                 tiled_rigid_tile_size=max(128, int(cfg.get("tiled_rigid_tile_size") or 2000)),
                 tiled_rigid_search_factor=max(1.0, float(cfg.get("tiled_rigid_search_factor") or 3.0)),
+                fast_large_island_refinement=bool(cfg.get("fast_large_island_refinement", True)),
+                fast_large_island_sample_count=max(1, int(cfg.get("fast_large_island_sample_count") or 5)),
                 pyramidal_output=bool(cfg.get("pyramidal_output") or False),
                 progress_cb=_progress,
                 progress_event_cb=_progress_event,
@@ -666,6 +668,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 name=nm,
                 blending="additive",
                 opacity=0.6,
+                gamma=0.3,
                 colormap=self._colormap_for_channel(i),
             )
 

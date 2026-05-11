@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 from pathlib import Path
@@ -357,6 +358,25 @@ def _extract_translated_crop(
     return shifted[oy0:oy1, ox0:ox1]
 
 
+def _extract_translated_crop_from_buffer(
+    moving_buffer: np.ndarray,
+    buffer_origin_yx: tuple[int, int],
+    bbox: tuple[int, int, int, int],
+    dy: float,
+    dx: float,
+    *,
+    order: int = 1,
+) -> np.ndarray:
+    y0, y1, x0, x1 = [int(v) for v in bbox]
+    by0, bx0 = int(buffer_origin_yx[0]), int(buffer_origin_yx[1])
+    shifted = _apply_translation(moving_buffer, dy, dx, order=order)
+    oy0 = y0 - by0
+    oy1 = oy0 + (y1 - y0)
+    ox0 = x0 - bx0
+    ox1 = ox0 + (x1 - x0)
+    return shifted[oy0:oy1, ox0:ox1]
+
+
 def _refine_bad_regions(
     fixed_yx,
     moving_yx,
@@ -486,6 +506,192 @@ def _masked_corr_score(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) 
     return float(np.sum(a * b) / (da * db))
 
 
+def _score_mask_for_crop(mask_crop: np.ndarray) -> np.ndarray:
+    use = mask_crop.astype(bool, copy=False)
+    if int(use.sum()) >= 32:
+        return use
+    return np.ones_like(use, dtype=bool)
+
+
+def _island_sample_cells(
+    region_mask: np.ndarray,
+    *,
+    cell_size: int,
+    min_overlap_fraction: float = 0.005,
+) -> list[tuple[int, int, int, int, float, float]]:
+    y0, y1, x0, x1 = _bbox_from_mask(region_mask)
+    size = max(1, int(cell_size))
+    cells: list[tuple[int, int, int, int, float, float]] = []
+    for cy0 in range(y0, y1, size):
+        cy1 = min(y1, cy0 + size)
+        for cx0 in range(x0, x1, size):
+            cx1 = min(x1, cx0 + size)
+            tile = region_mask[cy0:cy1, cx0:cx1]
+            if tile.size == 0:
+                continue
+            if float(tile.mean()) <= float(min_overlap_fraction):
+                continue
+            cells.append((cy0, cy1, cx0, cx1, (cy0 + cy1 - 1) / 2.0, (cx0 + cx1 - 1) / 2.0))
+    return cells
+
+
+def _select_spread_cells(
+    cells: list[tuple[int, int, int, int, float, float]],
+    n: int,
+) -> list[tuple[int, int, int, int]]:
+    if not cells:
+        return []
+    target = max(1, int(n))
+    if len(cells) <= target:
+        return [(int(c[0]), int(c[1]), int(c[2]), int(c[3])) for c in cells]
+
+    pts = np.asarray([(float(c[4]), float(c[5])) for c in cells], dtype=np.float32)
+    center = np.mean(pts, axis=0)
+    first = int(np.argmin(np.sum((pts - center) ** 2, axis=1)))
+    selected = [first]
+    min_d2 = np.sum((pts - pts[first]) ** 2, axis=1)
+    while len(selected) < target:
+        min_d2[selected] = -1.0
+        nxt = int(np.argmax(min_d2))
+        if nxt in selected:
+            break
+        selected.append(nxt)
+        min_d2 = np.minimum(min_d2, np.sum((pts - pts[nxt]) ** 2, axis=1))
+    return [(int(cells[i][0]), int(cells[i][1]), int(cells[i][2]), int(cells[i][3])) for i in selected]
+
+
+def _sample_tile_registration_worker(
+    fixed_crop: np.ndarray,
+    moving_base_crop: np.ndarray,
+    moving_buffer: np.ndarray,
+    buffer_origin_yx: tuple[int, int],
+    bbox: tuple[int, int, int, int],
+    mask_crop: np.ndarray,
+    base_shift: tuple[float, float],
+    search_radius: int,
+) -> tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray, tuple[int, int], tuple[int, int, int, int]] | None:
+    base_dy, base_dx = float(base_shift[0]), float(base_shift[1])
+    base_score = _masked_corr_score(fixed_crop, moving_base_crop, mask_crop)
+    try:
+        resid_dy, resid_dx = estimate_translation(
+            fixed_crop,
+            moving_base_crop,
+            downsample=1,
+            upsample_factor=10,
+        )
+    except Exception:
+        return None
+
+    max_shift = float(search_radius)
+    resid_dy = float(np.clip(resid_dy, -max_shift, max_shift))
+    resid_dx = float(np.clip(resid_dx, -max_shift, max_shift))
+    cand_dy = float(base_dy + resid_dy)
+    cand_dx = float(base_dx + resid_dx)
+    cand_crop = _extract_translated_crop_from_buffer(
+        moving_buffer,
+        buffer_origin_yx,
+        bbox,
+        cand_dy,
+        cand_dx,
+        order=1,
+    )
+    cand_score = _masked_corr_score(fixed_crop, cand_crop, mask_crop)
+    if not (np.isfinite(base_score) and np.isfinite(cand_score)):
+        return None
+    return (
+        resid_dy,
+        resid_dx,
+        float(base_score),
+        fixed_crop,
+        mask_crop,
+        moving_buffer,
+        buffer_origin_yx,
+        bbox,
+    )
+
+
+def _estimate_sampled_region_shift(
+    fixed_n: np.ndarray,
+    moving_n: np.ndarray,
+    moving_base_n: np.ndarray,
+    region_mask: np.ndarray,
+    base_shift: tuple[float, float],
+    *,
+    cell_size: int,
+    sample_count: int,
+    search_radius: int,
+) -> tuple[float, float] | None:
+    cells = _island_sample_cells(region_mask, cell_size=cell_size)
+    if len(cells) <= 4:
+        return None
+    selected = _select_spread_cells(cells, sample_count)
+    if not selected:
+        return None
+
+    base_dy, base_dx = float(base_shift[0]), float(base_shift[1])
+    max_abs_shift = max(abs(base_dy), abs(base_dx)) + float(search_radius)
+    buffer_pad = int(max(4, math.ceil(max_abs_shift) + 2))
+    tasks = []
+    for y0, y1, x0, x1 in selected:
+        fixed_crop = fixed_n[y0:y1, x0:x1]
+        moving_base_crop = moving_base_n[y0:y1, x0:x1]
+        mask_crop = _score_mask_for_crop(region_mask[y0:y1, x0:x1])
+        py0 = max(0, int(y0) - buffer_pad)
+        py1 = min(int(moving_n.shape[0]), int(y1) + buffer_pad)
+        px0 = max(0, int(x0) - buffer_pad)
+        px1 = min(int(moving_n.shape[1]), int(x1) + buffer_pad)
+        moving_buffer = moving_n[py0:py1, px0:px1]
+        tasks.append(
+            (
+                fixed_crop,
+                moving_base_crop,
+                moving_buffer,
+                (py0, px0),
+                (y0, y1, x0, x1),
+                mask_crop,
+                (base_dy, base_dx),
+                int(search_radius),
+            )
+        )
+
+    worker_count = min(len(tasks), max(1, int((os.cpu_count() or 2) - 1)))
+    if worker_count <= 1:
+        results = [_sample_tile_registration_worker(*task) for task in tasks]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            results = list(pool.map(lambda task: _sample_tile_registration_worker(*task), tasks))
+
+    good = [r for r in results if r is not None]
+    residuals = [(float(r[0]), float(r[1])) for r in good]
+
+    if not residuals:
+        return None
+
+    med_resid_y = float(np.median([v[0] for v in residuals]))
+    med_resid_x = float(np.median([v[1] for v in residuals]))
+    median_dy = float(base_dy + med_resid_y)
+    median_dx = float(base_dx + med_resid_x)
+    median_scores: list[float] = []
+    base_scores = [float(r[2]) for r in good]
+    for _resid_y, _resid_x, _base_score, fixed_crop, mask_crop, moving_buffer, buffer_origin_yx, bbox in good:
+        cand_crop = _extract_translated_crop_from_buffer(
+            moving_buffer,
+            buffer_origin_yx,
+            bbox,
+            median_dy,
+            median_dx,
+            order=1,
+        )
+        score = _masked_corr_score(fixed_crop, cand_crop, mask_crop)
+        if np.isfinite(score):
+            median_scores.append(float(score))
+    if not median_scores:
+        return None
+    if float(np.median(median_scores)) <= float(np.median(base_scores)) + 1e-6:
+        return base_dy, base_dx
+    return median_dy, median_dx
+
+
 def _score_region_shift(
     fixed_yx: np.ndarray,
     moving_yx: np.ndarray,
@@ -513,6 +719,9 @@ def _refine_region_transforms(
     search_radius: int,
     downsample: int,
     penalty_lambda: float,
+    fast_large_island_refinement: bool,
+    fast_large_island_sample_count: int,
+    fast_large_island_cell_size: int,
     progress_cb: Callable[[str], None] | None,
     progress_event_cb: Optional[Callable[[dict], None]],
     cancel_cb: Callable[[], bool] | None,
@@ -540,6 +749,31 @@ def _refine_region_transforms(
 
         region_mask = island_labels == lab
         pixels = int(region_mask.sum())
+
+        if bool(fast_large_island_refinement):
+            sampled_shift = _estimate_sampled_region_shift(
+                fixed_n,
+                moving_n,
+                moving_base_n,
+                region_mask,
+                (base_dy, base_dx),
+                cell_size=max(128, int(fast_large_island_cell_size)),
+                sample_count=max(1, int(fast_large_island_sample_count)),
+                search_radius=int(search_radius),
+            )
+            if sampled_shift is not None:
+                regions.append(
+                    _RegionTransform(
+                        label=int(lab),
+                        mask=region_mask,
+                        bbox=_bbox_from_mask(region_mask),
+                        shift_y=float(sampled_shift[0]),
+                        shift_x=float(sampled_shift[1]),
+                        pixels=pixels,
+                    )
+                )
+                continue
+
         bbox = _bbox_from_mask(region_mask, pad=max(16, int(search_radius)))
         y0, y1, x0, x1 = bbox
         fixed_crop = fixed_n[y0:y1, x0:x1]
@@ -662,6 +896,8 @@ def merge_cycles_to_ome_tiff(
     tiled_rigid_allow_rotation: bool = False,
     tiled_rigid_tile_size: int = 2000,
     tiled_rigid_search_factor: float = 3,
+    fast_large_island_refinement: bool = True,
+    fast_large_island_sample_count: int = 5,
     upsample_factor: int = 10,
     low_mem: bool = False,
     pyramidal_output: bool = False,
@@ -850,6 +1086,9 @@ def merge_cycles_to_ome_tiff(
             search_radius=region_search_radius,
             downsample=max(1, int(downsample_for_registration)),
             penalty_lambda=0.0,
+            fast_large_island_refinement=bool(fast_large_island_refinement),
+            fast_large_island_sample_count=max(1, int(fast_large_island_sample_count)),
+            fast_large_island_cell_size=max(128, int(tiled_rigid_tile_size)),
             progress_cb=progress_cb,
             progress_event_cb=progress_event_cb,
             cancel_cb=cancel_cb,
@@ -907,19 +1146,9 @@ def merge_cycles_to_ome_tiff(
     pyramid_output_path: str | None = None
     if pyramidal_output:
         _check_cancel(cancel_cb)
+        pyramid_output_path = out_path
         root = Path(out_path)
-        lower = root.name.lower()
-        if lower.endswith('.ome.tiff'):
-            stem = root.name[:-9]
-        elif lower.endswith('.ome.tif'):
-            stem = root.name[:-8]
-        elif lower.endswith('.tiff'):
-            stem = root.name[:-5]
-        elif lower.endswith('.tif'):
-            stem = root.name[:-4]
-        else:
-            stem = root.stem
-        pyramid_output_path = str(root.with_name(f"{stem}_pyramidal.ome.tiff"))
+        tmp_pyramid_path = str(root.with_name(f"{root.stem}.__pyramid_tmp__.ome.tiff"))
 
         def _pyr_progress(msg: str) -> None:
             _progress(
@@ -933,11 +1162,12 @@ def merge_cycles_to_ome_tiff(
 
         convert_flat_ome_to_pyramidal(
             out_path,
-            pyramid_output_path,
+            tmp_pyramid_path,
             tile_size=int(pyramidal_tile_size),
             compression=pyramidal_compression,
             min_level_size=int(pyramidal_min_level_size),
             out_chunk=max(1, int(pyramid_progress_chunk)),
+            replace_source=True,
             progress_cb=_pyr_progress,
         )
         tick += 1
@@ -966,6 +1196,8 @@ def merge_cycles_to_ome_tiff(
         },
         "input_pyramid_info": input_pyramid_info,
         "registration_algorithm": "global_translation_plus_foreground_island_refinement",
+        "fast_large_island_refinement": bool(fast_large_island_refinement),
+        "fast_large_island_sample_count": int(max(1, int(fast_large_island_sample_count))),
         "implemented_steps": [1, 2, 3, 4, 5],
         "pending_steps": [],
         "low_mem": bool(low_mem),
