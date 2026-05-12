@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 from concurrent.futures import ThreadPoolExecutor
+import gc
 import math
 import os
 from pathlib import Path
@@ -58,7 +59,6 @@ class CycleInput:
 @dataclass
 class _RegionTransform:
     label: int
-    mask: np.ndarray
     bbox: tuple[int, int, int, int]
     shift_y: float
     shift_x: float
@@ -456,7 +456,6 @@ def _refine_bad_regions(
             regions.append(
                 _RegionTransform(
                     label=int(lab),
-                    mask=mask,
                     bbox=bbox,
                     shift_y=float(new_dy),
                     shift_x=float(new_dx),
@@ -765,7 +764,6 @@ def _refine_region_transforms(
                 regions.append(
                     _RegionTransform(
                         label=int(lab),
-                        mask=region_mask,
                         bbox=_bbox_from_mask(region_mask),
                         shift_y=float(sampled_shift[0]),
                         shift_x=float(sampled_shift[1]),
@@ -813,7 +811,6 @@ def _refine_region_transforms(
         regions.append(
             _RegionTransform(
                 label=int(lab),
-                mask=region_mask,
                 bbox=bbox,
                 shift_y=float(best_dy),
                 shift_x=float(best_dx),
@@ -825,6 +822,7 @@ def _refine_region_transforms(
 
 def _dense_shift_field(
     shape_yx: tuple[int, int],
+    label_image: np.ndarray,
     regions: list[_RegionTransform],
     base_shift: tuple[float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -835,9 +833,14 @@ def _dense_shift_field(
         return field_y, field_x
     label_map = np.zeros((Y, X), dtype=np.int32)
     for reg in regions:
-        label_map[reg.mask] = int(reg.label)
-        field_y[reg.mask] = float(reg.shift_y)
-        field_x[reg.mask] = float(reg.shift_x)
+        y0, y1, x0, x1 = reg.bbox
+        mask_crop = label_image[y0:y1, x0:x1] == int(reg.label)
+        label_crop = label_map[y0:y1, x0:x1]
+        fy_crop = field_y[y0:y1, x0:x1]
+        fx_crop = field_x[y0:y1, x0:x1]
+        label_crop[mask_crop] = int(reg.label)
+        fy_crop[mask_crop] = float(reg.shift_y)
+        fx_crop[mask_crop] = float(reg.shift_x)
     if distance_transform_edt is None:
         return field_y, field_x
     bg = label_map == 0
@@ -854,6 +857,7 @@ def _dense_shift_field(
 
 def _piecewise_shift_field(
     shape_yx: tuple[int, int],
+    label_image: np.ndarray,
     regions: list[_RegionTransform],
     base_shift: tuple[float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -862,8 +866,12 @@ def _piecewise_shift_field(
     field_y = np.full((Y, X), float(base_shift[0]), dtype=np.float32)
     field_x = np.full((Y, X), float(base_shift[1]), dtype=np.float32)
     for reg in regions:
-        field_y[reg.mask] = float(reg.shift_y)
-        field_x[reg.mask] = float(reg.shift_x)
+        y0, y1, x0, x1 = reg.bbox
+        mask_crop = label_image[y0:y1, x0:x1] == int(reg.label)
+        fy_crop = field_y[y0:y1, x0:x1]
+        fx_crop = field_x[y0:y1, x0:x1]
+        fy_crop[mask_crop] = float(reg.shift_y)
+        fx_crop[mask_crop] = float(reg.shift_x)
     return field_y, field_x
 
 
@@ -1157,7 +1165,7 @@ def merge_cycles_to_ome_tiff(
 
             # Keep non-candidate pixels at the global shift; only selected foreground
             # island regions receive their accepted local shift.
-            field_yx = _piecewise_shift_field(canvas_yx, regs, (dy, dx))
+            field_yx = _piecewise_shift_field(canvas_yx, islands, regs, (dy, dx))
             del islands, regs, mov_reg
             tick += 1
 
@@ -1172,7 +1180,16 @@ def merge_cycles_to_ome_tiff(
             )
             _write_cycle_channels(ci, shp, field_yx)
             del field_yx
+            try:
+                gc.collect()
+            except Exception:
+                pass
             tick += 1
+    try:
+        del ref_reg
+        gc.collect()
+    except Exception:
+        pass
     pyramid_output_path: str | None = None
     if pyramidal_output:
         _check_cancel(cancel_cb)

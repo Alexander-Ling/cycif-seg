@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,9 +160,10 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
         # Samples table
         self.tbl = QtWidgets.QTableWidget()
-        self.tbl.setColumnCount(6)
+        self.tbl.setColumnCount(7)
         self.tbl.setHorizontalHeaderLabels([
             "Run",
+            "Config",
             "Sample",
             "# cycle files",
             "Tissue",
@@ -404,6 +406,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self._refreshing_table = True
         try:
             self.tbl.setRowCount(len(self._samples))
+            style = self.style()
+            ok_icon = style.standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
+            warn_icon = style.standardIcon(QtWidgets.QStyle.SP_MessageBoxWarning)
             for r, s in enumerate(self._samples):
                 # Run checkbox
                 chk = QtWidgets.QTableWidgetItem("")
@@ -411,18 +416,31 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 chk.setCheckState(QtCore.Qt.Checked if s.enabled else QtCore.Qt.Unchecked)
                 self.tbl.setItem(r, 0, chk)
 
+                cfg_item = QtWidgets.QTableWidgetItem("")
+                cfg_item.setFlags(cfg_item.flags() & ~QtCore.Qt.ItemIsEditable)
+                cfg_state, cfg_tip = self._sample_config_state(s)
+                if cfg_state == "valid":
+                    cfg_item.setIcon(ok_icon)
+                    cfg_item.setToolTip(cfg_tip or "Cycle configuration is valid.")
+                elif cfg_state == "invalid":
+                    cfg_item.setIcon(warn_icon)
+                    cfg_item.setToolTip(cfg_tip or "Cycle configuration is invalid.")
+                else:
+                    cfg_item.setToolTip("No cycle configuration for this sample.")
+                self.tbl.setItem(r, 1, cfg_item)
+
                 it_name = QtWidgets.QTableWidgetItem(s.name)
                 it_name.setFlags(it_name.flags() & ~QtCore.Qt.ItemIsEditable)
-                self.tbl.setItem(r, 1, it_name)
+                self.tbl.setItem(r, 2, it_name)
 
                 it_n = QtWidgets.QTableWidgetItem(str(len(s.files)))
                 it_n.setFlags(it_n.flags() & ~QtCore.Qt.ItemIsEditable)
-                self.tbl.setItem(r, 2, it_n)
+                self.tbl.setItem(r, 3, it_n)
 
-                self.tbl.setItem(r, 3, QtWidgets.QTableWidgetItem(s.tissue or ""))
-                self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(s.species or ""))
+                self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(s.tissue or ""))
+                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(s.species or ""))
                 out_name = Path(str(s.output_path)).name if s.output_path else ""
-                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(out_name))
+                self.tbl.setItem(r, 6, QtWidgets.QTableWidgetItem(out_name))
 
             try:
                 self.tbl.resizeColumnsToContents()
@@ -446,11 +464,11 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         try:
             if c == 0:
                 s.enabled = (item.checkState() == QtCore.Qt.Checked)
-            elif c == 3:
-                s.tissue = (item.text() or "").strip()
             elif c == 4:
-                s.species = (item.text() or "").strip()
+                s.tissue = (item.text() or "").strip()
             elif c == 5:
+                s.species = (item.text() or "").strip()
+            elif c == 6:
                 op_name = Path((item.text() or "").strip()).name
                 out_dir = Path(self.txt_outdir.text().strip() or "").expanduser() if self.txt_outdir.text().strip() else None
                 s.output_path = ((out_dir / op_name) if (out_dir and op_name) else None)
@@ -552,9 +570,17 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 return
 
             cfg = dlg.get_result()
+            snapshot = self._cycle_config_snapshot(s)
+            try:
+                # Apply to this sample immediately. This also validates duplicate
+                # enabled cycle numbers before the config can become the template.
+                self._apply_cfg_to_sample(s, cfg)
+            except Exception as e:
+                self._restore_cycle_config_snapshot(s, snapshot)
+                show_warning(str(e))
+                self._set_status(f"Invalid cycle configuration for sample '{s.name}': {e}")
+                return
             self._template_cfg = cfg
-            # Apply to this sample immediately
-            self._apply_cfg_to_sample(s, cfg)
             self._refresh_table()
             self._set_status(f"Stored cycle configuration template from sample '{s.name}'.")
 
@@ -635,6 +661,65 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         except Exception:
             return None
 
+    def _enabled_cycle_numbers(self, s: BatchSample) -> list[int]:
+        cycles: list[int] = []
+        for i, _p in enumerate(s.files or []):
+            enabled = bool(s.cycles_enabled[i] if s.cycles_enabled and i < len(s.cycles_enabled) else True)
+            if not enabled:
+                continue
+            cycles.append(int(s.cycles[i] if s.cycles and i < len(s.cycles) else i))
+        return cycles
+
+    def _duplicate_cycle_numbers(self, s: BatchSample) -> list[int]:
+        seen: set[int] = set()
+        dupes: set[int] = set()
+        for cy in self._enabled_cycle_numbers(s):
+            if cy in seen:
+                dupes.add(cy)
+            seen.add(cy)
+        return sorted(dupes)
+
+    def _validate_sample_cycle_numbers(self, s: BatchSample) -> tuple[bool, str]:
+        dupes = self._duplicate_cycle_numbers(s)
+        if dupes:
+            cycles = self._enabled_cycle_numbers(s)
+            return (
+                False,
+                f"Sample '{s.name}' has duplicate enabled cycle number(s): {dupes}. "
+                f"Enabled cycle numbers are: {cycles}. Reconfigure this sample before running batch preprocessing.",
+            )
+        return True, ""
+
+    def _sample_has_cycle_config(self, s: BatchSample) -> bool:
+        return bool(s.cycles and s.registration_markers and s.channel_markers and s.channel_antibodies)
+
+    def _sample_config_state(self, s: BatchSample) -> tuple[str, str]:
+        if not self._sample_has_cycle_config(s):
+            return "missing", "No cycle configuration for this sample."
+        if s.cycles_enabled and not any(bool(x) for x in s.cycles_enabled):
+            return "invalid", "All cycles are disabled. Enable at least one cycle."
+        ok, msg = self._validate_sample_cycle_numbers(s)
+        if not ok:
+            return "invalid", msg
+        return "valid", "Cycle configuration is valid."
+
+    def _cycle_config_snapshot(self, s: BatchSample) -> tuple:
+        return (
+            list(s.cycles or []) if s.cycles is not None else None,
+            list(s.registration_markers or []) if s.registration_markers is not None else None,
+            [list(x) for x in (s.channel_markers or [])] if s.channel_markers is not None else None,
+            [list(x) for x in (s.channel_antibodies or [])] if s.channel_antibodies is not None else None,
+            list(s.cycles_enabled or []) if s.cycles_enabled is not None else None,
+        )
+
+    def _restore_cycle_config_snapshot(self, s: BatchSample, snapshot: tuple) -> None:
+        cycles, reg, chm, cha, enableds = snapshot
+        s.cycles = cycles
+        s.registration_markers = reg
+        s.channel_markers = chm
+        s.channel_antibodies = cha
+        s.cycles_enabled = enableds
+
     def _apply_cfg_to_sample(self, s: BatchSample, cfg: dict, preserve_paths: bool = False) -> None:
         # Update global metadata from the dialog/plan.
         try:
@@ -690,15 +775,33 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.channel_markers = chm
             s.channel_antibodies = cha
             s.cycles_enabled = enableds
+            ok, msg = self._validate_sample_cycle_numbers(s)
+            if not ok:
+                raise ValueError(msg)
 
     def _apply_template_to_all(self) -> None:
         if not self._template_cfg:
             show_warning("No template configured yet. Use 'Configure cycles…' first.")
             return
+        copied = 0
+        skipped: list[str] = []
         for s in self._samples:
-            self._apply_cfg_to_sample(s, self._template_cfg, preserve_paths=True)
+            snapshot = self._cycle_config_snapshot(s)
+            try:
+                self._apply_cfg_to_sample(s, self._template_cfg, preserve_paths=True)
+                copied += 1
+            except Exception as e:
+                self._restore_cycle_config_snapshot(s, snapshot)
+                skipped.append(f"{s.name}: {e}")
         self._refresh_table()
-        self._set_status("Copied cycle configuration to all samples (preserved sample input/output paths).")
+        if skipped:
+            print("Cycle configuration copy skipped invalid sample(s):", flush=True)
+            for item in skipped:
+                print(f"  - {item}", flush=True)
+            show_warning(f"Copied config to {copied} sample(s); skipped {len(skipped)} invalid sample(s). See status/console for details.")
+            self._set_status(f"Copied config to {copied} sample(s); skipped {len(skipped)} invalid sample(s).")
+        else:
+            self._set_status(f"Copied cycle configuration to {copied} sample(s) (preserved sample input/output paths).")
         self._update_action_buttons()
 
     # -------------------- Plan I/O --------------------
@@ -802,6 +905,11 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.channel_markers = list(rec.get("channel_markers") or []) or None
             s.channel_antibodies = list(rec.get("channel_antibodies") or []) or None
             s.cycles_enabled = list(rec.get("cycles_enabled") or []) or None
+            ok, msg = self._validate_sample_cycle_numbers(s)
+            if not ok:
+                show_warning(msg)
+                self._set_status(f"Invalid loaded plan: {msg}")
+                return
             samples.append(s)
 
         self._samples = samples
@@ -825,9 +933,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             try:
                 it_run = self.tbl.item(r, 0)
                 s.enabled = (it_run.checkState() == QtCore.Qt.Checked) if it_run else True
-                s.tissue = (self.tbl.item(r, 3).text() if self.tbl.item(r, 3) else "").strip()
-                s.species = (self.tbl.item(r, 4).text() if self.tbl.item(r, 4) else "").strip()
-                op_name = Path((self.tbl.item(r, 5).text() if self.tbl.item(r, 5) else "").strip()).name
+                s.tissue = (self.tbl.item(r, 4).text() if self.tbl.item(r, 4) else "").strip()
+                s.species = (self.tbl.item(r, 5).text() if self.tbl.item(r, 5) else "").strip()
+                op_name = Path((self.tbl.item(r, 6).text() if self.tbl.item(r, 6) else "").strip()).name
                 out_dir = Path(self.txt_outdir.text().strip() or "").expanduser() if self.txt_outdir.text().strip() else None
                 s.output_path = ((out_dir / op_name) if (out_dir and op_name) else None)
             except Exception:
@@ -848,6 +956,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 return False, f"Sample '{s.name}' missing per-cycle configuration. Use 'Configure cycles…' and optionally 'Copy to all'."
             if s.cycles_enabled and not any(bool(x) for x in s.cycles_enabled):
                 return False, f"Sample '{s.name}' has all cycles disabled. Enable at least one cycle."
+            ok, msg = self._validate_sample_cycle_numbers(s)
+            if not ok:
+                return False, msg
         return True, ""
 
     def _run_batch(self) -> None:
@@ -879,7 +990,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             failures: list[dict] = []
             for si, s in enumerate(enabled, start=1):
                 if self._cancel_requested:
-                    raise RuntimeError("Cancelled")
+                    return {"reports": reports, "failures": failures, "cancelled": True}
 
                 # sample-level progress
                 self.sig_set_sample_progress.emit(int(si - 1), int(n_samp))
@@ -889,20 +1000,30 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
                 # Build CycleInput list
                 cycles_in: list[CycleInput] = []
-                for i, p in enumerate(s.files):
-                    if s.cycles_enabled and i < len(s.cycles_enabled) and (not bool(s.cycles_enabled[i])):
-                        continue
-                    cycles_in.append(
-                        CycleInput(
-                            path=str(p),
-                            cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
-                            tissue=(s.tissue or None),
-                            species=(s.species or None),
-                            registration_marker=(s.registration_markers[i] if s.registration_markers and i < len(s.registration_markers) else None),
-                            channel_markers=(s.channel_markers[i] if s.channel_markers and i < len(s.channel_markers) else None),
-                            channel_antibodies=(s.channel_antibodies[i] if s.channel_antibodies and i < len(s.channel_antibodies) else None),
+                try:
+                    ok, msg = self._validate_sample_cycle_numbers(s)
+                    if not ok:
+                        raise ValueError(msg)
+                    for i, p in enumerate(s.files):
+                        if s.cycles_enabled and i < len(s.cycles_enabled) and (not bool(s.cycles_enabled[i])):
+                            continue
+                        cycles_in.append(
+                            CycleInput(
+                                path=str(p),
+                                cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
+                                tissue=(s.tissue or None),
+                                species=(s.species or None),
+                                registration_marker=(s.registration_markers[i] if s.registration_markers and i < len(s.registration_markers) else None),
+                                channel_markers=(s.channel_markers[i] if s.channel_markers and i < len(s.channel_markers) else None),
+                                channel_antibodies=(s.channel_antibodies[i] if s.channel_antibodies and i < len(s.channel_antibodies) else None),
+                            )
                         )
-                    )
+                except Exception as e:
+                    failures.append({"sample_name": str(s.name), "error": str(e)})
+                    self.sig_set_status.emit(f"[{si}/{n_samp}] {s.name}: failed: {e}")
+                    self.sig_set_sample_progress.emit(int(si), int(n_samp))
+                    self.sig_set_sample_label.emit(f"Samples: {si}/{n_samp}")
+                    continue
 
                 # Reset per-sample cycle progress before starting.
                 sample_total = 1 + max(0, len(cycles_in) - 1) * 4 + len(cycles_in) + (1 if bool(getattr(s, 'pyramidal_output', False)) else 0)
@@ -973,13 +1094,39 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         cancel_cb=lambda: bool(self._cancel_requested),
                         low_mem=True,
                     )
-                    rep["sample_name"] = s.name
-                    reports.append(rep)
+                    reports.append(
+                        {
+                            "sample_name": str(s.name),
+                            "output_path": str(rep.get("output_path") or out_path),
+                            "pyramidal_output_path": rep.get("pyramidal_output_path"),
+                            "canvas_yx": tuple(rep.get("canvas_shape_yx") or ()),
+                            "n_cycles": int(rep.get("n_cycles") or len(cycles_in)),
+                            "n_channels_total": int(rep.get("n_channels_total") or 0),
+                            "cycle_global_shifts": dict(rep.get("cycle_global_shifts") or {}),
+                            "inputs": [
+                                {"path": str(c.path), "cycle": int(c.cycle)}
+                                for c in cycles_in
+                            ],
+                        }
+                    )
                 except Exception as e:
                     if self._cancel_requested:
-                        raise
+                        return {"reports": reports, "failures": failures, "cancelled": True}
                     failures.append({"sample_name": str(s.name), "error": str(e)})
                     self.sig_set_status.emit(f"[{si}/{n_samp}] {s.name}: failed: {e}")
+                finally:
+                    try:
+                        del cycles_in
+                    except Exception:
+                        pass
+                    try:
+                        del rep
+                    except Exception:
+                        pass
+                    try:
+                        gc.collect()
+                    except Exception:
+                        pass
 
                 self.sig_set_sample_progress.emit(int(si), int(n_samp))
                 self.sig_set_sample_label.emit(f"Samples: {si}/{n_samp}")
@@ -994,6 +1141,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             result = result or {}
             reports = list(result.get("reports") or [])
             failures = list(result.get("failures") or [])
+            cancelled = bool(result.get("cancelled", False))
             self._reports = reports  # type: ignore[attr-defined]
             self._failures = failures  # type: ignore[attr-defined]
             self._set_running_ui(False)
@@ -1004,8 +1152,11 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             self.prog_samples.setValue(self.prog_samples.maximum())
             self.prog_cycles.setValue(0)
             self.lbl_sample_progress.setText(f"Samples: {len(reports) + len(failures)}/{n_samp}")
-            self.lbl_cycle_progress.setText("Current sample: complete")
-            if failures:
+            self.lbl_cycle_progress.setText("Current sample: cancelled" if cancelled else "Current sample: complete")
+            if cancelled:
+                self._set_status("Batch cancelled.")
+                show_info("Batch cancelled.")
+            elif failures:
                 print("Batch preprocess completed with failed sample(s):", flush=True)
                 for fail in failures:
                     try:

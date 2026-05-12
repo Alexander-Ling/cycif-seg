@@ -108,15 +108,15 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        self.scroll = QtWidgets.QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        root.addWidget(self.scroll, 1)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tbl_registration = QtWidgets.QTableWidget()
+        self.tbl_channels = QtWidgets.QTableWidget()
+        self.tabs.addTab(self.tbl_registration, "Registration")
+        self.tabs.addTab(self.tbl_channels, "Channel names")
+        root.addWidget(self.tabs, 1)
 
-        inner = QtWidgets.QWidget()
-        self.scroll.setWidget(inner)
-        self.inner_layout = QtWidgets.QVBoxLayout(inner)
-
-        self._build_cycle_panels()
+        self._build_cycle_tables()
+        self.tbl_registration.itemChanged.connect(self._on_registration_item_changed)
 
         # Output path
         out_row = QtWidgets.QHBoxLayout()
@@ -151,7 +151,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         if out_path:
             self.txt_output.setText(out_path)
 
-    def _build_cycle_panels(self):
+    def _build_cycle_tables(self):
         # Build a mapping from filename (or full path) -> prior per-cycle config.
         init_cycles = list((self._initial_cfg.get("cycles") or []) if isinstance(self._initial_cfg, dict) else [])
         init_by_name: dict[str, dict] = {}
@@ -165,7 +165,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             except Exception:
                 continue
 
-        # Load channel names for each file and create UI group.
+        # Load channel names for each file and create table rows.
         self._cycles.clear()
         for i, p in enumerate(self._paths, start=1):
             cached = self._channel_name_cache.get(p)
@@ -224,68 +224,165 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             )
             self._cycles.append(cfg)
 
-            gb = QtWidgets.QGroupBox(f"Cycle {cycle_idx}")
-            gb_layout = QtWidgets.QVBoxLayout(gb)
+        self._populate_registration_table()
+        self._populate_channel_table()
 
-            gb_layout.addWidget(QtWidgets.QLabel(str(p)))
+    def _readonly_item(self, text: str) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(str(text))
+        item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+        return item
 
-            use_row = QtWidgets.QHBoxLayout()
-            chk_use = QtWidgets.QCheckBox("Use this cycle")
-            chk_use.setChecked(bool(cfg.enabled))
-            chk_use.setToolTip("Uncheck to skip this cycle during merge/registration (it will not be included in the output).")
-            use_row.addWidget(chk_use)
-            use_row.addStretch(1)
-            gb_layout.addLayout(use_row)
+    def _populate_registration_table(self) -> None:
+        tbl = self.tbl_registration
+        try:
+            tbl.blockSignals(True)
+        except Exception:
+            pass
+        tbl.setColumnCount(5)
+        tbl.setHorizontalHeaderLabels([
+            "Use",
+            "Cycle #",
+            "File",
+            "Registration channel",
+            "Available channels",
+        ])
+        tbl.setRowCount(len(self._cycles))
+        tbl.verticalHeader().setVisible(False)
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
+        tbl.horizontalHeader().setStretchLastSection(True)
 
-            # Allow manual cycle numbering (users often load files out of order).
-            cyc_row = QtWidgets.QHBoxLayout()
-            cyc_row.addWidget(QtWidgets.QLabel("Cycle number:"))
-            sp_cy = QtWidgets.QSpinBox()
-            sp_cy.setMinimum(0)
-            sp_cy.setMaximum(999)
-            sp_cy.setValue(int(cycle_idx))
-            sp_cy.setToolTip(
-                "Cycle index used in output channel naming (e.g., <marker>_cy<cycle>). Must be unique. Cycle 0 is allowed."
-            )
-            cyc_row.addWidget(sp_cy)
-            cyc_row.addStretch(1)
-            gb_layout.addLayout(cyc_row)
+        for r, cfg in enumerate(self._cycles):
+            use_item = QtWidgets.QTableWidgetItem("")
+            use_item.setFlags(use_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            use_item.setCheckState(QtCore.Qt.Checked if cfg.enabled else QtCore.Qt.Unchecked)
+            use_item.setToolTip("Uncheck to skip this cycle during merge/registration.")
+            tbl.setItem(r, 0, use_item)
 
-            reg_row = QtWidgets.QHBoxLayout()
-            reg_row.addWidget(QtWidgets.QLabel("Registration channel:"))
-            cmb = QtWidgets.QComboBox()
-            cmb.addItems(ch)
-            if reg_default in ch:
-                cmb.setCurrentText(reg_default)
-            reg_row.addWidget(cmb, 1)
-            gb_layout.addLayout(reg_row)
+            cy_item = QtWidgets.QTableWidgetItem(str(int(cfg.cycle)))
+            cy_item.setToolTip("Cycle index used in output channel naming. Must be unique among enabled cycles.")
+            tbl.setItem(r, 1, cy_item)
 
-            tbl = QtWidgets.QTableWidget()
-            tbl.setColumnCount(3)
-            tbl.setHorizontalHeaderLabels(["Original channel", "Marker name", "Antibody (optional)"])
-            tbl.setRowCount(len(ch))
-            tbl.horizontalHeader().setStretchLastSection(True)
-            tbl.verticalHeader().setVisible(False)
-            tbl.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.AdjustToContents)
-            tbl.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
+            file_item = self._readonly_item(Path(cfg.path).name)
+            file_item.setToolTip(str(cfg.path))
+            tbl.setItem(r, 2, file_item)
 
-            for r, nm in enumerate(ch):
-                item0 = QtWidgets.QTableWidgetItem(nm)
-                item0.setFlags(item0.flags() & ~QtCore.Qt.ItemIsEditable)
-                tbl.setItem(r, 0, item0)
-                tbl.setItem(r, 1, QtWidgets.QTableWidgetItem((cfg.marker_names[r] if r < len(cfg.marker_names) else (nm or "")).strip()))
-                tbl.setItem(r, 2, QtWidgets.QTableWidgetItem((cfg.antibody_names[r] if r < len(cfg.antibody_names) else "").strip()))
+            reg_item = QtWidgets.QTableWidgetItem(str(cfg.registration_channel or ""))
+            reg_item.setToolTip("Type the exact channel name to use for registration. See Available channels or the Channel names tab.")
+            tbl.setItem(r, 3, reg_item)
 
-            gb_layout.addWidget(tbl)
+            avail_item = self._readonly_item(", ".join(cfg.channel_names))
+            avail_item.setToolTip("\n".join(cfg.channel_names))
+            tbl.setItem(r, 4, avail_item)
 
-            # Store widgets for later readout
-            gb._cycif_enabled_chk = chk_use  # type: ignore[attr-defined]
-            gb._cycif_cycle_spin = sp_cy  # type: ignore[attr-defined]
-            gb._cycif_reg_combo = cmb  # type: ignore[attr-defined]
-            gb._cycif_table = tbl  # type: ignore[attr-defined]
-            self.inner_layout.addWidget(gb)
+        try:
+            tbl.resizeColumnsToContents()
+        except Exception:
+            pass
+        try:
+            tbl.blockSignals(False)
+        except Exception:
+            pass
 
-        self.inner_layout.addStretch(1)
+    def _populate_channel_table(self) -> None:
+        tbl = self.tbl_channels
+        try:
+            tbl.blockSignals(True)
+        except Exception:
+            pass
+        rows = sum(len(cfg.channel_names) for cfg in self._cycles)
+        tbl.setColumnCount(6)
+        tbl.setHorizontalHeaderLabels([
+            "Cycle #",
+            "File",
+            "Channel #",
+            "Original channel",
+            "Marker name",
+            "Antibody (optional)",
+        ])
+        tbl.setRowCount(rows)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        tbl.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
+        tbl.horizontalHeader().setStretchLastSection(True)
+
+        row = 0
+        for cycle_idx, cfg in enumerate(self._cycles):
+            for ch_idx, nm in enumerate(cfg.channel_names):
+                cy_item = self._readonly_item(str(int(cfg.cycle)))
+                cy_item.setData(QtCore.Qt.UserRole, int(cycle_idx))
+                tbl.setItem(row, 0, cy_item)
+
+                file_item = self._readonly_item(Path(cfg.path).name)
+                file_item.setToolTip(str(cfg.path))
+                tbl.setItem(row, 1, file_item)
+
+                tbl.setItem(row, 2, self._readonly_item(str(int(ch_idx))))
+                tbl.setItem(row, 3, self._readonly_item(str(nm)))
+                tbl.setItem(row, 4, QtWidgets.QTableWidgetItem((cfg.marker_names[ch_idx] if ch_idx < len(cfg.marker_names) else (nm or "")).strip()))
+                tbl.setItem(row, 5, QtWidgets.QTableWidgetItem((cfg.antibody_names[ch_idx] if ch_idx < len(cfg.antibody_names) else "").strip()))
+                row += 1
+
+        try:
+            tbl.resizeColumnsToContents()
+        except Exception:
+            pass
+        try:
+            tbl.blockSignals(False)
+        except Exception:
+            pass
+
+    def _on_registration_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        try:
+            if int(item.column()) != 1:
+                return
+            cycle_idx = int(item.row())
+            cycle_text = str(item.text()).strip()
+            for r in range(self.tbl_channels.rowCount()):
+                cy_item = self.tbl_channels.item(r, 0)
+                if cy_item is not None and int(cy_item.data(QtCore.Qt.UserRole)) == cycle_idx:
+                    cy_item.setText(cycle_text)
+        except Exception:
+            return
+
+    def _registration_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        tbl = self.tbl_registration
+        for r, cfg in enumerate(self._cycles):
+            use_item = tbl.item(r, 0)
+            cy_item = tbl.item(r, 1)
+            reg_item = tbl.item(r, 3)
+            enabled = (use_item.checkState() == QtCore.Qt.Checked) if use_item is not None else True
+            try:
+                cy = int((cy_item.text() if cy_item else "").strip())
+            except Exception:
+                raise ValueError(f"Invalid cycle number for {Path(cfg.path).name}. Cycle numbers must be integers.")
+            if cy < 0:
+                raise ValueError(f"Invalid cycle number for {Path(cfg.path).name}: {cy}. Cycle numbers must be >= 0.")
+            reg = (reg_item.text() if reg_item else "").strip()
+            rows.append({"enabled": bool(enabled), "cycle": int(cy), "registration_marker": reg})
+        return rows
+
+    def _channel_rows_by_cycle_index(self) -> dict[int, tuple[list[str], list[str]]]:
+        out: dict[int, tuple[list[str], list[str]]] = {
+            i: ([""] * len(cfg.channel_names), [""] * len(cfg.channel_names))
+            for i, cfg in enumerate(self._cycles)
+        }
+        tbl = self.tbl_channels
+        counters: dict[int, int] = {}
+        for r in range(tbl.rowCount()):
+            cy_item = tbl.item(r, 0)
+            if cy_item is None:
+                continue
+            idx = int(cy_item.data(QtCore.Qt.UserRole))
+            pos = int(counters.get(idx, 0))
+            counters[idx] = pos + 1
+            markers, antibodies = out[idx]
+            if pos >= len(markers):
+                continue
+            markers[pos] = (tbl.item(r, 4).text() if tbl.item(r, 4) else "").strip()
+            antibodies[pos] = (tbl.item(r, 5).text() if tbl.item(r, 5) else "").strip()
+        return out
 
     def get_result(self) -> dict:
         """Return a dict with tissue/species/output + per-cycle config."""
@@ -304,49 +401,36 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
 
         cycles_out: list[dict] = []
         seen_cycles: set[int] = set()
-        # Iterate groupboxes in the scroll area
-        for idx in range(self.inner_layout.count()):
-            w = self.inner_layout.itemAt(idx).widget()
-            if not isinstance(w, QtWidgets.QGroupBox):
-                continue
-            chk_use = getattr(w, "_cycif_enabled_chk", None)
-            sp_cy = getattr(w, "_cycif_cycle_spin", None)
-            cmb = getattr(w, "_cycif_reg_combo", None)
-            tbl = getattr(w, "_cycif_table", None)
-            if chk_use is None or sp_cy is None or cmb is None or tbl is None:
-                continue
-
-            cy = int(sp_cy.value())
-            enabled = bool(chk_use.isChecked())
+        reg_rows = self._registration_rows()
+        channel_rows = self._channel_rows_by_cycle_index()
+        for idx, cfg in enumerate(self._cycles):
+            rr = reg_rows[idx]
+            cy = int(rr["cycle"])
+            enabled = bool(rr["enabled"])
             if enabled:
                 if cy in seen_cycles:
                     raise ValueError(f"Duplicate cycle number: {cy}. Cycle numbers must be unique among enabled cycles.")
                 seen_cycles.add(cy)
+            reg_marker = str(rr["registration_marker"] or "").strip()
+            if enabled:
+                if not reg_marker:
+                    raise ValueError(f"Registration channel is required for enabled cycle {cy}.")
+                valid_channels = {str(v).strip().lower() for v in cfg.channel_names}
+                if reg_marker.lower() not in valid_channels:
+                    raise ValueError(
+                        f"Registration channel {reg_marker!r} is not present in cycle {cy} ({Path(cfg.path).name})."
+                    )
 
-            # Find original config by groupbox order (stable) instead of cycle number.
-            # Users can edit the cycle number, so the mapping must not depend on it.
-            # The groupbox order mirrors self._paths/self._cycles.
-            gb_idx = len(cycles_out)
-            cfg = self._cycles[gb_idx] if gb_idx < len(self._cycles) else None
-            if cfg is None:
-                raise ValueError("Internal error: cycle config mismatch")
-
-            markers: list[str] = []
-            antibodies: list[str] = []
-            for r in range(tbl.rowCount()):
-                m = (tbl.item(r, 1).text() if tbl.item(r, 1) else "").strip()
-                a = (tbl.item(r, 2).text() if tbl.item(r, 2) else "").strip()
-                markers.append(m)
-                antibodies.append(a)
+            markers, antibodies = channel_rows.get(idx, ([], []))
 
             cycles_out.append(
                 {
                     "path": cfg.path,
                     "cycle": int(cy),
                     "enabled": bool(enabled),
-                    "registration_marker": str(cmb.currentText()).strip(),
-                    "channel_markers": markers,
-                    "channel_antibodies": antibodies,
+                    "registration_marker": reg_marker,
+                    "channel_markers": list(markers),
+                    "channel_antibodies": list(antibodies),
                 }
             )
 

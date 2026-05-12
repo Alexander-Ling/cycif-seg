@@ -507,9 +507,21 @@ class IncrementalOmeBigTiffWriter:
             pass
 
     def close(self) -> None:
-        self.flush()
+        mm = getattr(self, "_mm", None)
+        try:
+            self.flush()
+        except Exception:
+            pass
+        try:
+            _close_memmap(mm if isinstance(mm, np.memmap) else None)
+        except Exception:
+            pass
         try:
             del self._mm
+        except Exception:
+            pass
+        try:
+            gc.collect()
         except Exception:
             pass
 
@@ -1141,14 +1153,18 @@ def load_single_channel_tiff_native(path: str, channel_index: int) -> np.ndarray
             if len(shape) == 3 and ((axes and axes.endswith("C")) or (not axes and shape[2] == int(c))):
                 arr = series.asarray() if series is not None else tf.asarray()
                 arr = np.asarray(arr)
-                return arr[..., idx]
+                plane = np.asarray(arr[..., idx]).copy()
+                del arr
+                return plane
         except Exception:
             pass
 
     # Conservative fallback for unusual layouts.
     arr = tifffile.imread(path)
     arr = _normalize_to_yxc(arr)
-    return np.asarray(arr[..., idx])
+    plane = np.asarray(arr[..., idx]).copy()
+    del arr
+    return plane
 
 
 class LazyChannelImage:
@@ -1232,8 +1248,32 @@ def load_channel_names_only_fast(path: str) -> list[str]:
     if not ome_xml:
         return []
 
-    names = list(_channel_names_from_ome_all(ome_xml) or [])
-    n_channels = _channel_count_from_ome(ome_xml)
+    names: list[str] = []
+    n_channels: int | None = None
+    try:
+        root = ET.fromstring(ome_xml)
+
+        def _strip(tag: str) -> str:
+            return tag.split("}", 1)[-1]
+
+        pixels = None
+        for el in root.iter():
+            if _strip(el.tag) == "Pixels":
+                pixels = el
+                try:
+                    size_c = pixels.attrib.get("SizeC")
+                    n_channels = int(size_c) if size_c is not None else None
+                except Exception:
+                    n_channels = None
+                break
+
+        scope = pixels.iter() if pixels is not None else root.iter()
+        for el in scope:
+            if _strip(el.tag) == "Channel":
+                names.append(str(el.attrib.get("Name") or "").strip())
+    except Exception:
+        names = []
+        n_channels = None
 
     if n_channels is None:
         return [nm for nm in names if nm]
