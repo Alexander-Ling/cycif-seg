@@ -738,7 +738,7 @@ def _refine_region_transforms(
         _check_cancel(cancel_cb)
 
         _progress(
-            f"6. Refining position of individual foreground island {i}/{total}...",
+            f"6. Registering Cycle {cycle}: refining foreground island {i}/{total}...",
             progress_cb=progress_cb,
             progress_event_cb=progress_event_cb,
             phase="region_refine",
@@ -896,7 +896,7 @@ def merge_cycles_to_ome_tiff(
     tiled_rigid_allow_rotation: bool = False,
     tiled_rigid_tile_size: int = 2000,
     tiled_rigid_search_factor: float = 3,
-    fast_large_island_refinement: bool = True,
+    fast_large_island_refinement: bool = False,
     fast_large_island_sample_count: int = 5,
     upsample_factor: int = 10,
     low_mem: bool = False,
@@ -957,10 +957,15 @@ def merge_cycles_to_ome_tiff(
         raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
 
     merged_names: list[str] = []
+    channel_offsets: dict[int, int] = {}
     seen: dict[str, int] = {}
-    for ci, _, _ in infos:
+    out_c = 0
+    for ci, shp, _ in infos:
+        channel_offsets[int(ci.cycle)] = out_c
         ch_names = load_channel_names_only(ci.path)
-        for j, nm in enumerate(ch_names):
+        n_ch = int(shp[2])
+        for j in range(n_ch):
+            nm = ch_names[j] if j < len(ch_names) else ""
             markers = ci.channel_markers or []
             marker = (markers[j] if j < len(markers) else "").strip()
             base = marker or (nm or "").strip() or "Channel"
@@ -969,6 +974,7 @@ def merge_cycles_to_ome_tiff(
             out_nm = f"{stem}_{k+1}" if k else stem
             seen[stem] = k + 1
             merged_names.append(out_nm)
+            out_c += 1
 
     ref_names = load_channel_names_only(ref_ci.path)
     ref_marker = ref_ci.registration_marker or default_registration_marker
@@ -978,17 +984,12 @@ def merge_cycles_to_ome_tiff(
     ref_plane_native = load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx))
     ref_yx = _pad_plane_to_canvas(ref_plane_native, canvas_yx, out_dtype=np.float32)
     ref_reg = _normalized_for_registration(ref_yx)
+    del ref_plane_native, ref_yx
     ref_pixel_sizes = load_physical_pixel_sizes(ref_ci.path)
 
     shifts: dict[int, tuple[float, float]] = {int(ref_ci.cycle): (0.0, 0.0)}
     island_counts: dict[int, int] = {int(ref_ci.cycle): 1}
-    region_transforms: dict[int, list[_RegionTransform]] = {int(ref_ci.cycle): []}
-    dense_fields: dict[int, tuple[np.ndarray, np.ndarray]] = {
-        int(ref_ci.cycle): (
-            np.zeros(canvas_yx, dtype=np.float32),
-            np.zeros(canvas_yx, dtype=np.float32),
-        )
-    }
+    cycle_region_shift_summaries: dict[int, list[dict]] = {int(ref_ci.cycle): []}
 
     moving_infos = [item for item in infos if int(item[0].cycle) != int(reference_cycle)]
     total_ch = int(total_input_ch)
@@ -996,7 +997,7 @@ def merge_cycles_to_ome_tiff(
     tick = 0
 
     _progress(
-        f"1. Loading Cycle {int(ref_ci.cycle)}...",
+        f"1. Loading reference Cycle {int(ref_ci.cycle)}...",
         progress_cb=progress_cb,
         progress_event_cb=progress_event_cb,
         phase="load_ref",
@@ -1007,109 +1008,6 @@ def merge_cycles_to_ome_tiff(
     tick += 1
 
     region_search_radius = max(8, int(round(max(1, tiled_rigid_tile_size) * max(1.0, float(tiled_rigid_search_factor)) / 4.0)))
-    for ci, _shp, _dt in moving_infos:
-        _check_cancel(cancel_cb)
-        cycle = int(ci.cycle)
-        marker = ci.registration_marker or default_registration_marker
-        names = load_channel_names_only(ci.path)
-        ch_idx = _find_channel_index(names, marker)
-        if ch_idx is None:
-            raise ValueError(f"Could not find registration marker {marker!r} in cycle {cycle}")
-
-        _progress(
-            f"2. Loading Cycle {cycle}...",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="load_cycle",
-            idx=tick,
-            n=total_ticks,
-            cycle=cycle,
-        )
-        mov_native = load_single_channel_tiff_native(ci.path, int(ch_idx))
-        mov_yx = _pad_plane_to_canvas(mov_native, canvas_yx, out_dtype=np.float32)
-        mov_reg = _normalized_for_registration(mov_yx)
-        tick += 1
-
-        _progress(
-            "3. Calculating initial transform...",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="global_registration",
-            idx=tick,
-            n=total_ticks,
-            cycle=cycle,
-        )
-        dy, dx = estimate_translation(ref_reg, mov_reg, downsample=max(1, int(downsample_for_registration)), upsample_factor=upsample_factor)
-        shifts[cycle] = (float(dy), float(dx))
-        tick += 1
-
-        _progress(
-            "4. Generating foreground mask...",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="foreground_mask",
-            idx=tick,
-            n=total_ticks,
-            cycle=cycle,
-        )
-        moving_fg = _foreground_mask(mov_reg)
-        moved_mask = _apply_translation(moving_fg.astype(np.float32), dy, dx, order=0) > 0.5
-
-        _progress(
-            "5. Finding regions of connected foreground...",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="identify_islands",
-            idx=tick,
-            n=total_ticks,
-            cycle=cycle,
-        )
-        islands = _identify_foreground_islands(moved_mask, max(100, int(tiled_rigid_tile_size)), solid=True)
-        n_islands = int(np.max(islands))
-        island_counts[cycle] = n_islands
-        _progress(
-            f"5. Finding regions of connected foreground... identified {n_islands} foreground island(s)",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="identify_islands",
-            idx=tick,
-            n=total_ticks,
-            cycle=cycle,
-        )
-        tick += 1
-
-        regs = _refine_region_transforms(
-            ref_reg,
-            mov_reg,
-            islands,
-            (dy, dx),
-            search_radius=region_search_radius,
-            downsample=max(1, int(downsample_for_registration)),
-            penalty_lambda=0.0,
-            fast_large_island_refinement=bool(fast_large_island_refinement),
-            fast_large_island_sample_count=max(1, int(fast_large_island_sample_count)),
-            fast_large_island_cell_size=max(128, int(tiled_rigid_tile_size)),
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            cancel_cb=cancel_cb,
-            cycle=cycle,
-        )
-        region_transforms[cycle] = list(regs)
-        _progress(
-            "6. Foreground island refinement complete.",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="foreground_island_refine",
-            idx=tick,
-            n=total_ticks,
-            cycle=cycle,
-        )
-
-        # Keep non-candidate pixels at the global shift; only selected foreground
-        # island regions receive their accepted local shift.
-        dense_fields[cycle] = _piecewise_shift_field(canvas_yx, region_transforms[cycle], (dy, dx))
-        tick += 1
-
     out_path = str(output_path)
     with IncrementalOmeBigTiffWriter(
         out_path,
@@ -1118,23 +1016,153 @@ def merge_cycles_to_ome_tiff(
         merged_names,
         physical_pixel_sizes=ref_pixel_sizes,
     ) as writer:
-        out_c = 0
-        for ci, shp, _dt in infos:
+        def _write_cycle_channels(
+            ci: CycleInput,
+            shp: tuple[int, int, int],
+            field_yx: tuple[np.ndarray, np.ndarray] | None,
+        ) -> None:
             _check_cancel(cancel_cb)
             cycle = int(ci.cycle)
-            field_y, field_x = dense_fields[cycle]
+            out_c0 = int(channel_offsets[cycle])
             n_ch = int(shp[2])
             for ch in range(n_ch):
                 plane_native = load_single_channel_tiff_native(ci.path, int(ch))
                 plane = _pad_plane_to_canvas(plane_native, canvas_yx, out_dtype=np.float32)
-                if cycle == int(reference_cycle):
+                del plane_native
+                if field_yx is None:
                     reg_plane = plane
                 else:
+                    field_y, field_x = field_yx
                     reg_plane = _warp_plane_by_field(plane, field_y, field_x, order=1)
-                writer.write_channel(out_c, _cast_preserve_dtype(reg_plane, base_dtype))
-                out_c += 1
+                writer.write_channel(out_c0 + ch, _cast_preserve_dtype(reg_plane, base_dtype))
+                del plane, reg_plane
+
+        ref_info = next((item for item in infos if int(item[0].cycle) == int(reference_cycle)), None)
+        if ref_info is None:
+            raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
+        ref_ci_write, ref_shp, _ref_dt = ref_info
+        _progress(
+            f"7. Writing registered channels for Cycle {int(reference_cycle)}...",
+            progress_cb=progress_cb,
+            progress_event_cb=progress_event_cb,
+            phase="write_cycle",
+            idx=tick,
+            n=total_ticks,
+            cycle=int(reference_cycle),
+        )
+        _write_cycle_channels(ref_ci_write, ref_shp, None)
+        tick += 1
+
+        for ci, shp, _dt in moving_infos:
+            _check_cancel(cancel_cb)
+            cycle = int(ci.cycle)
+            marker = ci.registration_marker or default_registration_marker
+            names = load_channel_names_only(ci.path)
+            ch_idx = _find_channel_index(names, marker)
+            if ch_idx is None:
+                raise ValueError(f"Could not find registration marker {marker!r} in cycle {cycle}")
+
             _progress(
-                f"9. Writing registered channels for Cycle {cycle}...",
+                f"2. Loading Cycle {cycle}...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="load_cycle",
+                idx=tick,
+                n=total_ticks,
+                cycle=cycle,
+            )
+            mov_native = load_single_channel_tiff_native(ci.path, int(ch_idx))
+            mov_yx = _pad_plane_to_canvas(mov_native, canvas_yx, out_dtype=np.float32)
+            mov_reg = _normalized_for_registration(mov_yx)
+            del mov_native, mov_yx
+            tick += 1
+
+            _progress(
+                f"3. Registering Cycle {cycle}: calculating global translation...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="global_registration",
+                idx=tick,
+                n=total_ticks,
+                cycle=cycle,
+            )
+            dy, dx = estimate_translation(ref_reg, mov_reg, downsample=max(1, int(downsample_for_registration)), upsample_factor=upsample_factor)
+            shifts[cycle] = (float(dy), float(dx))
+            tick += 1
+
+            _progress(
+                f"4. Registering Cycle {cycle}: generating foreground mask...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="foreground_mask",
+                idx=tick,
+                n=total_ticks,
+                cycle=cycle,
+            )
+            moving_fg = _foreground_mask(mov_reg)
+            moved_mask = _apply_translation(moving_fg.astype(np.float32), dy, dx, order=0) > 0.5
+            del moving_fg
+
+            _progress(
+                f"5. Registering Cycle {cycle}: finding foreground islands...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="identify_islands",
+                idx=tick,
+                n=total_ticks,
+                cycle=cycle,
+            )
+            islands = _identify_foreground_islands(moved_mask, max(100, int(tiled_rigid_tile_size)), solid=True)
+            del moved_mask
+            n_islands = int(np.max(islands))
+            island_counts[cycle] = n_islands
+            tick += 1
+
+            _progress(
+                f"6. Registering Cycle {cycle}: refining foreground islands...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="foreground_island_refine",
+                idx=tick,
+                n=total_ticks,
+                cycle=cycle,
+            )
+            regs = _refine_region_transforms(
+                ref_reg,
+                mov_reg,
+                islands,
+                (dy, dx),
+                search_radius=region_search_radius,
+                downsample=max(1, int(downsample_for_registration)),
+                penalty_lambda=0.0,
+                fast_large_island_refinement=bool(fast_large_island_refinement),
+                fast_large_island_sample_count=max(1, int(fast_large_island_sample_count)),
+                fast_large_island_cell_size=max(128, int(tiled_rigid_tile_size)),
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                cancel_cb=cancel_cb,
+                cycle=cycle,
+            )
+            regs = list(regs)
+            cycle_region_shift_summaries[cycle] = [
+                {
+                    "label": int(r.label),
+                    "shift_y": float(r.shift_y),
+                    "shift_x": float(r.shift_x),
+                    "pixels": int(r.pixels),
+                    "bbox": tuple(int(v) for v in r.bbox),
+                }
+                for r in regs
+            ]
+
+            # Keep non-candidate pixels at the global shift; only selected foreground
+            # island regions receive their accepted local shift.
+            field_yx = _piecewise_shift_field(canvas_yx, regs, (dy, dx))
+            del islands, regs, mov_reg
+            tick += 1
+
+            _progress(
+                f"7. Writing registered channels for Cycle {cycle}...",
                 progress_cb=progress_cb,
                 progress_event_cb=progress_event_cb,
                 phase="write_cycle",
@@ -1142,6 +1170,8 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
+            _write_cycle_channels(ci, shp, field_yx)
+            del field_yx
             tick += 1
     pyramid_output_path: str | None = None
     if pyramidal_output:
@@ -1152,7 +1182,7 @@ def merge_cycles_to_ome_tiff(
 
         def _pyr_progress(msg: str) -> None:
             _progress(
-                f"9. Building pyramidal OME-TIFF: {msg}",
+                f"8. Building pyramidal OME-TIFF: {msg}",
                 progress_cb=progress_cb,
                 progress_event_cb=progress_event_cb,
                 phase="pyramid",
@@ -1181,19 +1211,7 @@ def merge_cycles_to_ome_tiff(
         "n_channels_total": int(total_ch),
         "cycle_global_shifts": {int(k): (float(v[0]), float(v[1])) for k, v in shifts.items()},
         "cycle_island_counts": {int(k): int(v) for k, v in island_counts.items()},
-        "cycle_region_shifts": {
-            int(k): [
-                {
-                    "label": int(r.label),
-                    "shift_y": float(r.shift_y),
-                    "shift_x": float(r.shift_x),
-                    "pixels": int(r.pixels),
-                    "bbox": tuple(int(v) for v in r.bbox),
-                }
-                for r in regs
-            ]
-            for k, regs in region_transforms.items()
-        },
+        "cycle_region_shifts": cycle_region_shift_summaries,
         "input_pyramid_info": input_pyramid_info,
         "registration_algorithm": "global_translation_plus_foreground_island_refinement",
         "fast_large_island_refinement": bool(fast_large_island_refinement),

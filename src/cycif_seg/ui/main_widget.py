@@ -393,9 +393,11 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
         self.set_status("Merging/registering cycles (background)…")
         self.prog.setVisible(True)
-        # Determinate progress: 0..(N cycles + 1 write step). Progress ticks happen after each cycle completes and after the output is written.
+        # Determinate progress mirrors merge_cycles_to_ome_tiff:
+        # load reference, four registration ticks per moving cycle, one write tick per cycle, optional pyramid tick.
         try:
-            self.prog.setRange(0, max(1, len(cycles) + 1))
+            n_steps = 1 + max(0, len(cycles) - 1) * 4 + len(cycles) + (1 if bool(cfg.get("pyramidal_output", False)) else 0)
+            self.prog.setRange(0, max(1, int(n_steps)))
             self.prog.setValue(0)
         except Exception:
             self.prog.setRange(0, 0)
@@ -445,7 +447,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 tiled_rigid_allow_rotation=bool(cfg.get("tiled_rigid_allow_rotation") or False),
                 tiled_rigid_tile_size=max(128, int(cfg.get("tiled_rigid_tile_size") or 2000)),
                 tiled_rigid_search_factor=max(1.0, float(cfg.get("tiled_rigid_search_factor") or 3.0)),
-                fast_large_island_refinement=bool(cfg.get("fast_large_island_refinement", True)),
+                fast_large_island_refinement=False,
                 fast_large_island_sample_count=max(1, int(cfg.get("fast_large_island_sample_count") or 5)),
                 pyramidal_output=bool(cfg.get("pyramidal_output") or False),
                 progress_cb=_progress,

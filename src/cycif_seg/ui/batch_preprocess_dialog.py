@@ -19,7 +19,7 @@ PLAN_SCHEMA_VERSION = 1
 
 default_tiled_rigid_tile_size: int = 2000
 default_tiled_rigid_search_factor: float = 3.0
-default_fast_large_island_refinement: bool = True
+default_fast_large_island_refinement: bool = False
 default_fast_large_island_sample_count: int = 5
 
 def _parse_cycle_number_from_filename(name: str) -> int | None:
@@ -627,7 +627,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "tiled_rigid_allow_rotation": bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
                 "tiled_rigid_tile_size": int(getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size),
                 "tiled_rigid_search_factor": float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor),
-                "fast_large_island_refinement": bool(getattr(s, 'fast_large_island_refinement', default_fast_large_island_refinement)),
+                "fast_large_island_refinement": False,
                 "fast_large_island_sample_count": int(getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count),
                 "pyramidal_output": bool(getattr(s, 'pyramidal_output', True)),
                 "cycles": cycles_out,
@@ -653,7 +653,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.tiled_rigid_allow_rotation = bool(cfg.get('tiled_rigid_allow_rotation') if cfg.get('tiled_rigid_allow_rotation') is not None else getattr(s, 'tiled_rigid_allow_rotation', False))
             s.tiled_rigid_tile_size = max(128, int(cfg.get('tiled_rigid_tile_size') if cfg.get('tiled_rigid_tile_size') is not None else getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size))
             s.tiled_rigid_search_factor = max(1.0, float(cfg.get('tiled_rigid_search_factor') if cfg.get('tiled_rigid_search_factor') is not None else getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor))
-            s.fast_large_island_refinement = bool(cfg.get('fast_large_island_refinement') if cfg.get('fast_large_island_refinement') is not None else getattr(s, 'fast_large_island_refinement', default_fast_large_island_refinement))
+            s.fast_large_island_refinement = False
             s.fast_large_island_sample_count = max(1, int(cfg.get('fast_large_island_sample_count') if cfg.get('fast_large_island_sample_count') is not None else getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count))
             s.pyramidal_output = bool(cfg.get('pyramidal_output') if cfg.get('pyramidal_output') is not None else getattr(s, 'pyramidal_output', True))
         except Exception:
@@ -742,7 +742,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "tiled_rigid_allow_rotation": bool(getattr(s, "tiled_rigid_allow_rotation", False)),
                 "tiled_rigid_tile_size": int(getattr(s, "tiled_rigid_tile_size", default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size),
                 "tiled_rigid_search_factor": float(getattr(s, "tiled_rigid_search_factor", default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor),
-                "fast_large_island_refinement": bool(getattr(s, "fast_large_island_refinement", default_fast_large_island_refinement)),
+                "fast_large_island_refinement": False,
                 "fast_large_island_sample_count": int(getattr(s, "fast_large_island_sample_count", default_fast_large_island_sample_count) or default_fast_large_island_sample_count),
                 "pyramidal_output": bool(getattr(s, "pyramidal_output", True)),
             }
@@ -794,7 +794,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.tiled_rigid_allow_rotation = bool(rec.get("tiled_rigid_allow_rotation", False))
             s.tiled_rigid_tile_size = max(128, int(rec.get("tiled_rigid_tile_size", defs.get("tiled_rigid_tile_size", default_tiled_rigid_tile_size)) or default_tiled_rigid_tile_size))
             s.tiled_rigid_search_factor = max(1.0, float(rec.get("tiled_rigid_search_factor", defs.get("tiled_rigid_search_factor", default_tiled_rigid_search_factor)) or default_tiled_rigid_search_factor))
-            s.fast_large_island_refinement = bool(rec.get("fast_large_island_refinement", defs.get("fast_large_island_refinement", default_fast_large_island_refinement)))
+            s.fast_large_island_refinement = False
             s.fast_large_island_sample_count = max(1, int(rec.get("fast_large_island_sample_count", defs.get("fast_large_island_sample_count", default_fast_large_island_sample_count)) or default_fast_large_island_sample_count))
             s.pyramidal_output = bool(rec.get("pyramidal_output", True))
             s.cycles = list(rec.get("cycles") or []) or None
@@ -913,6 +913,23 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     pass
 
                 # UI hooks
+                def _progress_label(ev: dict, idx: int, n: int) -> str:
+                    phase = str(ev.get("phase") or "")
+                    cycle = ev.get("cycle")
+                    cycle_txt = f"Cycle {int(cycle)}" if cycle is not None else "cycle"
+                    action_by_phase = {
+                        "load_ref": f"loading reference {cycle_txt}",
+                        "load_cycle": f"loading {cycle_txt}",
+                        "global_registration": f"registering {cycle_txt}: global translation",
+                        "foreground_mask": f"registering {cycle_txt}: foreground mask",
+                        "identify_islands": f"registering {cycle_txt}: foreground islands",
+                        "foreground_island_refine": f"registering {cycle_txt}: island refinement",
+                        "write_cycle": f"writing {cycle_txt}",
+                        "pyramid": "building pyramid",
+                    }
+                    action = action_by_phase.get(phase, "working")
+                    return f"Current sample: {s.name} - {action} ({max(0, min(int(idx), int(n)))}/{int(n)})"
+
                 def _ev(ev: dict) -> None:
                     try:
                         n = int(ev.get("n") or 0)
@@ -936,7 +953,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     }
                     if n > 0 and phase in top_level_phases:
                         self.sig_set_cycle_progress.emit(int(idx), int(n))
-                        self.sig_set_cycle_label.emit(f"Current sample: {s.name} ({max(0, min(int(idx), int(n)))}/{int(n)})")
+                        self.sig_set_cycle_label.emit(_progress_label(ev, idx, n))
 
                 # Run merge
                 try:
@@ -949,7 +966,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         tiled_rigid_allow_rotation=bool(getattr(s, 'tiled_rigid_allow_rotation', False)),
                         tiled_rigid_tile_size=max(128, int(getattr(s, 'tiled_rigid_tile_size', default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size)),
                         tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
-                        fast_large_island_refinement=bool(getattr(s, 'fast_large_island_refinement', default_fast_large_island_refinement)),
+                        fast_large_island_refinement=False,
                         fast_large_island_sample_count=max(1, int(getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count)),
                         pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
                         progress_event_cb=_ev,

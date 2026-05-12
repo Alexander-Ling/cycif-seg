@@ -74,14 +74,12 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         refine_form.addRow("Foreground island size (px):", self.spn_tile_size)
         refine_form.addRow("Local search factor:", self.spn_search_factor)
         self.chk_fast_large_island = QtWidgets.QCheckBox("Use fast large-island refinement")
-        self.chk_fast_large_island.setChecked(True)
+        self.chk_fast_large_island.setChecked(False)
         self.chk_fast_large_island.setToolTip("For large foreground islands, register a small set of spread-out full-resolution tiles and apply their median shift to the whole island.")
         self.spn_fast_sample_count = QtWidgets.QSpinBox()
         self.spn_fast_sample_count.setRange(1, 100)
         self.spn_fast_sample_count.setValue(5)
         self.spn_fast_sample_count.setToolTip("Number of full-resolution sample tiles to register per large foreground island when fast mode is enabled.")
-        refine_form.addRow(self.chk_fast_large_island)
-        refine_form.addRow("Sample tiles per large island:", self.spn_fast_sample_count)
         root.addLayout(refine_form)
         try:
             if isinstance(self._initial_cfg, dict):
@@ -95,12 +93,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                     v_sf = self._initial_cfg.get("search_factor")
                 if v_sf is not None:
                     self.spn_search_factor.setValue(max(1.0, float(v_sf)))
-                v_fast = self._initial_cfg.get("fast_large_island_refinement")
-                if v_fast is not None:
-                    self.chk_fast_large_island.setChecked(bool(v_fast))
-                v_n = self._initial_cfg.get("fast_large_island_sample_count")
-                if v_n is not None:
-                    self.spn_fast_sample_count.setValue(max(1, int(v_n)))
         except Exception:
             pass
 
@@ -305,8 +297,8 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         tiled_allow_rotation = False
         tiled_tile_size = int(getattr(self, 'spn_tile_size', None).value() if getattr(self, 'spn_tile_size', None) is not None else 2000)
         tiled_search_factor = float(getattr(self, 'spn_search_factor', None).value() if getattr(self, 'spn_search_factor', None) is not None else 3.0)
-        fast_large_island = bool(getattr(self, 'chk_fast_large_island', None) and self.chk_fast_large_island.isChecked())
-        fast_sample_count = int(getattr(self, 'spn_fast_sample_count', None).value() if getattr(self, 'spn_fast_sample_count', None) is not None else 5)
+        fast_large_island = False
+        fast_sample_count = 5
         if not out_path:
             raise ValueError("Output path is required")
 
