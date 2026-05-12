@@ -180,7 +180,7 @@ def _downsample_image(img: np.ndarray, factor: int) -> np.ndarray:
 
 
 def _normalized_for_registration(img: np.ndarray) -> np.ndarray:
-    arr = np.asarray(img, dtype=np.float32)
+    arr = np.array(img, dtype=np.float32)  # always copy so in-place ops below don't alias caller's data
     if arr.size == 0:
         return arr
     lo = float(np.percentile(arr, 1.0))
@@ -191,9 +191,10 @@ def _normalized_for_registration(img: np.ndarray) -> np.ndarray:
         hi = float(np.max(arr))
     if hi <= lo:
         hi = lo + 1.0
-    arr = np.clip(arr, lo, hi)
-    arr = (arr - lo) / (hi - lo)
-    return arr.astype(np.float32, copy=False)
+    np.clip(arr, lo, hi, out=arr)
+    arr -= lo
+    arr /= (hi - lo)
+    return arr
 
 
 def estimate_translation(
@@ -331,6 +332,93 @@ def _combine_component_masks(masks: list[np.ndarray]) -> np.ndarray:
         lab += 1
         final[m] = lab
     return final
+
+def _tile_component_sets(
+    mask: np.ndarray,
+    tile_hw: tuple[int, int],
+    offset_yx: tuple[int, int],
+) -> list[list[tuple[int, int, int, int]]]:
+    """Like _tile_component_masks but returns tile-bbox lists instead of full-canvas bool arrays."""
+    Y, X = mask.shape
+    tile_h = max(1, int(tile_hw[0]))
+    tile_w = max(1, int(tile_hw[1]))
+    off_y = int(offset_yx[0])
+    off_x = int(offset_yx[1])
+    y_starts = list(range(off_y, Y, tile_h))
+    x_starts = list(range(off_x, X, tile_w))
+    if not y_starts:
+        y_starts = [0]
+    if not x_starts:
+        x_starts = [0]
+    active = np.zeros((len(y_starts), len(x_starts)), dtype=bool)
+    bboxes: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    for r, y0 in enumerate(y_starts):
+        y1 = min(Y, y0 + tile_h)
+        for c, x0 in enumerate(x_starts):
+            x1 = min(X, x0 + tile_w)
+            tile = mask[y0:y1, x0:x1]
+            fg_frac = float(tile.mean()) if tile.size else 0.0
+            if fg_frac > 0.005:
+                active[r, c] = True
+                bboxes[(r, c)] = (y0, y1, x0, x1)
+    if not active.any():
+        return []
+    labs = sk_label(active, connectivity=1)
+    comps: list[list[tuple[int, int, int, int]]] = []
+    for lab in range(1, int(labs.max()) + 1):
+        rr, cc = np.where(labs == lab)
+        tiles = [bboxes[(int(r), int(c))] for r, c in zip(rr.tolist(), cc.tolist())]
+        comps.append(tiles)
+    return comps
+
+
+def _combine_tile_sets_to_label_image(
+    comps: list[list[tuple[int, int, int, int]]],
+    shape: tuple[int, int],
+) -> np.ndarray:
+    """Merge overlapping tile-set components via union-find and write directly to a label image.
+
+    No full-canvas bool masks are allocated — only the final int32 output.
+    """
+    n = len(comps)
+    uf = _UnionFind(n)
+    bounds: list[tuple[int, int, int, int]] = []
+    for tiles in comps:
+        bounds.append((
+            min(t[0] for t in tiles),
+            max(t[1] for t in tiles),
+            min(t[2] for t in tiles),
+            max(t[3] for t in tiles),
+        ))
+    for i in range(n):
+        bi = bounds[i]
+        for j in range(i + 1, n):
+            bj = bounds[j]
+            if bi[0] >= bj[1] or bi[1] <= bj[0] or bi[2] >= bj[3] or bi[3] <= bj[2]:
+                continue
+            merged = False
+            for ta in comps[i]:
+                if merged:
+                    break
+                for tb in comps[j]:
+                    if ta[0] < tb[1] and ta[1] > tb[0] and ta[2] < tb[3] and ta[3] > tb[2]:
+                        uf.union(i, j)
+                        merged = True
+                        break
+    Y, X = int(shape[0]), int(shape[1])
+    result = np.zeros((Y, X), dtype=np.int32)
+    root_to_label: dict[int, int] = {}
+    lab = 0
+    for i, tiles in enumerate(comps):
+        r = uf.find(i)
+        if r not in root_to_label:
+            lab += 1
+            root_to_label[r] = lab
+        lbl = root_to_label[r]
+        for y0, y1, x0, x1 in tiles:
+            result[y0:y1, x0:x1] = lbl
+    return result
+
 
 def _extract_translated_crop(
     moving: np.ndarray,
@@ -470,8 +558,16 @@ def _refine_bad_regions(
 def _identify_foreground_islands(mask: np.ndarray, tile_size: int, *, solid: bool = False) -> np.ndarray:
     half = max(100, int(round(float(tile_size) / 2.0)))
     tile_hw = (half, half)
-    comps_a = _tile_component_masks(mask, tile_hw, (0, 0), solid=solid)
-    comps_b = _tile_component_masks(mask, tile_hw, (half // 2, half // 2), solid=solid)
+    if solid:
+        # Efficient path: components are tile-bbox lists — no full-canvas bool masks allocated.
+        comps_a = _tile_component_sets(mask, tile_hw, (0, 0))
+        comps_b = _tile_component_sets(mask, tile_hw, (half // 2, half // 2))
+        all_comps = comps_a + comps_b
+        if not all_comps:
+            return np.zeros_like(mask, dtype=np.int32)
+        return _combine_tile_sets_to_label_image(all_comps, mask.shape)
+    comps_a = _tile_component_masks(mask, tile_hw, (0, 0), solid=False)
+    comps_b = _tile_component_masks(mask, tile_hw, (half // 2, half // 2), solid=False)
     all_comps = comps_a + comps_b
     if not all_comps:
         return np.zeros_like(mask, dtype=np.int32)
@@ -612,7 +708,6 @@ def _sample_tile_registration_worker(
 def _estimate_sampled_region_shift(
     fixed_n: np.ndarray,
     moving_n: np.ndarray,
-    moving_base_n: np.ndarray,
     region_mask: np.ndarray,
     base_shift: tuple[float, float],
     *,
@@ -633,7 +728,7 @@ def _estimate_sampled_region_shift(
     tasks = []
     for y0, y1, x0, x1 in selected:
         fixed_crop = fixed_n[y0:y1, x0:x1]
-        moving_base_crop = moving_base_n[y0:y1, x0:x1]
+        moving_base_crop = _extract_translated_crop(moving_n, (y0, y1, x0, x1), base_dy, base_dx, order=1)
         mask_crop = _score_mask_for_crop(region_mask[y0:y1, x0:x1])
         py0 = max(0, int(y0) - buffer_pad)
         py1 = min(int(moving_n.shape[0]), int(y1) + buffer_pad)
@@ -730,9 +825,8 @@ def _refine_region_transforms(
     base_dy, base_dx = float(base_shift[0]), float(base_shift[1])
     labs = [int(v) for v in np.unique(island_labels) if int(v) > 0]
     total = len(labs)
-    fixed_n = _normalized_for_registration(fixed_yx)
-    moving_n = _normalized_for_registration(moving_yx)
-    moving_base_n = _apply_translation(moving_n, base_dy, base_dx, order=1)
+    fixed_n = fixed_yx
+    moving_n = moving_yx
     for i, lab in enumerate(labs, start=1):
         _check_cancel(cancel_cb)
 
@@ -753,7 +847,6 @@ def _refine_region_transforms(
             sampled_shift = _estimate_sampled_region_shift(
                 fixed_n,
                 moving_n,
-                moving_base_n,
                 region_mask,
                 (base_dy, base_dx),
                 cell_size=max(128, int(fast_large_island_cell_size)),
@@ -775,7 +868,7 @@ def _refine_region_transforms(
         bbox = _bbox_from_mask(region_mask, pad=max(16, int(search_radius)))
         y0, y1, x0, x1 = bbox
         fixed_crop = fixed_n[y0:y1, x0:x1]
-        moving_base_crop = moving_base_n[y0:y1, x0:x1]
+        moving_base_crop = _extract_translated_crop(moving_n, bbox, base_dy, base_dx, order=1)
         mask_crop = region_mask[y0:y1, x0:x1]
 
         base_score = _masked_corr_score(fixed_crop, moving_base_crop, mask_crop)
@@ -1061,7 +1154,7 @@ def merge_cycles_to_ome_tiff(
         _write_cycle_channels(ref_ci_write, ref_shp, None)
         tick += 1
 
-        for ci, shp, _dt in moving_infos:
+        for _i_moving, (ci, shp, _dt) in enumerate(moving_infos):
             _check_cancel(cancel_cb)
             cycle = int(ci.cycle)
             marker = ci.registration_marker or default_registration_marker
@@ -1167,6 +1260,8 @@ def merge_cycles_to_ome_tiff(
             # island regions receive their accepted local shift.
             field_yx = _piecewise_shift_field(canvas_yx, islands, regs, (dy, dx))
             del islands, regs, mov_reg
+            if _i_moving == len(moving_infos) - 1:
+                del ref_reg
             tick += 1
 
             _progress(
@@ -1187,6 +1282,9 @@ def merge_cycles_to_ome_tiff(
             tick += 1
     try:
         del ref_reg
+    except NameError:
+        pass
+    try:
         gc.collect()
     except Exception:
         pass
