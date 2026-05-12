@@ -108,6 +108,43 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+        # Strip-based RAM-efficient processing
+        self.chk_low_mem = QtWidgets.QCheckBox("RAM-efficient strip processing")
+        self.chk_low_mem.setChecked(True)
+        self.chk_low_mem.setToolTip(
+            "Process the image in horizontal strips to reduce RAM usage.\n"
+            "Recommended for large files (>10 GB per cycle).\n"
+            "Uses downsampled images for registration and writes channel data strip by strip."
+        )
+        root.addWidget(self.chk_low_mem)
+
+        strip_form = QtWidgets.QFormLayout()
+        self.spn_strip_height = QtWidgets.QSpinBox()
+        self.spn_strip_height.setRange(0, 200000)
+        self.spn_strip_height.setSingleStep(1000)
+        self.spn_strip_height.setValue(0)
+        self.spn_strip_height.setSpecialValueText("Auto")
+        self.spn_strip_height.setToolTip(
+            "Height of each processing strip in pixels.\n"
+            "\"Auto\" (0): canvas height ÷ 10, minimum 1000 rows.\n"
+            "Set a specific value to override the automatic choice."
+        )
+        self.spn_strip_height.setEnabled(self.chk_low_mem.isChecked())
+        self.chk_low_mem.toggled.connect(self.spn_strip_height.setEnabled)
+        strip_form.addRow("Strip height (px):", self.spn_strip_height)
+        root.addLayout(strip_form)
+
+        try:
+            if isinstance(self._initial_cfg, dict):
+                vlm = self._initial_cfg.get("low_mem")
+                if vlm is not None:
+                    self.chk_low_mem.setChecked(bool(vlm))
+                vsh = self._initial_cfg.get("strip_height")
+                if vsh is not None:
+                    self.spn_strip_height.setValue(max(0, int(vsh)))
+        except Exception:
+            pass
+
         self.tabs = QtWidgets.QTabWidget()
         self.tbl_registration = QtWidgets.QTableWidget()
         self.tbl_channels = QtWidgets.QTableWidget()
@@ -446,5 +483,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "fast_large_island_refinement": bool(fast_large_island),
             "fast_large_island_sample_count": int(fast_sample_count),
             "pyramidal_output": bool(self.chk_pyramidal_output.isChecked()),
+            "low_mem": bool(self.chk_low_mem.isChecked()),
+            "strip_height": int(self.spn_strip_height.value()) if self.spn_strip_height.value() > 0 else None,
             "cycles": cycles_out,
         }

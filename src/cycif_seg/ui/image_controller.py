@@ -8,7 +8,14 @@ from qtpy import QtCore, QtWidgets
 from napari.qt.threading import thread_worker
 from napari.utils.notifications import show_warning, show_info
 
-from cycif_seg.io.ome_tiff import LazyChannelImage, inspect_tiff_yxc, load_single_channel_tiff_native
+from cycif_seg.io.ome_tiff import (
+    LazyChannelImage,
+    inspect_tiff_yxc,
+    is_tiff_loading_debug,
+    load_channel_downsampled,
+    load_channel_multiscale_lazy,
+    load_single_channel_tiff_native,
+)
 
 
 class ImageController:
@@ -20,6 +27,45 @@ class ImageController:
 
     def __init__(self, w):
         self.w = w
+
+    # --------------------------
+    # Multiscale / contrast helpers
+    # --------------------------
+
+    @staticmethod
+    def _contrast_limits_from_thumbnail(path: str, channel_index: int, dtype) -> tuple[float, float] | None:
+        """Return (lo, hi) contrast limits from a tiny downsampled thumbnail.
+
+        Uses the smallest available pyramid level (or a 16× block-average downsample
+        for non-pyramidal files) to compute 1st/99th percentiles without loading the
+        full-resolution channel.  Returns None if the thumbnail load fails so callers
+        can fall back to dtype-range limits.
+        """
+        try:
+            thumb = load_channel_downsampled(path, channel_index, factor=16)
+            if thumb is not None and thumb.size > 0:
+                lo = float(np.percentile(thumb, 1.0))
+                hi = float(np.percentile(thumb, 99.0))
+                if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+                    return (lo, hi)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _dtype_contrast_limits(dtype) -> tuple[float, float]:
+        """Fallback contrast limits from the dtype range."""
+        try:
+            if np.issubdtype(np.dtype(dtype), np.integer):
+                info = np.iinfo(np.dtype(dtype))
+                return (float(info.min), float(info.max))
+        except Exception:
+            pass
+        return (0.0, 1.0)
+
+    def _get_contrast_limits(self, path: str, channel_index: int, dtype) -> tuple[float, float]:
+        lims = self._contrast_limits_from_thumbnail(path, channel_index, dtype)
+        return lims if lims is not None else self._dtype_contrast_limits(dtype)
 
     # --------------------------
     # Channel selection utilities
@@ -120,17 +166,44 @@ class ImageController:
                     pass
 
         # Add missing selected layers
+        _want_multiscale = bool(getattr(w, "chk_multiscale", None) and w.chk_multiscale.isChecked())
         for i in indices:
             nm = w.ch_names[i]
             if nm not in w.viewer.layers:
-                w.viewer.add_image(
-                    w.img[..., i],
-                    name=nm,
-                    blending="additive",
-                    opacity=0.6,
-                    gamma=0.3,
-                    colormap=w._colormap_for_channel(i),
-                )
+                _levels = load_channel_multiscale_lazy(w.img.path, i) if _want_multiscale else None
+                if _levels is not None:
+                    if is_tiff_loading_debug():
+                        print(
+                            f"[viewer ch={i}] multiscale path: {len(_levels)} level(s), "
+                            f"shapes={[tuple(l.shape) for l in _levels]}",
+                            flush=True,
+                        )
+                    # Pass explicit contrast limits so napari does not materialise the
+                    # full dask array to compute statistics.
+                    _clims = self._get_contrast_limits(w.img.path, i, w.img.dtype)
+                    if is_tiff_loading_debug():
+                        print(f"[viewer ch={i}] contrast_limits={_clims}", flush=True)
+                    w.viewer.add_image(
+                        _levels,
+                        name=nm,
+                        multiscale=(len(_levels) > 1),
+                        contrast_limits=_clims,
+                        blending="additive",
+                        opacity=0.6,
+                        gamma=0.3,
+                        colormap=w._colormap_for_channel(i),
+                    )
+                else:
+                    if is_tiff_loading_debug():
+                        print(f"[viewer ch={i}] fallback to numpy (multiscale unavailable)", flush=True)
+                    w.viewer.add_image(
+                        w.img[..., i],
+                        name=nm,
+                        blending="additive",
+                        opacity=0.6,
+                        gamma=0.3,
+                        colormap=w._colormap_for_channel(i),
+                    )
                 try:
                     w._connect_layer_dirty(w.viewer.layers[nm])
                 except Exception:
@@ -220,6 +293,58 @@ class ImageController:
         if not to_add:
             _finish()
             return
+
+        # Fast path for pyramidal files: dask array creation is near-instant so
+        # we can add all new channels synchronously without a background worker.
+        _want_multiscale = bool(getattr(w, "chk_multiscale", None) and w.chk_multiscale.isChecked())
+        _img_path = getattr(w.img, "path", None) if w.img else None
+        _probe = load_channel_multiscale_lazy(_img_path, 0) if (_want_multiscale and _img_path) else None
+        _multiscale_ok = bool(_probe is not None)
+        if is_tiff_loading_debug():
+            print(f"[viewer incremental] want_multiscale={_want_multiscale} ok={_multiscale_ok}, adding channels={to_add}", flush=True)
+
+        if _multiscale_ok and _img_path:
+            for i in to_add:
+                nm = w.ch_names[i]
+                _levels = load_channel_multiscale_lazy(_img_path, i)
+                if _levels is None:
+                    _multiscale_ok = False
+                    break
+                # Explicit contrast limits to prevent napari from materialising the
+                # full dask array when computing display statistics.
+                _clims = self._get_contrast_limits(_img_path, i, w.img.dtype)
+                try:
+                    if nm in w.viewer.layers:
+                        w.viewer.layers[nm].data = _levels
+                        try:
+                            w.viewer.layers[nm].multiscale = len(_levels) > 1
+                            w.viewer.layers[nm].contrast_limits = _clims
+                        except Exception:
+                            pass
+                        w.viewer.layers[nm].visible = True
+                    else:
+                        w.viewer.add_image(
+                            _levels,
+                            name=nm,
+                            multiscale=(len(_levels) > 1),
+                            contrast_limits=_clims,
+                            blending="additive",
+                            opacity=0.6,
+                            gamma=0.3,
+                            colormap=w._colormap_for_channel(i),
+                        )
+                        try:
+                            w._connect_layer_dirty(w.viewer.layers[nm])
+                        except Exception:
+                            pass
+                except Exception:
+                    _multiscale_ok = False
+                    break
+                _bump_progress()
+            if _multiscale_ok:
+                _finish()
+                return
+            # If something went wrong mid-loop, fall through to worker-based path
 
         @thread_worker
         def _load_planes_worker(path, load_indices):

@@ -29,6 +29,8 @@ from cycif_seg.io.ome_tiff import (
     inspect_tiff_pyramid,
     inspect_tiff_yxc,
     load_channel_names_only,
+    load_channel_downsampled,
+    load_channel_strip,
     load_physical_pixel_sizes,
     load_single_channel_tiff_native,
     convert_flat_ome_to_pyramidal,
@@ -38,6 +40,19 @@ from cycif_seg.io.ome_tiff import (
 _STEP1_DEBUG = str(os.environ.get("CYCIF_SEG_STEP1_DEBUG", "0")).strip().lower() not in {
     "0", "false", "no", "off", ""
 }
+
+# UI-toggled debug flag for batch preprocessing (Settings panel checkbox).
+_debug_preprocess: bool = False
+
+
+def set_preprocess_debug(enabled: bool) -> None:
+    """Enable or disable verbose console output for preprocessing operations."""
+    global _debug_preprocess
+    _debug_preprocess = bool(enabled)
+
+
+def is_preprocess_debug() -> bool:
+    return _debug_preprocess
 
 
 def _dbg(msg: str) -> None:
@@ -985,6 +1000,79 @@ def _warp_plane_by_field(plane_yx: np.ndarray, field_y: np.ndarray, field_x: np.
     return out
 
 
+def _build_strip_shift_field(
+    out_y0: int,
+    out_y1: int,
+    canvas_x: int,
+    regs: list[_RegionTransform],
+    base_dy: float,
+    base_dx: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a (strip_H, canvas_x) shift field for output rows [out_y0:out_y1].
+
+    Uses only the compact list of _RegionTransform objects — no full-canvas arrays.
+    Background pixels (not covered by any region bbox) get the global shift.
+    """
+    strip_H = out_y1 - out_y0
+    field_y = np.full((strip_H, canvas_x), float(base_dy), dtype=np.float32)
+    field_x = np.full((strip_H, canvas_x), float(base_dx), dtype=np.float32)
+    for reg in regs:
+        ry0, ry1, rx0, rx1 = reg.bbox
+        local_y0 = max(0, ry0 - out_y0)
+        local_y1 = min(strip_H, ry1 - out_y0)
+        rx0_c = max(0, rx0)
+        rx1_c = min(canvas_x, rx1)
+        if local_y0 >= local_y1 or rx0_c >= rx1_c:
+            continue
+        field_y[local_y0:local_y1, rx0_c:rx1_c] = float(reg.shift_y)
+        field_x[local_y0:local_y1, rx0_c:rx1_c] = float(reg.shift_x)
+    return field_y, field_x
+
+
+def _warp_strip_by_field(
+    src_canvas_strip: np.ndarray,
+    out_y0: int,
+    strip_H: int,
+    src_canvas_y0: int,
+    field_y: np.ndarray,
+    field_x: np.ndarray,
+    *,
+    order: int,
+) -> np.ndarray:
+    """Warp output rows [out_y0 : out_y0+strip_H] using src_canvas_strip as source.
+
+    src_canvas_strip covers canvas rows [src_canvas_y0 : src_canvas_y0+src_H].
+    field_y/field_x are shaped (strip_H, canvas_X) for the output strip.
+    """
+    arr = np.asarray(src_canvas_strip, dtype=np.float32)
+    X = arr.shape[1]
+    out = np.empty((strip_H, X), dtype=np.float32)
+    gy = np.arange(out_y0, out_y0 + strip_H, dtype=np.float32)
+    gx = np.arange(X, dtype=np.float32)
+    _CHUNK = 512
+    for j0 in range(0, strip_H, _CHUNK):
+        j1 = min(strip_H, j0 + _CHUNK)
+        # Canvas Y coordinates for the output rows, shifted by field → source canvas row
+        # Convert to src_canvas_strip-local index by subtracting src_canvas_y0
+        src_y = (gy[j0:j1, np.newaxis] - field_y[j0:j1] - float(src_canvas_y0)).ravel()
+        src_x = (gx[np.newaxis, :] - field_x[j0:j1]).ravel()
+        out[j0:j1] = map_coordinates(
+            arr, [src_y, src_x], order=order, mode='constant', cval=0.0, prefilter=(order > 1)
+        ).reshape(j1 - j0, X)
+    return out
+
+
+def _scale_region_transform(r: _RegionTransform, D: int) -> _RegionTransform:
+    """Scale a _RegionTransform from downsampled to full-resolution coordinates."""
+    return _RegionTransform(
+        label=r.label,
+        bbox=(r.bbox[0] * D, r.bbox[1] * D, r.bbox[2] * D, r.bbox[3] * D),
+        shift_y=r.shift_y * float(D),
+        shift_x=r.shift_x * float(D),
+        pixels=r.pixels * D * D,
+    )
+
+
 def merge_cycles_to_ome_tiff(
     cycles: Iterable[CycleInput],
     output_path: str,
@@ -1001,6 +1089,7 @@ def merge_cycles_to_ome_tiff(
     fast_large_island_sample_count: int = 5,
     upsample_factor: int = 10,
     low_mem: bool = False,
+    strip_height: int | None = None,
     pyramidal_output: bool = False,
     pyramidal_tile_size: int = 512,
     pyramidal_compression: str | int | None = "zlib",
@@ -1053,6 +1142,32 @@ def merge_cycles_to_ome_tiff(
 
     assert base_dtype is not None
     canvas_yx = (int(canvas_y), int(canvas_x))
+
+    # Strip-mode setup: activate when low_mem=True or strip_height is explicitly set.
+    D = max(1, int(downsample_for_registration))
+    _strip_h: int | None = strip_height
+    if _strip_h is None and low_mem:
+        _strip_h = max(1000, canvas_yx[0] // 10)
+    _strip_mode = _strip_h is not None and _strip_h > 0
+    # Downsampled canvas dimensions used during strip-mode registration
+    _ds_canvas_yx = (max(1, canvas_yx[0] // D), max(1, canvas_yx[1] // D)) if _strip_mode else canvas_yx
+
+    if _debug_preprocess:
+        if _strip_mode:
+            _n_strips = (canvas_yx[0] + _strip_h - 1) // _strip_h
+            print(
+                f"[preprocess] strip_mode=ON  strip_height={_strip_h} px  "
+                f"canvas={canvas_yx[0]}×{canvas_yx[1]}  strips_per_cycle={_n_strips}  "
+                f"reg_downsample={D}×  ds_canvas={_ds_canvas_yx[0]}×{_ds_canvas_yx[1]}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[preprocess] strip_mode=OFF  low_mem={low_mem}  "
+                f"canvas={canvas_yx[0]}×{canvas_yx[1]}",
+                flush=True,
+            )
+
     ref_ci = next((ci for ci, _, _ in infos if int(ci.cycle) == int(reference_cycle)), None)
     if ref_ci is None:
         raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
@@ -1082,10 +1197,16 @@ def merge_cycles_to_ome_tiff(
     ref_ch_idx = _find_channel_index(ref_names, ref_marker)
     if ref_ch_idx is None:
         raise ValueError(f"Could not find registration marker {ref_marker!r} in reference cycle {int(ref_ci.cycle)}")
-    ref_plane_native = load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx))
-    ref_yx = _pad_plane_to_canvas(ref_plane_native, canvas_yx, out_dtype=np.float32)
-    ref_reg = _normalized_for_registration(ref_yx)
-    del ref_plane_native, ref_yx
+    if _strip_mode:
+        _ref_ds = load_channel_downsampled(ref_ci.path, int(ref_ch_idx), D)
+        _ref_yx_ds = _pad_plane_to_canvas(_ref_ds.astype(np.float32), _ds_canvas_yx, out_dtype=np.float32)
+        ref_reg = _normalized_for_registration(_ref_yx_ds)
+        del _ref_ds, _ref_yx_ds
+    else:
+        ref_plane_native = load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx))
+        ref_yx = _pad_plane_to_canvas(ref_plane_native, canvas_yx, out_dtype=np.float32)
+        ref_reg = _normalized_for_registration(ref_yx)
+        del ref_plane_native, ref_yx
     ref_pixel_sizes = load_physical_pixel_sizes(ref_ci.path)
 
     shifts: dict[int, tuple[float, float]] = {int(ref_ci.cycle): (0.0, 0.0)}
@@ -1138,6 +1259,109 @@ def merge_cycles_to_ome_tiff(
                 writer.write_channel(out_c0 + ch, _cast_preserve_dtype(reg_plane, base_dtype))
                 del plane, reg_plane
 
+        def _write_cycle_channels_strip(
+            ci: CycleInput,
+            shp: tuple[int, int, int],
+            regs_fullres: list[_RegionTransform] | None,
+            base_dy: float,
+            base_dx: float,
+        ) -> None:
+            """Strip-based writer: processes the canvas in horizontal bands to minimise RAM."""
+            _check_cancel(cancel_cb)
+            cycle = int(ci.cycle)
+            out_c0 = int(channel_offsets[cycle])
+            n_ch = int(shp[2])
+            source_H, source_W = int(shp[0]), int(shp[1])
+            canvas_H, canvas_W = int(canvas_yx[0]), int(canvas_yx[1])
+
+            # Canvas placement (same logic as _pad_plane_to_canvas)
+            canvas_pad_y0 = max((canvas_H - source_H) // 2, 0)
+            canvas_pad_x0 = max((canvas_W - source_W) // 2, 0)
+            in_y0 = max((source_H - canvas_H) // 2, 0)
+            in_x0 = max((source_W - canvas_W) // 2, 0)
+            ys = min(source_H - in_y0, canvas_H - canvas_pad_y0)
+            xs = min(source_W - in_x0, canvas_W - canvas_pad_x0)
+
+            # Shift padding: ensure we load enough source rows for the largest shift
+            shift_pad = 4
+            if regs_fullres:
+                shift_pad = max(shift_pad,
+                    int(np.ceil(max(max(abs(r.shift_y), abs(r.shift_x)) for r in regs_fullres))) + 4)
+            shift_pad = max(shift_pad, int(np.ceil(max(abs(base_dy), abs(base_dx)))) + 4)
+
+            sh = max(1, int(_strip_h))
+            _dbg_n_strips = (canvas_H + sh - 1) // sh if _debug_preprocess else 0
+            if _debug_preprocess:
+                print(
+                    f"[preprocess] writing cycle {cycle} "
+                    f"({'strip' if regs_fullres is not None else 'passthrough'} mode): "
+                    f"{n_ch} channel(s) × {_dbg_n_strips} strip(s) of ≤{sh} rows",
+                    flush=True,
+                )
+            for out_y0 in range(0, canvas_H, sh):
+                _check_cancel(cancel_cb)
+                out_y1 = min(canvas_H, out_y0 + sh)
+                strip_H = out_y1 - out_y0
+                if _debug_preprocess:
+                    _strip_idx = out_y0 // sh + 1
+                    _pct = 100 * out_y0 // canvas_H
+                    _rss = ""
+                    try:
+                        import psutil as _ps
+                        _rss = f"  RAM={_ps.Process().memory_info().rss / 1024**2:.0f} MB"
+                    except Exception:
+                        pass
+                    print(
+                        f"[preprocess]   strip {_strip_idx}/{_dbg_n_strips}"
+                        f"  rows [{out_y0}:{out_y1}]  ({_pct}%){_rss}",
+                        flush=True,
+                    )
+
+                if regs_fullres is not None:
+                    field_y_s, field_x_s = _build_strip_shift_field(
+                        out_y0, out_y1, canvas_W, regs_fullres, base_dy, base_dx
+                    )
+                else:
+                    field_y_s = field_x_s = None
+
+                # Source canvas rows needed (with shift padding)
+                src_cy0 = max(0, out_y0 - shift_pad)
+                src_cy1 = min(canvas_H, out_y1 + shift_pad)
+                src_H = src_cy1 - src_cy0
+
+                # Source file rows that overlap with canvas rows [src_cy0:src_cy1]
+                ovlp_cy0 = max(src_cy0, canvas_pad_y0)
+                ovlp_cy1 = min(src_cy1, canvas_pad_y0 + ys)
+
+                for ch in range(n_ch):
+                    _check_cancel(cancel_cb)
+                    src_canvas = np.zeros((src_H, canvas_W), dtype=np.float32)
+
+                    if ovlp_cy0 < ovlp_cy1:
+                        file_y0 = in_y0 + (ovlp_cy0 - canvas_pad_y0)
+                        file_y1 = in_y0 + (ovlp_cy1 - canvas_pad_y0)
+                        raw = load_channel_strip(ci.path, ch, file_y0, file_y1)
+                        dest_y0 = ovlp_cy0 - src_cy0
+                        dest_y1 = ovlp_cy1 - src_cy0
+                        src_canvas[dest_y0:dest_y1, canvas_pad_x0:canvas_pad_x0 + xs] = \
+                            raw[:, in_x0:in_x0 + xs].astype(np.float32, copy=False)
+                        del raw
+
+                    if field_y_s is None:
+                        # Reference cycle or global-translation-only: just slice and cast
+                        rel_y0 = out_y0 - src_cy0
+                        rel_y1 = out_y1 - src_cy0
+                        out_strip = _cast_preserve_dtype(src_canvas[rel_y0:rel_y1], base_dtype)
+                    else:
+                        warped = _warp_strip_by_field(
+                            src_canvas, out_y0, strip_H, src_cy0, field_y_s, field_x_s, order=1
+                        )
+                        out_strip = _cast_preserve_dtype(warped, base_dtype)
+                        del warped
+
+                    writer.write_channel_strip(out_c0 + ch, out_strip, out_y0)
+                    del src_canvas, out_strip
+
         ref_info = next((item for item in infos if int(item[0].cycle) == int(reference_cycle)), None)
         if ref_info is None:
             raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
@@ -1151,7 +1375,19 @@ def merge_cycles_to_ome_tiff(
             n=total_ticks,
             cycle=int(reference_cycle),
         )
-        _write_cycle_channels(ref_ci_write, ref_shp, None)
+        if _strip_mode:
+            _write_cycle_channels_strip(ref_ci_write, ref_shp, None, 0.0, 0.0)
+        else:
+            _write_cycle_channels(ref_ci_write, ref_shp, None)
+        writer.flush_and_release()
+        if _debug_preprocess:
+            _rss_ref = ""
+            try:
+                import psutil as _ps
+                _rss_ref = f"  RAM={_ps.Process().memory_info().rss / 1024**2:.0f} MB"
+            except Exception:
+                pass
+            print(f"[preprocess] reference cycle written + released{_rss_ref}", flush=True)
         tick += 1
 
         for _i_moving, (ci, shp, _dt) in enumerate(moving_infos):
@@ -1172,10 +1408,24 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
-            mov_native = load_single_channel_tiff_native(ci.path, int(ch_idx))
-            mov_yx = _pad_plane_to_canvas(mov_native, canvas_yx, out_dtype=np.float32)
-            mov_reg = _normalized_for_registration(mov_yx)
-            del mov_native, mov_yx
+            if _strip_mode:
+                _mov_ds = load_channel_downsampled(ci.path, int(ch_idx), D)
+                _mov_yx_ds = _pad_plane_to_canvas(_mov_ds.astype(np.float32), _ds_canvas_yx, out_dtype=np.float32)
+                mov_reg = _normalized_for_registration(_mov_yx_ds)
+                del _mov_ds, _mov_yx_ds
+            else:
+                mov_native = load_single_channel_tiff_native(ci.path, int(ch_idx))
+                mov_yx = _pad_plane_to_canvas(mov_native, canvas_yx, out_dtype=np.float32)
+                mov_reg = _normalized_for_registration(mov_yx)
+                del mov_native, mov_yx
+            if _debug_preprocess:
+                _reg_shape = tuple(int(v) for v in mov_reg.shape)
+                _reg_mode = f"downsampled 1/{D}" if _strip_mode else "full-resolution"
+                print(
+                    f"[preprocess] cycle {cycle}: reg channel loaded ({_reg_mode})  "
+                    f"shape={_reg_shape}",
+                    flush=True,
+                )
             tick += 1
 
             _progress(
@@ -1187,9 +1437,25 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
-            dy, dx = estimate_translation(ref_reg, mov_reg, downsample=max(1, int(downsample_for_registration)), upsample_factor=upsample_factor)
+            if _strip_mode:
+                # ref_reg and mov_reg are already at 1/D scale; estimate at that scale then scale up
+                _dy_ds, _dx_ds = estimate_translation(ref_reg, mov_reg, downsample=1, upsample_factor=upsample_factor)
+                dy = _dy_ds * float(D)
+                dx = _dx_ds * float(D)
+            else:
+                dy, dx = estimate_translation(ref_reg, mov_reg, downsample=max(1, int(downsample_for_registration)), upsample_factor=upsample_factor)
             shifts[cycle] = (float(dy), float(dx))
+            if _debug_preprocess:
+                print(
+                    f"[preprocess] cycle {cycle}: global shift dy={dy:.2f} dx={dx:.2f}",
+                    flush=True,
+                )
             tick += 1
+
+            _use_islands = not (bool(global_translation_only) or
+                                str(registration_algorithm or "").strip().lower() in {
+                                    "translation", "phase_correlation", "phase-correlation", "phase correlation"
+                                })
 
             _progress(
                 f"4. Registering Cycle {cycle}: generating foreground mask...",
@@ -1200,9 +1466,13 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
-            moving_fg = _foreground_mask(mov_reg)
-            moved_mask = _apply_translation(moving_fg.astype(np.float32), dy, dx, order=0) > 0.5
-            del moving_fg
+            if _use_islands:
+                moving_fg = _foreground_mask(mov_reg)
+                _shift_for_mask = (_dy_ds, _dx_ds) if _strip_mode else (dy, dx)
+                moved_mask = _apply_translation(moving_fg.astype(np.float32), _shift_for_mask[0], _shift_for_mask[1], order=0) > 0.5
+                del moving_fg
+            else:
+                moved_mask = None
 
             _progress(
                 f"5. Registering Cycle {cycle}: finding foreground islands...",
@@ -1213,9 +1483,16 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
-            islands = _identify_foreground_islands(moved_mask, max(100, int(tiled_rigid_tile_size)), solid=True)
-            del moved_mask
-            n_islands = int(np.max(islands))
+            if _use_islands and moved_mask is not None:
+                _tile_sz = max(4, int(tiled_rigid_tile_size) // D) if _strip_mode else max(100, int(tiled_rigid_tile_size))
+                islands = _identify_foreground_islands(moved_mask, _tile_sz, solid=True)
+                del moved_mask
+                n_islands = int(np.max(islands))
+            else:
+                islands = None
+                n_islands = 0
+                if moved_mask is not None:
+                    del moved_mask
             island_counts[cycle] = n_islands
             tick += 1
 
@@ -1228,23 +1505,33 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
-            regs = _refine_region_transforms(
-                ref_reg,
-                mov_reg,
-                islands,
-                (dy, dx),
-                search_radius=region_search_radius,
-                downsample=max(1, int(downsample_for_registration)),
-                penalty_lambda=0.0,
-                fast_large_island_refinement=bool(fast_large_island_refinement),
-                fast_large_island_sample_count=max(1, int(fast_large_island_sample_count)),
-                fast_large_island_cell_size=max(128, int(tiled_rigid_tile_size)),
-                progress_cb=progress_cb,
-                progress_event_cb=progress_event_cb,
-                cancel_cb=cancel_cb,
-                cycle=cycle,
-            )
-            regs = list(regs)
+            if _use_islands and islands is not None:
+                _base_shift_for_refine = (_dy_ds, _dx_ds) if _strip_mode else (dy, dx)
+                _search_rad = max(2, region_search_radius // D) if _strip_mode else region_search_radius
+                _ds_for_refine = 1 if _strip_mode else max(1, int(downsample_for_registration))
+                regs_raw = _refine_region_transforms(
+                    ref_reg,
+                    mov_reg,
+                    islands,
+                    _base_shift_for_refine,
+                    search_radius=_search_rad,
+                    downsample=_ds_for_refine,
+                    penalty_lambda=0.0,
+                    fast_large_island_refinement=bool(fast_large_island_refinement),
+                    fast_large_island_sample_count=max(1, int(fast_large_island_sample_count)),
+                    fast_large_island_cell_size=max(4, int(tiled_rigid_tile_size) // D) if _strip_mode else max(128, int(tiled_rigid_tile_size)),
+                    progress_cb=progress_cb,
+                    progress_event_cb=progress_event_cb,
+                    cancel_cb=cancel_cb,
+                    cycle=cycle,
+                )
+                regs_raw = list(regs_raw)
+                if _strip_mode:
+                    regs = [_scale_region_transform(r, D) for r in regs_raw]
+                else:
+                    regs = regs_raw
+            else:
+                regs = []
             cycle_region_shift_summaries[cycle] = [
                 {
                     "label": int(r.label),
@@ -1255,11 +1542,12 @@ def merge_cycles_to_ome_tiff(
                 }
                 for r in regs
             ]
-
-            # Keep non-candidate pixels at the global shift; only selected foreground
-            # island regions receive their accepted local shift.
-            field_yx = _piecewise_shift_field(canvas_yx, islands, regs, (dy, dx))
-            del islands, regs, mov_reg
+            if _debug_preprocess:
+                print(
+                    f"[preprocess] cycle {cycle}: {len(regs)} region transform(s) "
+                    f"({'downsampled+scaled' if _strip_mode else 'full-res'})",
+                    flush=True,
+                )
             if _i_moving == len(moving_infos) - 1:
                 del ref_reg
             tick += 1
@@ -1273,8 +1561,33 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
-            _write_cycle_channels(ci, shp, field_yx)
-            del field_yx
+            if _strip_mode:
+                # Strip mode: islands and mov_reg not needed for writing
+                if islands is not None:
+                    del islands
+                del mov_reg
+                # Pass regs directly (even if empty) so global shift (dy, dx) is applied;
+                # None is reserved for the reference cycle (no shift at all).
+                _write_cycle_channels_strip(ci, shp, regs, dy, dx)
+                del regs
+            else:
+                # Full-plane mode: compute dense shift field then write
+                _label_img = islands if (_use_islands and islands is not None) else np.zeros((1, 1), dtype=np.int32)
+                field_yx = _piecewise_shift_field(canvas_yx, _label_img, regs, (dy, dx))
+                if islands is not None:
+                    del islands
+                del regs, mov_reg
+                _write_cycle_channels(ci, shp, field_yx)
+                del field_yx
+            writer.flush_and_release()
+            if _debug_preprocess:
+                _rss_post = ""
+                try:
+                    import psutil as _ps
+                    _rss_post = f"  RAM={_ps.Process().memory_info().rss / 1024**2:.0f} MB"
+                except Exception:
+                    pass
+                print(f"[preprocess] cycle {cycle} written + released{_rss_post}", flush=True)
             try:
                 gc.collect()
             except Exception:
@@ -1334,4 +1647,5 @@ def merge_cycles_to_ome_tiff(
         "implemented_steps": [1, 2, 3, 4, 5],
         "pending_steps": [],
         "low_mem": bool(low_mem),
+        "strip_height": int(_strip_h) if _strip_h is not None else None,
     }

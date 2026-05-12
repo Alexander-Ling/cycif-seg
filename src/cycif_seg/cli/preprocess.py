@@ -1,0 +1,355 @@
+"""
+cycif-seg-preprocess — headless CLI for Step 1 batch preprocessing.
+
+Two subcommands:
+
+  cycif-seg-preprocess plan  --root DIR --output DIR [options] PLAN.json
+      Scans for samples, reads channel names from OME-TIFFs, and writes a
+      plan JSON that can be reviewed/edited before running.
+
+  cycif-seg-preprocess run   PLAN.json [--output-dir DIR] [--dry-run]
+      Executes a plan JSON, printing progress to stdout.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+import traceback
+from pathlib import Path
+
+from cycif_seg.preprocess.batch_plan import (
+    BatchSample,
+    default_tiled_rigid_tile_size,
+    default_tiled_rigid_search_factor,
+    enabled_cycle_numbers,
+    plan_from_dict,
+    plan_to_dict,
+    sample_has_cycle_config,
+    scan_root_for_samples,
+    validate_samples_ready,
+)
+from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
+
+
+def _cmd_plan(args: argparse.Namespace) -> int:
+    from cycif_seg.io.ome_tiff import load_channel_names_only_fast
+
+    root_dir = Path(args.root).expanduser().resolve()
+    output_dir = Path(args.output).expanduser().resolve()
+    plan_path = Path(args.plan_json).expanduser()
+    reg_marker = (args.registration_marker or "DAPI").strip()
+    pyramidal = not args.no_pyramidal
+
+    if not root_dir.is_dir():
+        print(f"Error: root directory does not exist: {root_dir}", file=sys.stderr)
+        return 1
+
+    print(f"Scanning {root_dir} for samples...")
+    samples = scan_root_for_samples(root_dir, output_dir, tissue=args.tissue, species=args.species)
+
+    if not samples:
+        print(
+            "No samples found.\n"
+            "Expected layout: {root}/{sample_dir}/{cycle_dir}/C#_*.ome.tiff\n"
+            "Cycle files must be named with a C<number>_ prefix (e.g. C1_sample.ome.tiff).",
+            file=sys.stderr,
+        )
+        return 1
+
+    n_cycle_files = sum(len(s.files) for s in samples)
+    print(f"Found {len(samples)} sample(s), {n_cycle_files} cycle file(s) total.")
+
+    warnings: list[str] = []
+    for si, s in enumerate(samples, 1):
+        print(f"  [{si}/{len(samples)}] {s.name}: reading channel names from {len(s.files)} cycle file(s)...")
+        registration_markers: list[str] = []
+        channel_markers: list[list[str]] = []
+        channel_antibodies: list[list[str]] = []
+
+        for p in s.files:
+            try:
+                ch_names = list(load_channel_names_only_fast(str(p)) or [])
+            except Exception as e:
+                ch_names = []
+                warnings.append(f"{s.name}/{p.name}: could not read channel names ({e})")
+
+            reg = next(
+                (nm for nm in ch_names if nm.strip().upper() == reg_marker.upper()),
+                ch_names[0] if ch_names else reg_marker,
+            )
+            registration_markers.append(reg)
+            channel_markers.append(ch_names)
+            channel_antibodies.append([""] * len(ch_names))
+
+        s.registration_markers = registration_markers
+        s.channel_markers = channel_markers
+        s.channel_antibodies = channel_antibodies
+        s.tiled_rigid_tile_size = max(128, int(args.tile_size))
+        s.tiled_rigid_search_factor = max(1.0, float(args.search_factor))
+        s.pyramidal_output = pyramidal
+
+    if warnings:
+        print("\nWarnings (edit the plan JSON to fix marker names manually):")
+        for w in warnings:
+            print(f"  ! {w}")
+
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    d = plan_to_dict(
+        samples,
+        root_dir=root_dir,
+        output_dir=output_dir,
+        default_tissue=args.tissue,
+        default_species=args.species,
+    )
+    plan_path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+
+    print(f"\nPlan written to: {plan_path}")
+    if warnings:
+        print(
+            "Some channel names could not be read automatically.\n"
+            "Edit the plan JSON to set 'registration_markers' and 'channel_markers' manually."
+        )
+    else:
+        print(
+            "Review the plan JSON and adjust registration markers or channel names as needed,\n"
+            "then run:"
+        )
+    print(f"  cycif-seg-preprocess run {plan_path}")
+    return 0
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    plan_path = Path(args.plan_json).expanduser()
+    if not plan_path.is_file():
+        print(f"Error: plan file not found: {plan_path}", file=sys.stderr)
+        return 1
+
+    try:
+        d = json.loads(plan_path.read_text(encoding="utf-8"))
+        result = plan_from_dict(d)
+    except (ValueError, json.JSONDecodeError) as e:
+        print(f"Error loading plan: {e}", file=sys.stderr)
+        return 1
+
+    samples: list[BatchSample] = result["samples"]
+
+    if args.output_dir:
+        out_dir = Path(args.output_dir).expanduser().resolve()
+        for s in samples:
+            name = s.output_path.name if s.output_path else f"{s.name}.ome.tiff"
+            s.output_path = out_dir / name
+
+    ok, msg = validate_samples_ready(samples)
+    if not ok:
+        print(f"Plan validation failed: {msg}", file=sys.stderr)
+        print(
+            "Tip: run 'cycif-seg-preprocess plan' to regenerate a plan with channel names,\n"
+            "     or edit the JSON to add 'registration_markers' and 'channel_markers' fields.",
+            file=sys.stderr,
+        )
+        return 1
+
+    enabled = [s for s in samples if s.enabled]
+    n_samp = len(enabled)
+
+    if args.dry_run:
+        print(f"Dry run: plan is valid. {n_samp} sample(s) would be processed:")
+        for s in enabled:
+            n_cy = len(enabled_cycle_numbers(s))
+            print(f"  {s.name}: {n_cy} cycle(s) -> {s.output_path}")
+        return 0
+
+    print(f"Running batch preprocessing: {n_samp} sample(s)\n")
+    failures: list[dict] = []
+    reports: list[dict] = []
+    start_total = time.monotonic()
+
+    for si, s in enumerate(enabled, 1):
+        print(f"[{si}/{n_samp}] {s.name}")
+        out_path = Path(str(s.output_path)).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cycles_in: list[CycleInput] = []
+        try:
+            for i, p in enumerate(s.files):
+                if s.cycles_enabled and i < len(s.cycles_enabled) and not bool(s.cycles_enabled[i]):
+                    continue
+                cycles_in.append(
+                    CycleInput(
+                        path=str(p),
+                        cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
+                        tissue=s.tissue or None,
+                        species=s.species or None,
+                        registration_marker=(
+                            s.registration_markers[i]
+                            if s.registration_markers and i < len(s.registration_markers)
+                            else None
+                        ),
+                        channel_markers=(
+                            s.channel_markers[i]
+                            if s.channel_markers and i < len(s.channel_markers)
+                            else None
+                        ),
+                        channel_antibodies=(
+                            s.channel_antibodies[i]
+                            if s.channel_antibodies and i < len(s.channel_antibodies)
+                            else None
+                        ),
+                    )
+                )
+        except Exception as e:
+            print(f"  ERROR building cycle inputs: {e}", file=sys.stderr)
+            failures.append({"sample_name": s.name, "error": str(e)})
+            continue
+
+        _phase_labels = {
+            "load_ref": "loading reference",
+            "load_cycle": "loading",
+            "global_registration": "global translation",
+            "foreground_mask": "foreground mask",
+            "identify_islands": "foreground islands",
+            "foreground_island_refine": "island refinement",
+            "write_cycle": "writing",
+            "pyramid": "building pyramid",
+        }
+
+        def _ev(ev: dict) -> None:
+            phase = str(ev.get("phase") or "")
+            if not phase:
+                return
+            cycle = ev.get("cycle")
+            n = int(ev.get("n") or 0)
+            idx = int(ev.get("idx") or 0)
+            label = _phase_labels.get(phase, phase)
+            cycle_txt = f" cycle {int(cycle)}" if cycle is not None else ""
+            progress_txt = f" ({idx}/{n})" if n > 0 else ""
+            print(f"  {label}{cycle_txt}{progress_txt}", flush=True)
+
+        start_s = time.monotonic()
+        try:
+            rep = merge_cycles_to_ome_tiff(
+                cycles_in,
+                str(out_path),
+                default_registration_marker="DAPI",
+                registration_algorithm=str(getattr(s, "registration_algorithm", "tiled_rigid") or "tiled_rigid"),
+                global_translation_only=bool(getattr(s, "global_translation_only", False)),
+                tiled_rigid_allow_rotation=bool(getattr(s, "tiled_rigid_allow_rotation", False)),
+                tiled_rigid_tile_size=max(128, int(getattr(s, "tiled_rigid_tile_size", default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size)),
+                tiled_rigid_search_factor=max(1.0, float(getattr(s, "tiled_rigid_search_factor", default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
+                fast_large_island_refinement=False,
+                fast_large_island_sample_count=max(1, int(getattr(s, "fast_large_island_sample_count", 5) or 5)),
+                pyramidal_output=bool(getattr(s, "pyramidal_output", False)),
+                progress_event_cb=_ev,
+                cancel_cb=None,
+                low_mem=True,
+                strip_height=args.strip_height,
+            )
+            elapsed = time.monotonic() - start_s
+            print(f"  done in {elapsed:.0f}s -> {out_path}")
+            reports.append({
+                "sample_name": s.name,
+                "output_path": str(rep.get("output_path") or out_path),
+                "pyramidal_output_path": rep.get("pyramidal_output_path"),
+                "canvas_yx": list(rep.get("canvas_shape_yx") or []),
+                "n_cycles": int(rep.get("n_cycles") or len(cycles_in)),
+                "n_channels_total": int(rep.get("n_channels_total") or 0),
+            })
+        except Exception as e:
+            elapsed = time.monotonic() - start_s
+            print(f"  ERROR after {elapsed:.0f}s: {e}", file=sys.stderr)
+            traceback.print_exc()
+            failures.append({"sample_name": s.name, "error": str(e)})
+
+    total_elapsed = time.monotonic() - start_total
+    print(f"\nDone in {total_elapsed:.0f}s: {len(reports)} succeeded, {len(failures)} failed.")
+    if failures:
+        print("Failed samples:")
+        for f in failures:
+            print(f"  {f['sample_name']}: {f['error']}")
+
+    results = {
+        "schema_version": 1,
+        "plan": str(plan_path),
+        "reports": reports,
+        "failures": failures,
+        "elapsed_seconds": round(total_elapsed, 1),
+    }
+    results_path = plan_path.with_name(plan_path.stem + "_results.json")
+    try:
+        results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"Results written to: {results_path}")
+    except Exception as e:
+        print(f"Warning: could not write results JSON: {e}", file=sys.stderr)
+
+    return 1 if failures else 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="cycif-seg-preprocess",
+        description="cycif-seg headless batch preprocessing (Step 1: merge/register cycles)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ---- plan subcommand ----
+    p_plan = sub.add_parser(
+        "plan",
+        help="Scan a directory and write a batch plan JSON",
+        description=(
+            "Scan ROOT for sample subdirectories (each containing cycle subdirectories "
+            "with C#_*.ome.tiff files), read channel names from the OME-TIFFs, and write "
+            "a plan JSON. Review and edit the JSON before running."
+        ),
+    )
+    p_plan.add_argument("--root", required=True, metavar="DIR",
+                        help="Root input directory containing one subdirectory per sample")
+    p_plan.add_argument("--output", required=True, metavar="DIR",
+                        help="Output directory for merged OME-TIFFs")
+    p_plan.add_argument("--tissue", default="", metavar="TEXT",
+                        help="Default tissue label (applied to all samples)")
+    p_plan.add_argument("--species", default="", metavar="TEXT",
+                        help="Default species label")
+    p_plan.add_argument("--registration-marker", default="DAPI", metavar="NAME",
+                        help="Default registration channel name (default: DAPI)")
+    p_plan.add_argument("--tile-size", type=int, default=default_tiled_rigid_tile_size,
+                        metavar="N", help=f"Tiled-rigid tile size in pixels (default: {default_tiled_rigid_tile_size})")
+    p_plan.add_argument("--search-factor", type=float, default=default_tiled_rigid_search_factor,
+                        metavar="F", help=f"Registration search factor (default: {default_tiled_rigid_search_factor})")
+    p_plan.add_argument("--no-pyramidal", action="store_true",
+                        help="Disable pyramidal OME-TIFF output (default: pyramidal enabled)")
+    p_plan.add_argument("plan_json", metavar="PLAN.json",
+                        help="Output path for the plan JSON file")
+
+    # ---- run subcommand ----
+    p_run = sub.add_parser(
+        "run",
+        help="Execute a batch plan JSON",
+        description=(
+            "Load a plan JSON (created by 'plan' or edited manually) and run batch "
+            "preprocessing, printing progress to stdout."
+        ),
+    )
+    p_run.add_argument("plan_json", metavar="PLAN.json",
+                       help="Path to the plan JSON file to execute")
+    p_run.add_argument("--output-dir", metavar="DIR",
+                       help="Override output directory for all samples (rebases output paths)")
+    p_run.add_argument("--strip-height", type=int, default=None, metavar="N",
+                       help=(
+                           "Process the image in horizontal strips of N rows to reduce RAM. "
+                           "low_mem=True (the default) auto-selects canvas_height/10 when not given. "
+                           "Set to 0 to disable strip mode even when low_mem is active."
+                       ))
+    p_run.add_argument("--dry-run", action="store_true",
+                       help="Validate the plan and print what would run, without processing")
+
+    parsed = parser.parse_args()
+    if parsed.command == "plan":
+        sys.exit(_cmd_plan(parsed))
+    elif parsed.command == "run":
+        sys.exit(_cmd_run(parsed))
+
+
+if __name__ == "__main__":
+    main()

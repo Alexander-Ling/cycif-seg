@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import gc
-from dataclasses import dataclass
 from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
@@ -11,96 +10,21 @@ from qtpy import QtCore, QtWidgets
 from napari.utils.notifications import show_info, show_warning
 from napari.qt.threading import thread_worker
 
-from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
+from cycif_seg.preprocess.organize_cycles import CycleInput, is_preprocess_debug, merge_cycles_to_ome_tiff
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
+from cycif_seg.preprocess.batch_plan import (
+    BatchSample,
+    default_tiled_rigid_tile_size,
+    default_tiled_rigid_search_factor,
+    default_fast_large_island_refinement,
+    default_fast_large_island_sample_count,
+    scan_root_for_samples,
+    validate_sample_cycle_numbers,
+    sample_has_cycle_config,
+    plan_to_dict,
+    plan_from_dict,
+)
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
-
-
-PLAN_SCHEMA_VERSION = 1
-
-default_tiled_rigid_tile_size: int = 2000
-default_tiled_rigid_search_factor: float = 3.0
-default_fast_large_island_refinement: bool = False
-default_fast_large_island_sample_count: int = 5
-
-def _parse_cycle_number_from_filename(name: str) -> int | None:
-    """Parse cycle number from stitched file names like ``C3_sample_...ome.tiff``."""
-    try:
-        import re
-
-        m = re.match(r"^c(\d+)_", str(name or "").strip(), flags=re.IGNORECASE)
-        if not m:
-            return None
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def _find_stitched_cycle_files_in_sample_dir(sample_dir: Path) -> list[tuple[Path, int]]:
-    """
-    Discover stitched cycle OME-TIFFs using the expected layout::
-
-        {input}/{sample_dir}/{cycle_dir}/C#_{stuff}.ome.tiff
-
-    Rules:
-    - only inspect immediate subdirectories of ``sample_dir`` as cycle dirs
-    - ignore any OME-TIFF directly under ``sample_dir``
-    - ignore tile files such as ``area_*.ome.tiff``
-    - infer cycle number from the stitched filename prefix ``C#_``
-    """
-    out: list[tuple[Path, int]] = []
-    try:
-        cycle_dirs = [p for p in sorted(sample_dir.iterdir()) if p.is_dir()]
-    except Exception:
-        return out
-
-    for cycle_dir in cycle_dirs:
-        try:
-            files = [p for p in sorted(cycle_dir.iterdir()) if p.is_file()]
-        except Exception:
-            continue
-        for p in files:
-            nm = p.name
-            low = nm.lower()
-            if ".ome." not in low:
-                continue
-            if not (low.endswith('.ome.tif') or low.endswith('.ome.tiff')):
-                continue
-            if low.startswith('area_'):
-                continue
-            cy = _parse_cycle_number_from_filename(nm)
-            if cy is None:
-                continue
-            out.append((p, int(cy)))
-
-    out.sort(key=lambda t: (int(t[1]), str(t[0]).lower()))
-    return out
-
-
-@dataclass
-class BatchSample:
-    name: str
-    input_dir: Path
-    files: list[Path]
-    tissue: str = ""
-    species: str = ""
-    output_path: Path | None = None
-    enabled: bool = True
-
-    # Per-file config (same order as files)
-    cycles: list[int] | None = None
-    registration_markers: list[str] | None = None
-    channel_markers: list[list[str]] | None = None
-    channel_antibodies: list[list[str]] | None = None
-    cycles_enabled: list[bool] | None = None
-    registration_algorithm: str = "tiled_rigid"
-    global_translation_only: bool = False
-    tiled_rigid_allow_rotation: bool = False
-    tiled_rigid_tile_size: int = default_tiled_rigid_tile_size
-    tiled_rigid_search_factor: float = default_tiled_rigid_search_factor
-    fast_large_island_refinement: bool = default_fast_large_island_refinement
-    fast_large_island_sample_count: int = default_fast_large_island_sample_count
-    pyramidal_output: bool = True
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -368,33 +292,12 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             return
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        samples: list[BatchSample] = []
-        n_cycle_files = 0
-        for sub in sorted(root_dir.iterdir()):
-            if not sub.is_dir():
-                continue
-            stitched = _find_stitched_cycle_files_in_sample_dir(sub)
-            if not stitched:
-                continue
-            files = [p for (p, _cy) in stitched]
-            cycles = [int(cy) for (_p, cy) in stitched]
-            sname = sub.name
-            n_cycle_files += len(files)
-            samples.append(
-                BatchSample(
-                    name=sname,
-                    input_dir=sub,
-                    files=files,
-                    tissue=self.txt_default_tissue.text().strip(),
-                    species=self.txt_default_species.text().strip(),
-                    output_path=(out_dir / f"{sname}.ome.tiff"),
-                    enabled=True,
-                    cycles=cycles,
-                    registration_algorithm="tiled_rigid",
-                    global_translation_only=False,
-                )
-            )
-
+        samples = scan_root_for_samples(
+            root_dir, out_dir,
+            tissue=self.txt_default_tissue.text().strip(),
+            species=self.txt_default_species.text().strip(),
+        )
+        n_cycle_files = sum(len(s.files) for s in samples)
         self._samples = samples
         self._refresh_table()
         self._set_status(
@@ -656,49 +559,19 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "fast_large_island_refinement": False,
                 "fast_large_island_sample_count": int(getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count),
                 "pyramidal_output": bool(getattr(s, 'pyramidal_output', True)),
+                "low_mem": bool(getattr(s, 'low_mem', True)),
+                "strip_height": getattr(s, 'strip_height', None),
                 "cycles": cycles_out,
             }
         except Exception:
             return None
 
-    def _enabled_cycle_numbers(self, s: BatchSample) -> list[int]:
-        cycles: list[int] = []
-        for i, _p in enumerate(s.files or []):
-            enabled = bool(s.cycles_enabled[i] if s.cycles_enabled and i < len(s.cycles_enabled) else True)
-            if not enabled:
-                continue
-            cycles.append(int(s.cycles[i] if s.cycles and i < len(s.cycles) else i))
-        return cycles
-
-    def _duplicate_cycle_numbers(self, s: BatchSample) -> list[int]:
-        seen: set[int] = set()
-        dupes: set[int] = set()
-        for cy in self._enabled_cycle_numbers(s):
-            if cy in seen:
-                dupes.add(cy)
-            seen.add(cy)
-        return sorted(dupes)
-
-    def _validate_sample_cycle_numbers(self, s: BatchSample) -> tuple[bool, str]:
-        dupes = self._duplicate_cycle_numbers(s)
-        if dupes:
-            cycles = self._enabled_cycle_numbers(s)
-            return (
-                False,
-                f"Sample '{s.name}' has duplicate enabled cycle number(s): {dupes}. "
-                f"Enabled cycle numbers are: {cycles}. Reconfigure this sample before running batch preprocessing.",
-            )
-        return True, ""
-
-    def _sample_has_cycle_config(self, s: BatchSample) -> bool:
-        return bool(s.cycles and s.registration_markers and s.channel_markers and s.channel_antibodies)
-
     def _sample_config_state(self, s: BatchSample) -> tuple[str, str]:
-        if not self._sample_has_cycle_config(s):
+        if not sample_has_cycle_config(s):
             return "missing", "No cycle configuration for this sample."
         if s.cycles_enabled and not any(bool(x) for x in s.cycles_enabled):
             return "invalid", "All cycles are disabled. Enable at least one cycle."
-        ok, msg = self._validate_sample_cycle_numbers(s)
+        ok, msg = validate_sample_cycle_numbers(s)
         if not ok:
             return "invalid", msg
         return "valid", "Cycle configuration is valid."
@@ -741,6 +614,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.fast_large_island_refinement = False
             s.fast_large_island_sample_count = max(1, int(cfg.get('fast_large_island_sample_count') if cfg.get('fast_large_island_sample_count') is not None else getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count))
             s.pyramidal_output = bool(cfg.get('pyramidal_output') if cfg.get('pyramidal_output') is not None else getattr(s, 'pyramidal_output', True))
+            s.low_mem = bool(cfg.get('low_mem') if cfg.get('low_mem') is not None else getattr(s, 'low_mem', True))
+            _sh = cfg.get('strip_height') if 'strip_height' in cfg else getattr(s, 'strip_height', None)
+            s.strip_height = int(_sh) if _sh is not None and int(_sh) > 0 else None
         except Exception:
             pass
 
@@ -775,7 +651,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.channel_markers = chm
             s.channel_antibodies = cha
             s.cycles_enabled = enableds
-            ok, msg = self._validate_sample_cycle_numbers(s)
+            ok, msg = validate_sample_cycle_numbers(s)
             if not ok:
                 raise ValueError(msg)
 
@@ -806,51 +682,15 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
     # -------------------- Plan I/O --------------------
     def _plan_dict(self) -> dict:
-        root_dir = str(Path(self.txt_root.text().strip() or "").expanduser())
-        out_dir = str(Path(self.txt_outdir.text().strip() or "").expanduser())
-        d: dict = {
-            "schema_version": PLAN_SCHEMA_VERSION,
-            "root_dir": root_dir,
-            "output_dir": out_dir,
-            "defaults": {
-                "registration_algorithm": "tiled_rigid",
-                "global_translation_only": False,
-                "tiled_rigid_tile_size": default_tiled_rigid_tile_size,
-                "tiled_rigid_search_factor": default_tiled_rigid_search_factor,
-                "fast_large_island_refinement": default_fast_large_island_refinement,
-                "fast_large_island_sample_count": default_fast_large_island_sample_count,
-                "tissue": self.txt_default_tissue.text().strip(),
-                "species": self.txt_default_species.text().strip(),
-            },
-            "samples": [],
-            "registration_algorithm": "tiled_rigid",
-            "global_translation_only": False,
-        }
-        for s in self._samples:
-            rec = {
-                "name": s.name,
-                "input_dir": str(s.input_dir),
-                "files": [str(p) for p in s.files],
-                "tissue": s.tissue,
-                "species": s.species,
-                "output_path": str(s.output_path or ""),
-                "enabled": bool(s.enabled),
-                "cycles": list(s.cycles or []),
-                "registration_markers": list(s.registration_markers or []),
-                "channel_markers": list(s.channel_markers or []),
-                "channel_antibodies": list(s.channel_antibodies or []),
-                "cycles_enabled": list(s.cycles_enabled or []),
-                "registration_algorithm": str(getattr(s, "registration_algorithm", "tiled_rigid") or "tiled_rigid"),
-                "global_translation_only": bool(getattr(s, "global_translation_only", False)),
-                "tiled_rigid_allow_rotation": bool(getattr(s, "tiled_rigid_allow_rotation", False)),
-                "tiled_rigid_tile_size": int(getattr(s, "tiled_rigid_tile_size", default_tiled_rigid_tile_size) or default_tiled_rigid_tile_size),
-                "tiled_rigid_search_factor": float(getattr(s, "tiled_rigid_search_factor", default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor),
-                "fast_large_island_refinement": False,
-                "fast_large_island_sample_count": int(getattr(s, "fast_large_island_sample_count", default_fast_large_island_sample_count) or default_fast_large_island_sample_count),
-                "pyramidal_output": bool(getattr(s, "pyramidal_output", True)),
-            }
-            d["samples"].append(rec)
-        return d
+        root_dir = Path(self.txt_root.text().strip() or "").expanduser()
+        out_dir = Path(self.txt_outdir.text().strip() or "").expanduser()
+        return plan_to_dict(
+            self._samples,
+            root_dir=root_dir,
+            output_dir=out_dir,
+            default_tissue=self.txt_default_tissue.text().strip(),
+            default_species=self.txt_default_species.text().strip(),
+        )
 
     def _save_plan(self) -> None:
         # Ensure any table edits are captured before writing JSON.
@@ -868,51 +708,20 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load batch plan JSON", start, "JSON files (*.json);;All files (*.*)")
         if not path:
             return
-        d = json.loads(Path(path).read_text(encoding="utf-8"))
-        if int(d.get("schema_version") or 0) != PLAN_SCHEMA_VERSION:
-            show_warning(f"Unsupported plan schema version: {d.get('schema_version')}")
+        try:
+            d = json.loads(Path(path).read_text(encoding="utf-8"))
+            result = plan_from_dict(d)
+        except ValueError as e:
+            show_warning(str(e))
+            self._set_status(f"Invalid loaded plan: {e}")
             return
-        self.txt_root.setText(str(d.get("root_dir") or ""))
-        self.txt_outdir.setText(str(d.get("output_dir") or ""))
-        defs = d.get("defaults") or {}
+
+        self.txt_root.setText(result["root_dir"])
+        self.txt_outdir.setText(result["output_dir"])
+        defs = result["defaults"]
         self.txt_default_tissue.setText(str(defs.get("tissue") or ""))
         self.txt_default_species.setText(str(defs.get("species") or ""))
-
-        samples: list[BatchSample] = []
-        for rec in d.get("samples") or []:
-            s = BatchSample(
-                name=str(rec.get("name") or ""),
-                input_dir=Path(str(rec.get("input_dir") or "")).expanduser(),
-                files=[Path(p).expanduser() for p in (rec.get("files") or [])],
-                tissue=str(rec.get("tissue") or ""),
-                species=str(rec.get("species") or ""),
-                output_path=Path(str(rec.get("output_path") or "")).expanduser() if rec.get("output_path") else None,
-                enabled=bool(rec.get("enabled", True)),
-                registration_algorithm=str(rec.get("registration_algorithm") or defs.get("registration_algorithm") or "tiled_rigid"),
-                global_translation_only=bool(rec.get("global_translation_only", defs.get("global_translation_only", False))),
-            )
-            s.global_translation_only = bool(rec.get("global_translation_only", defs.get("global_translation_only", False)))
-            if s.global_translation_only:
-                s.registration_algorithm = "translation"
-            s.tiled_rigid_allow_rotation = bool(rec.get("tiled_rigid_allow_rotation", False))
-            s.tiled_rigid_tile_size = max(128, int(rec.get("tiled_rigid_tile_size", defs.get("tiled_rigid_tile_size", default_tiled_rigid_tile_size)) or default_tiled_rigid_tile_size))
-            s.tiled_rigid_search_factor = max(1.0, float(rec.get("tiled_rigid_search_factor", defs.get("tiled_rigid_search_factor", default_tiled_rigid_search_factor)) or default_tiled_rigid_search_factor))
-            s.fast_large_island_refinement = False
-            s.fast_large_island_sample_count = max(1, int(rec.get("fast_large_island_sample_count", defs.get("fast_large_island_sample_count", default_fast_large_island_sample_count)) or default_fast_large_island_sample_count))
-            s.pyramidal_output = bool(rec.get("pyramidal_output", True))
-            s.cycles = list(rec.get("cycles") or []) or None
-            s.registration_markers = list(rec.get("registration_markers") or []) or None
-            s.channel_markers = list(rec.get("channel_markers") or []) or None
-            s.channel_antibodies = list(rec.get("channel_antibodies") or []) or None
-            s.cycles_enabled = list(rec.get("cycles_enabled") or []) or None
-            ok, msg = self._validate_sample_cycle_numbers(s)
-            if not ok:
-                show_warning(msg)
-                self._set_status(f"Invalid loaded plan: {msg}")
-                return
-            samples.append(s)
-
-        self._samples = samples
+        self._samples = result["samples"]
         self._rebase_sample_output_paths(self.txt_outdir.text().strip())
         self._refresh_table()
         self._update_scan_button_enabled()
@@ -956,7 +765,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 return False, f"Sample '{s.name}' missing per-cycle configuration. Use 'Configure cycles…' and optionally 'Copy to all'."
             if s.cycles_enabled and not any(bool(x) for x in s.cycles_enabled):
                 return False, f"Sample '{s.name}' has all cycles disabled. Enable at least one cycle."
-            ok, msg = self._validate_sample_cycle_numbers(s)
+            ok, msg = validate_sample_cycle_numbers(s)
             if not ok:
                 return False, msg
         return True, ""
@@ -1001,7 +810,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 # Build CycleInput list
                 cycles_in: list[CycleInput] = []
                 try:
-                    ok, msg = self._validate_sample_cycle_numbers(s)
+                    ok, msg = validate_sample_cycle_numbers(s)
                     if not ok:
                         raise ValueError(msg)
                     for i, p in enumerate(s.files):
@@ -1077,6 +886,16 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         self.sig_set_cycle_label.emit(_progress_label(ev, idx, n))
 
                 # Run merge
+                if is_preprocess_debug():
+                    _sh_disp = str(getattr(s, 'strip_height', None) or 'auto')
+                    print(
+                        f"[batch preprocess] starting '{s.name}'"
+                        f"  cycles={len(cycles_in)}"
+                        f"  low_mem={getattr(s, 'low_mem', True)}"
+                        f"  strip_height={_sh_disp}"
+                        f"  output={out_path}",
+                        flush=True,
+                    )
                 try:
                     rep = merge_cycles_to_ome_tiff(
                         cycles_in,
@@ -1092,8 +911,16 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
                         progress_event_cb=_ev,
                         cancel_cb=lambda: bool(self._cancel_requested),
-                        low_mem=True,
+                        low_mem=bool(getattr(s, 'low_mem', True)),
+                        strip_height=getattr(s, 'strip_height', None),
                     )
+                    if is_preprocess_debug():
+                        print(
+                            f"[batch preprocess] done '{s.name}'"
+                            f"  strip_height_used={rep.get('strip_height')}"
+                            f"  canvas={rep.get('canvas_shape_yx')}",
+                            flush=True,
+                        )
                     reports.append(
                         {
                             "sample_name": str(s.name),

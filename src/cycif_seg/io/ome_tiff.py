@@ -12,12 +12,33 @@ from typing import Callable
 import numpy as np
 import tifffile
 
-# Optional lazy-loading stack (recommended for very large OME-TIFFs)
+# Debug flag — toggled by the Settings panel checkbox.
+_debug_tiff_loading: bool = False
+
+
+def set_tiff_loading_debug(enabled: bool) -> None:
+    """Enable or disable verbose console output for TIFF loading operations."""
+    global _debug_tiff_loading
+    _debug_tiff_loading = bool(enabled)
+
+
+def is_tiff_loading_debug() -> bool:
+    return _debug_tiff_loading
+
+
+# Optional lazy-loading stack (recommended for very large OME-TIFFs).
+# dask and zarr are imported independently so a zarr version mismatch does not
+# prevent dask-based lazy loading.
 try:  # pragma: no cover
+    import dask  # type: ignore
     import dask.array as da  # type: ignore
+except Exception:  # pragma: no cover
+    dask = None  # type: ignore
+    da = None
+
+try:  # pragma: no cover
     import zarr  # type: ignore
 except Exception:  # pragma: no cover
-    da = None
     zarr = None
 
 # ome-types is nice-to-have, but keep this module usable without it.
@@ -500,11 +521,68 @@ class IncrementalOmeBigTiffWriter:
             raise ValueError(f"Plane shape mismatch. Expected {exp}, got {got}")
         self._mm[idx, :, :] = plane_yx.astype(self.dtype, copy=False)
 
+    def write_channel_strip(self, channel_index: int, strip_yx: np.ndarray, row_offset: int) -> None:
+        """Write a horizontal strip (strip_H, X) to a channel starting at row_offset."""
+        idx = int(channel_index)
+        if idx < 0 or idx >= int(self.shape_yxc[2]):
+            raise IndexError(f"channel_index out of range: {channel_index}")
+        if strip_yx.ndim != 2:
+            raise ValueError(f"Expected (strip_H, X). Got shape={strip_yx.shape}")
+        r0 = int(row_offset)
+        r1 = r0 + int(strip_yx.shape[0])
+        if r0 < 0 or r1 > int(self.shape_yxc[0]):
+            raise ValueError(f"Strip [{r0}:{r1}] out of bounds for canvas height {self.shape_yxc[0]}")
+        self._mm[idx, r0:r1, :] = strip_yx.astype(self.dtype, copy=False)
+
     def flush(self) -> None:
         try:
             self._mm.flush()
         except Exception:
             pass
+
+    def flush_and_release(self) -> None:
+        """Flush dirty pages to disk then remap the output file.
+
+        Memory-mapped writes accumulate as dirty pages in the OS working set.
+        Unmapping and remapping releases those pages so they can be evicted,
+        preventing RAM from growing linearly with the number of cycles written.
+        The file contents are fully preserved — only the process-side mapping
+        is refreshed.
+        """
+        mm = getattr(self, "_mm", None)
+        if mm is None:
+            return
+        try:
+            old_offset = int(getattr(mm, "offset", 0))
+            old_shape = tuple(int(v) for v in mm.shape)
+            old_dtype = np.dtype(mm.dtype)
+        except Exception:
+            try:
+                mm.flush()
+            except Exception:
+                pass
+            return
+        try:
+            _close_memmap(mm)
+        except Exception:
+            pass
+        try:
+            del self._mm
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            self._mm = np.memmap(
+                self.path, dtype=old_dtype, mode="r+",
+                shape=old_shape, offset=old_offset,
+            )
+        except Exception as _e:
+            raise RuntimeError(
+                f"flush_and_release: failed to remap {self.path!r}: {_e}"
+            ) from _e
 
     def close(self) -> None:
         mm = getattr(self, "_mm", None)
@@ -1165,6 +1243,202 @@ def load_single_channel_tiff_native(path: str, channel_index: int) -> np.ndarray
     plane = np.asarray(arr[..., idx]).copy()
     del arr
     return plane
+
+
+def load_channel_downsampled(path: str, channel_index: int, factor: int) -> np.ndarray:
+    """Load a single channel at approximately 1/factor resolution.
+
+    For pyramidal OME-TIFFs, reads the closest pyramid level directly.
+    For non-pyramidal files, loads the full channel and block-averages.
+    Returns a 2D (Y, X) array in native dtype.
+    """
+    factor = max(1, int(factor))
+    if factor <= 1:
+        return load_single_channel_tiff_native(path, channel_index)
+
+    info = inspect_tiff_yxc(path)
+    Y, X, C = info["shape_yxc"]
+    idx = int(channel_index)
+    target_h = max(1, Y // factor)
+
+    # Try reading from an existing pyramid level
+    try:
+        with tifffile.TiffFile(path) as tf:
+            series0 = tf.series[0]
+            levels = list(getattr(series0, "levels", None) or [])
+            if len(levels) > 1:
+                best_li = 0
+                best_diff = abs(int(levels[0].shape[-2]) - target_h)
+                for li, lvl in enumerate(levels[1:], start=1):
+                    lvl_h = int(lvl.shape[-2]) if len(lvl.shape) >= 2 else 0
+                    diff = abs(lvl_h - target_h)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_li = li
+                if best_li > 0:
+                    lvl = levels[best_li]
+                    lvl_axes = str(getattr(lvl, "axes", "") or "")
+                    lvl_shape = tuple(int(v) for v in lvl.shape)
+                    if lvl_axes.startswith("C") or (len(lvl_shape) == 3 and lvl_shape[0] <= 64):
+                        arr = lvl.asarray(key=idx)
+                        return np.asarray(arr, dtype=info["dtype"]).copy()
+                    elif lvl_axes.endswith("C") or (len(lvl_shape) == 3 and lvl_shape[2] <= 64):
+                        arr = lvl.asarray()
+                        plane = np.asarray(arr[..., idx], dtype=info["dtype"]).copy()
+                        del arr
+                        return plane
+    except Exception:
+        pass
+
+    # Fallback: load full channel and block-average downsample
+    full = load_single_channel_tiff_native(path, idx)
+    f = max(1, int(factor))
+    y_trim = (int(full.shape[0]) // f) * f
+    x_trim = (int(full.shape[1]) // f) * f
+    if y_trim <= 0 or x_trim <= 0:
+        return full
+    trimmed = full[:y_trim, :x_trim].astype(np.float32, copy=False)
+    ds = trimmed.reshape(y_trim // f, f, x_trim // f, f).mean(axis=(1, 3))
+    return ds.astype(full.dtype, copy=False)
+
+
+def load_channel_strip(path: str, channel_index: int, y0: int, y1: int) -> np.ndarray:
+    """Load rows [y0:y1] of a single channel from an OME-TIFF.
+
+    Uses tifffile memory-map for efficient partial loading where possible (OS only
+    pages in the needed TIFF strips/tiles). Falls back to a full-channel load + slice
+    for compressed or unsupported formats.
+    Returns a (y1-y0, X) array in native dtype.
+    """
+    info = inspect_tiff_yxc(path)
+    Y, X, C = info["shape_yxc"]
+    idx = int(channel_index)
+    y0 = max(0, int(y0))
+    y1 = min(int(Y), int(y1))
+    if y0 >= y1:
+        return np.zeros((0, int(X)), dtype=info["dtype"])
+
+    axes = str(info.get("axes", "") or "")
+    try:
+        mm = tifffile.memmap(path, mode="r")
+        if mm.ndim == 3:
+            if axes.startswith("C") or (not axes and int(mm.shape[0]) == int(C)):
+                strip = np.asarray(mm[idx, y0:y1, :]).copy()
+            elif axes.endswith("C") or (not axes and int(mm.shape[2]) == int(C)):
+                strip = np.asarray(mm[y0:y1, :, idx]).copy()
+            else:
+                raise ValueError(f"Cannot infer channel axis: shape={mm.shape}, axes={axes!r}")
+        else:
+            raise ValueError(f"Unexpected memmap ndim: {mm.ndim}")
+        _close_memmap(mm if isinstance(mm, np.memmap) else None)
+        del mm
+        return strip
+    except Exception:
+        pass
+
+    # Fallback: load full channel and slice
+    full = load_single_channel_tiff_native(path, idx)
+    return np.asarray(full[y0:y1, :]).copy()
+
+
+def load_channel_multiscale_lazy(path: str, channel_index: int) -> list | None:
+    """Return a list of lazy dask 2D (Y, X) arrays for one channel across all pyramid levels.
+
+    ``list[0]`` = full resolution, ``list[1]`` = half resolution, etc.
+    Pass to ``napari.viewer.add_image(..., multiscale=len(result) > 1)``.
+
+    Uses tifffile's ``series.levels`` API directly — zarr is not required.
+    Returns ``None`` if dask is unavailable, the file has no pyramid, or any error occurs.
+    """
+    _dbg = _debug_tiff_loading
+    _tag = f"[multiscale ch={channel_index}]"
+    if da is None or dask is None:
+        if _dbg:
+            print(f"{_tag} SKIP — dask not available", flush=True)
+        return None
+    try:
+        info = inspect_tiff_yxc(path)
+        _Y, _X, C = info["shape_yxc"]
+        idx = int(channel_index)
+        if idx < 0 or idx >= int(C):
+            if _dbg:
+                print(f"{_tag} SKIP — channel {idx} out of range (C={C})", flush=True)
+            return None
+
+        # Inspect pyramid structure without loading pixels.
+        with tifffile.TiffFile(path) as tf:
+            series0 = tf.series[0]
+            try:
+                raw_levels = list(series0.levels or [])
+            except Exception:
+                raw_levels = [series0]
+
+            if _dbg:
+                print(f"{_tag} tifffile levels found: {len(raw_levels)}", flush=True)
+            if len(raw_levels) <= 1:
+                if _dbg:
+                    print(f"{_tag} SKIP — file has no pyramid (only 1 level)", flush=True)
+                return None
+
+            levels_meta: list[tuple[int, tuple[int, int], np.dtype, str]] = []
+            for li, lvl in enumerate(raw_levels):
+                try:
+                    lvl_shape = tuple(int(v) for v in lvl.shape)
+                    lvl_axes = str(getattr(lvl, "axes", "") or "")
+                    lvl_dtype = np.dtype(lvl.dtype)
+                    if len(lvl_shape) == 3:
+                        if lvl_axes.startswith("C") or (not lvl_axes and lvl_shape[0] == C):
+                            yx = (lvl_shape[1], lvl_shape[2])
+                        elif lvl_axes.endswith("C") or (not lvl_axes and lvl_shape[2] == C):
+                            yx = (lvl_shape[0], lvl_shape[1])
+                        else:
+                            yx = (lvl_shape[1], lvl_shape[2])
+                    elif len(lvl_shape) == 2:
+                        yx = (lvl_shape[0], lvl_shape[1])
+                    else:
+                        continue
+                    if _dbg:
+                        print(f"{_tag}   level {li}: raw shape={lvl_shape} axes={lvl_axes!r} → yx={yx}", flush=True)
+                    levels_meta.append((li, yx, lvl_dtype, lvl_axes))
+                except Exception as _le:
+                    if _dbg:
+                        print(f"{_tag}   level {li}: skipped ({_le})", flush=True)
+
+        if not levels_meta:
+            if _dbg:
+                print(f"{_tag} SKIP — could not read level metadata", flush=True)
+            return None
+
+        # Build one dask.delayed array per pyramid level.
+        # Each delayed call re-opens the file and reads the channel plane for that level.
+        def _read_level_channel(p: str, level_idx: int, ch_idx: int, lvl_axes: str):
+            with tifffile.TiffFile(p) as _tf:
+                _lvl = _tf.series[0].levels[level_idx]
+                _la = str(getattr(_lvl, "axes", "") or lvl_axes)
+                if _la.startswith("C") or (not _la and _lvl.shape[0] <= 64):
+                    return np.asarray(_lvl.asarray(key=ch_idx))
+                elif _la.endswith("C") or (not _la and _lvl.shape[2] <= 64):
+                    return np.asarray(_lvl.asarray())[..., ch_idx]
+                else:
+                    return np.asarray(_lvl.asarray(key=ch_idx))
+
+        dask_levels: list = []
+        for li, yx, dtype, lvl_axes in levels_meta:
+            delayed_plane = dask.delayed(_read_level_channel)(path, li, idx, lvl_axes)
+            dask_arr = da.from_delayed(delayed_plane, shape=yx, dtype=dtype)
+            dask_levels.append(dask_arr)
+            if _dbg:
+                print(f"{_tag}   → dask level {li}: shape={yx} dtype={dtype}", flush=True)
+
+        if _dbg:
+            print(f"{_tag} OK — {len(dask_levels)} pyramid level(s)", flush=True)
+        return dask_levels
+    except Exception as _e:
+        if _dbg:
+            import traceback
+            print(f"{_tag} EXCEPTION: {_e}", flush=True)
+            traceback.print_exc()
+        return None
 
 
 class LazyChannelImage:

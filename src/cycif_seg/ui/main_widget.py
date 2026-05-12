@@ -42,6 +42,9 @@ from cycif_seg.ui.batch_stitch_dialog import BatchStitchDialog
 from cycif_seg.ui.batch_preprocess_dialog import BatchPreprocessDialog
 from cycif_seg.ui.steps.step2a_nuclei_panel import Step2aNucleiPanel
 from cycif_seg.ui.steps.step2b_edit_panel import Step2bEditPanel
+from cycif_seg.ui.settings_panel import SettingsPanel
+from cycif_seg.io.ome_tiff import set_tiff_loading_debug
+from cycif_seg.preprocess.organize_cycles import set_preprocess_debug
 from cycif_seg.features.multiscale import build_features
 from cycif_seg.model.rf_pixel import train_rf, predict_proba_tiled
 
@@ -172,6 +175,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_nuclei = self.step2a_panel.btn_nuclei
         self.btn_stop_nuclei = self.step2a_panel.btn_stop_nuclei
         self.chk_show_nuc_markers = self.step2a_panel.chk_show_nuc_markers
+        self.chk_multiscale = self.step2a_panel.chk_multiscale
         self.slider_alpha = self.step2a_panel.slider_alpha
         self.tabs.addTab(self.step2a_panel, "Step 2a: Nuclei (initial)")
 
@@ -221,6 +225,18 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         tab5_layout.addWidget(QtWidgets.QLabel("Step 5 (coming soon): batch run steps 2–4 with QC checks."))
         tab5_layout.addStretch(1)
         self.tabs.addTab(tab5, "Step 5: Batch/QC")
+
+        # -----------------------------
+        # Settings tab
+        # -----------------------------
+        self.settings_panel = SettingsPanel()
+        self.tabs.addTab(self.settings_panel, "Settings")
+        self.settings_panel.chk_debug_tiff_loading.stateChanged.connect(
+            lambda state: set_tiff_loading_debug(state != 0)
+        )
+        self.settings_panel.chk_debug_preprocess.stateChanged.connect(
+            lambda state: set_preprocess_debug(state != 0)
+        )
 
         # Global status + progress (visible across tabs)
         self.status = QtWidgets.QLabel("")

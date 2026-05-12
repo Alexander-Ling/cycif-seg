@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cycif-seg"
-version = "0.0.51"
+version = "0.0.52"
 description = "MVP napari app for CycIF segmentation (scribbles + RF pixel classifier)"
 requires-python = ">=3.11"
 dependencies = [
-  "napari[pyqt5]",
   "numpy",
   "tifffile",
   "zarr",
@@ -16,15 +15,20 @@ dependencies = [
   "scikit-image",
   "scipy",
   "scikit-learn",
-  "qtpy",
   "simpleitk",
-  "superqt",
   "ome-types",
+]
+
+[project.optional-dependencies]
+gui = [
+  "napari[pyqt5]",
   "qtpy",
+  "superqt",
 ]
 
 [project.scripts]
-cycif-seg = "cycif_seg.app:main"
+cycif-seg            = "cycif_seg.app:main"
+cycif-seg-preprocess = "cycif_seg.cli.preprocess:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

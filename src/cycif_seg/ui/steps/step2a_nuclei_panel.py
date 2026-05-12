@@ -24,6 +24,16 @@ class Step2aNucleiPanel(QtWidgets.QWidget):
         file_row.addWidget(self.lbl_file, 1)
         layout.addLayout(file_row)
 
+        self.chk_multiscale = QtWidgets.QCheckBox("Multiscale (tiled) loading")
+        self.chk_multiscale.setChecked(True)
+        self.chk_multiscale.setToolTip(
+            "Load pyramidal OME-TIFFs as tiled multi-resolution images.\n"
+            "napari displays the appropriate resolution level for the current zoom,\n"
+            "reducing RAM usage for large files.\n"
+            "Requires a pyramidal output file from Step 1."
+        )
+        layout.addWidget(self.chk_multiscale)
+
         header_row = QtWidgets.QHBoxLayout()
         header_row.addWidget(QtWidgets.QLabel("Channels used for RF training:"))
         layout.addLayout(header_row)
