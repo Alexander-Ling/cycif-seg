@@ -4,6 +4,8 @@ import math
 import os
 import re
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -70,24 +72,28 @@ class DirectedEdge:
 
 class RunningOverlap:
     def __init__(self, tile_h: int, tile_w: int, frac: float = 0.05):
+        self._lock = threading.Lock()
         self._x: list[float] = [max(8.0, float(tile_w) * float(frac))]
         self._y: list[float] = [max(8.0, float(tile_h) * float(frac))]
 
     @property
     def overlap_x(self) -> float:
-        return float(sum(self._x) / max(1, len(self._x)))
+        with self._lock:
+            return float(sum(self._x) / max(1, len(self._x)))
 
     @property
     def overlap_y(self) -> float:
-        return float(sum(self._y) / max(1, len(self._y)))
+        with self._lock:
+            return float(sum(self._y) / max(1, len(self._y)))
 
     def add(self, axis: str, overlap_px: float) -> None:
         if not np.isfinite(overlap_px):
             return
-        if axis == 'x':
-            self._x.append(float(overlap_px))
-        else:
-            self._y.append(float(overlap_px))
+        with self._lock:
+            if axis == 'x':
+                self._x.append(float(overlap_px))
+            else:
+                self._y.append(float(overlap_px))
 
 
 def _compile_tile_regex(tile_filename_regex: str | None) -> re.Pattern[str]:
@@ -361,6 +367,7 @@ def _build_neighbor_estimates(
     threshold: float,
     progress_cb: Callable[[str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
+    n_workers: int = 1,
 ) -> tuple[dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate], RunningOverlap, int, int, int]:
     if not tiles:
         raise ValueError('No tile files found')
@@ -369,16 +376,28 @@ def _build_neighbor_estimates(
     tile_h, tile_w, n_channels = (int(info['shape_yxc'][0]), int(info['shape_yxc'][1]), int(info['shape_yxc'][2]))
     running = RunningOverlap(tile_h, tile_w, frac=0.05)
     cache: dict[tuple[int, int], np.ndarray] = {}
+    cache_lock = threading.Lock()
 
     def _img(xy: tuple[int, int]) -> np.ndarray:
-        if xy not in cache:
-            cache[xy] = np.asarray(load_single_channel_tiff_native(str(tiles[xy]), int(channel_index)), dtype=np.float32)
-        return cache[xy]
+        with cache_lock:
+            if xy in cache:
+                return cache[xy]
+        arr = np.asarray(load_single_channel_tiff_native(str(tiles[xy]), int(channel_index)), dtype=np.float32)
+        with cache_lock:
+            if xy not in cache:
+                cache[xy] = arr
+            return cache[xy]
 
     pairs: list[tuple[float, str, tuple[int, int], tuple[int, int]]] = []
     nom_x = max(8, int(round(tile_w * 0.05)))
     nom_y = max(8, int(round(tile_h * 0.05)))
-    for (x, y), p in sorted(tiles.items()):
+    n_tiles_total = len(tiles)
+    for ti, ((x, y), p) in enumerate(sorted(tiles.items()), start=1):
+        if progress_cb is not None:
+            try:
+                progress_cb(f'Loading tile {ti}/{n_tiles_total}…')
+            except Exception:
+                pass
         if (x + 1, y) in tiles:
             a = _img((x, y))[:, tile_w - nom_x : tile_w]
             b = _img((x + 1, y))[:, :nom_x]
@@ -395,45 +414,86 @@ def _build_neighbor_estimates(
     any_signal = False
     any_unmasked = False
     n_pairs = len(pairs)
-    for pi, (_score, axis, src_xy, dst_xy) in enumerate(pairs, start=1):
-        if cancel_cb is not None and bool(cancel_cb()):
-            raise RuntimeError('Cancelled')
-        src = _img(src_xy)
-        dst = _img(dst_xy)
-        nominal = running.overlap_x if axis == 'x' else running.overlap_y
-        est = _estimate_strip_pair(src, dst, axis=axis, nominal_overlap_px=nominal, thr=threshold)
-        if est is None:
+    effective_workers = max(1, min(int(n_workers), n_pairs)) if n_pairs > 0 else 1
+
+    def _build_estimate(axis: str, src_xy: tuple[int, int], dst_xy: tuple[int, int], raw: NeighborEstimate | None) -> NeighborEstimate:
+        if raw is None:
             if axis == 'x':
                 overlap = float(running.overlap_x)
                 dy, dx = 0.0, float(tile_w - overlap)
             else:
                 overlap = float(running.overlap_y)
                 dy, dx = float(tile_h - overlap), 0.0
-            est = NeighborEstimate(axis=axis, src=src_xy, dst=dst_xy, dy=dy, dx=dx, overlap_px=overlap, score=-1.0, used_fallback=True, fg_overlap_pixels=0.0, fg_overlap_frac=0.0)
-        else:
-            est = NeighborEstimate(
-                axis=axis,
-                src=src_xy,
-                dst=dst_xy,
-                dy=est.dy,
-                dx=est.dx,
-                overlap_px=est.overlap_px,
-                score=est.score,
-                used_fallback=False,
-                used_unmasked=bool(getattr(est, 'used_unmasked', False)),
-                fg_overlap_pixels=float(getattr(est, 'fg_overlap_pixels', 0.0)),
-                fg_overlap_frac=float(getattr(est, 'fg_overlap_frac', 0.0)),
-            )
-            running.add(axis, est.overlap_px)
-            any_signal = True
-            any_unmasked = any_unmasked or bool(est.used_unmasked)
-        estimates[(src_xy, dst_xy)] = est
-        if progress_cb is not None:
-            try:
-                extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
-                progress_cb(f"[{pi}/{n_pairs} pairs] Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px, fg_overlap={getattr(est, 'fg_overlap_pixels', 0.0):.0f}px){extra}")
-            except Exception:
-                pass
+            return NeighborEstimate(axis=axis, src=src_xy, dst=dst_xy, dy=dy, dx=dx, overlap_px=overlap, score=-1.0, used_fallback=True, fg_overlap_pixels=0.0, fg_overlap_frac=0.0)
+        return NeighborEstimate(
+            axis=axis,
+            src=src_xy,
+            dst=dst_xy,
+            dy=raw.dy,
+            dx=raw.dx,
+            overlap_px=raw.overlap_px,
+            score=raw.score,
+            used_fallback=False,
+            used_unmasked=bool(getattr(raw, 'used_unmasked', False)),
+            fg_overlap_pixels=float(getattr(raw, 'fg_overlap_pixels', 0.0)),
+            fg_overlap_frac=float(getattr(raw, 'fg_overlap_frac', 0.0)),
+        )
+
+    if effective_workers <= 1:
+        for pi, (_score, axis, src_xy, dst_xy) in enumerate(pairs, start=1):
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError('Cancelled')
+            src = _img(src_xy)
+            dst = _img(dst_xy)
+            nominal = running.overlap_x if axis == 'x' else running.overlap_y
+            raw = _estimate_strip_pair(src, dst, axis=axis, nominal_overlap_px=nominal, thr=threshold)
+            est = _build_estimate(axis, src_xy, dst_xy, raw)
+            if not est.used_fallback:
+                running.add(axis, est.overlap_px)
+                any_signal = True
+                any_unmasked = any_unmasked or bool(est.used_unmasked)
+            estimates[(src_xy, dst_xy)] = est
+            if progress_cb is not None:
+                try:
+                    extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
+                    progress_cb(f"[{pi}/{n_pairs} pairs] Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px, fg_overlap={getattr(est, 'fg_overlap_pixels', 0.0):.0f}px){extra}")
+                except Exception:
+                    pass
+    else:
+        def _pair_task(axis: str, src_xy: tuple[int, int], dst_xy: tuple[int, int]) -> tuple[str, tuple[int, int], tuple[int, int], NeighborEstimate]:
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError('Cancelled')
+            src = _img(src_xy)
+            dst = _img(dst_xy)
+            nominal = running.overlap_x if axis == 'x' else running.overlap_y
+            raw = _estimate_strip_pair(src, dst, axis=axis, nominal_overlap_px=nominal, thr=threshold)
+            return axis, src_xy, dst_xy, _build_estimate(axis, src_xy, dst_xy, raw)
+
+        completed_count = 0
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_to_pair = {
+                executor.submit(_pair_task, axis, src_xy, dst_xy): (axis, src_xy, dst_xy)
+                for _score, axis, src_xy, dst_xy in pairs
+            }
+            for fut in as_completed(future_to_pair):
+                if cancel_cb is not None and bool(cancel_cb()):
+                    break
+                axis, src_xy, dst_xy, est = fut.result()
+                if not est.used_fallback:
+                    running.add(axis, est.overlap_px)
+                    any_signal = True
+                    any_unmasked = any_unmasked or bool(est.used_unmasked)
+                estimates[(src_xy, dst_xy)] = est
+                completed_count += 1
+                if progress_cb is not None:
+                    try:
+                        extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
+                        progress_cb(f"[{completed_count}/{n_pairs} pairs] Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px, fg_overlap={getattr(est, 'fg_overlap_pixels', 0.0):.0f}px){extra}")
+                    except Exception:
+                        pass
+        if cancel_cb is not None and bool(cancel_cb()):
+            raise RuntimeError('Cancelled')
+
     if not any_signal:
         raise RuntimeError('Unable to estimate tile overlaps for this cycle/channel, including unmasked fallback registration.')
     return estimates, running, tile_h, tile_w, n_channels
@@ -731,6 +791,7 @@ def stitch_cycle_tiles(
     y_group: int = _DEFAULT_Y_GROUP,
     progress_cb: Callable[[str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
+    n_workers: int = 1,
 ) -> dict:
     def _check_cancel() -> None:
         if cancel_cb is not None and bool(cancel_cb()):
@@ -775,7 +836,10 @@ def stitch_cycle_tiles(
         float(thr),
         progress_cb=progress_cb,
         cancel_cb=cancel_cb,
+        n_workers=int(n_workers),
     )
+    if progress_cb is not None:
+        progress_cb(f'Solving tile positions for {cycle_dir.name}…')
     positions = _solve_positions(tiles, estimates, channel_index=int(stitch_channel), threshold=float(thr))
 
     max_y = max(int(v[0]) for v in positions.values()) + int(tile_h)
@@ -813,6 +877,8 @@ def stitch_cycle_tiles(
                 plane = np.zeros_like(acc)
                 nz = wsum > 0
                 plane[nz] = acc[nz] / wsum[nz]
+                if progress_cb is not None:
+                    progress_cb(f'Writing channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}…')
                 writer.write_channel(ch, plane)
                 writer.flush()
         if pyramidal_output:

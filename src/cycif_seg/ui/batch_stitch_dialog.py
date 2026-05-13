@@ -71,12 +71,22 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self.spin_default_channel.setMaximum(999)
         self.chk_default_pyramidal = QtWidgets.QCheckBox('Pyramidal output')
         self.chk_default_pyramidal.setChecked(True)
+        self.spin_n_workers = QtWidgets.QSpinBox()
+        self.spin_n_workers.setMinimum(1)
+        self.spin_n_workers.setMaximum(64)
+        self.spin_n_workers.setValue(1)
+        self.spin_n_workers.setToolTip(
+            'Threads used for tile pair estimation within each cycle. '
+            'Higher values are faster but use more RAM.'
+        )
         self.btn_apply_defaults = QtWidgets.QPushButton('Apply defaults to all')
         defaults.addWidget(QtWidgets.QLabel('Default suffix:'))
         defaults.addWidget(self.txt_default_suffix)
         defaults.addWidget(QtWidgets.QLabel('Default stitch channel:'))
         defaults.addWidget(self.spin_default_channel)
         defaults.addWidget(self.chk_default_pyramidal)
+        defaults.addWidget(QtWidgets.QLabel('Threads per cycle:'))
+        defaults.addWidget(self.spin_n_workers)
         defaults.addWidget(self.btn_apply_defaults)
         defaults.addStretch(1)
         root.addLayout(defaults)
@@ -388,6 +398,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                 'tile_filename_regex': self.txt_tile_regex.text().strip() or _DEFAULT_TILE_RE.pattern,
                 'x_group': int(self.spin_x_group.value()),
                 'y_group': int(self.spin_y_group.value()),
+                'n_workers': int(self.spin_n_workers.value()),
             },
             'samples': [
                 {
@@ -432,6 +443,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self.txt_tile_regex.setText(str(defs.get('tile_filename_regex') or _DEFAULT_TILE_RE.pattern))
         self.spin_x_group.setValue(max(1, int(defs.get('x_group') or _DEFAULT_X_GROUP)))
         self.spin_y_group.setValue(max(1, int(defs.get('y_group') or _DEFAULT_Y_GROUP)))
+        self.spin_n_workers.setValue(max(1, int(defs.get('n_workers') or 1)))
         self._samples = [
             StitchSample(
                 name=str(rec.get('name') or ''),
@@ -499,6 +511,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self._cancel_requested = False
         self._reports = []
         self._failures = []
+        n_workers_value = int(self.spin_n_workers.value())
 
         @thread_worker
         def _worker():
@@ -530,6 +543,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                             y_group=int(y_group),
                             progress_cb=_progress,
                             cancel_cb=lambda: bool(self._cancel_requested),
+                            n_workers=n_workers_value,
                         )
                         rep['sample_name'] = s.name
                         reports.append(rep)
