@@ -360,6 +360,7 @@ def _build_neighbor_estimates(
     channel_index: int,
     threshold: float,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_cb: Callable[[], bool] | None = None,
 ) -> tuple[dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate], RunningOverlap, int, int, int]:
     if not tiles:
         raise ValueError('No tile files found')
@@ -393,7 +394,10 @@ def _build_neighbor_estimates(
     estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate] = {}
     any_signal = False
     any_unmasked = False
-    for _score, axis, src_xy, dst_xy in pairs:
+    n_pairs = len(pairs)
+    for pi, (_score, axis, src_xy, dst_xy) in enumerate(pairs, start=1):
+        if cancel_cb is not None and bool(cancel_cb()):
+            raise RuntimeError('Cancelled')
         src = _img(src_xy)
         dst = _img(dst_xy)
         nominal = running.overlap_x if axis == 'x' else running.overlap_y
@@ -427,7 +431,7 @@ def _build_neighbor_estimates(
         if progress_cb is not None:
             try:
                 extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
-                progress_cb(f"Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px, fg_overlap={getattr(est, 'fg_overlap_pixels', 0.0):.0f}px){extra}")
+                progress_cb(f"[{pi}/{n_pairs} pairs] Estimated tile offset {src_xy} -> {dst_xy} (axis={axis}, overlap≈{est.overlap_px:.1f}px, fg_overlap={getattr(est, 'fg_overlap_pixels', 0.0):.0f}px){extra}")
             except Exception:
                 pass
     if not any_signal:
@@ -770,6 +774,7 @@ def stitch_cycle_tiles(
         int(stitch_channel),
         float(thr),
         progress_cb=progress_cb,
+        cancel_cb=cancel_cb,
     )
     positions = _solve_positions(tiles, estimates, channel_index=int(stitch_channel), threshold=float(thr))
 
@@ -785,15 +790,19 @@ def stitch_cycle_tiles(
     used_fallback_pairs = sum(1 for e in estimates.values() if bool(e.used_fallback))
     used_unmasked_pairs = sum(1 for e in estimates.values() if bool(getattr(e, 'used_unmasked', False)))
     try:
+        sorted_tile_keys = sorted(tiles.keys(), key=lambda t: (t[1], t[0]))
+        n_tiles = len(sorted_tile_keys)
         with IncrementalOmeBigTiffWriter(str(out_flat), shape_yxc, info['dtype'], channel_names=channel_names, physical_pixel_sizes=phys) as writer:
             for ch in range(int(n_channels)):
                 _check_cancel()
                 if progress_cb is not None:
-                    progress_cb(f'Stitching channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}…')
+                    progress_cb(f'Stitching channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}… (0/{n_tiles} tiles)')
                 acc = np.zeros((shape_yxc[0], shape_yxc[1]), dtype=np.float32)
                 wsum = np.zeros((shape_yxc[0], shape_yxc[1]), dtype=np.float32)
-                for xy in sorted(tiles.keys(), key=lambda t: (t[1], t[0])):
+                for ti, xy in enumerate(sorted_tile_keys, start=1):
                     _check_cancel()
+                    if progress_cb is not None:
+                        progress_cb(f'Stitching channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}… ({ti}/{n_tiles} tiles)')
                     tile = np.asarray(load_single_channel_tiff_native(str(tiles[xy]), int(ch)), dtype=np.float32)
                     y0, x0 = positions[xy]
                     y1 = y0 + tile.shape[0]
