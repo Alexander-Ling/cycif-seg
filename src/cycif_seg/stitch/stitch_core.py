@@ -393,6 +393,8 @@ def _build_neighbor_estimates(
     nom_y = max(8, int(round(tile_h * 0.05)))
     n_tiles_total = len(tiles)
     for ti, ((x, y), p) in enumerate(sorted(tiles.items()), start=1):
+        if cancel_cb is not None and bool(cancel_cb()):
+            raise RuntimeError('Cancelled')
         if progress_cb is not None:
             try:
                 progress_cb(f'Loading tile {ti}/{n_tiles_total}…')
@@ -855,31 +857,45 @@ def stitch_cycle_tiles(
     used_unmasked_pairs = sum(1 for e in estimates.values() if bool(getattr(e, 'used_unmasked', False)))
     try:
         sorted_tile_keys = sorted(tiles.keys(), key=lambda t: (t[1], t[0]))
-        n_tiles = len(sorted_tile_keys)
+        n_strips = math.ceil(shape_yxc[0] / tile_h)
         with IncrementalOmeBigTiffWriter(str(out_flat), shape_yxc, info['dtype'], channel_names=channel_names, physical_pixel_sizes=phys) as writer:
             for ch in range(int(n_channels)):
                 _check_cancel()
-                if progress_cb is not None:
-                    progress_cb(f'Stitching channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}… (0/{n_tiles} tiles)')
-                acc = np.zeros((shape_yxc[0], shape_yxc[1]), dtype=np.float32)
-                wsum = np.zeros((shape_yxc[0], shape_yxc[1]), dtype=np.float32)
-                for ti, xy in enumerate(sorted_tile_keys, start=1):
-                    _check_cancel()
+                for si in range(n_strips):
+                    strip_row0 = si * tile_h
+                    strip_row1 = min(strip_row0 + tile_h, shape_yxc[0])
+                    actual_strip_h = strip_row1 - strip_row0
+                    # Tiles whose canvas row range intersects [strip_row0, strip_row1).
+                    # Use nominal tile_h for the filter; the clip below handles edge tiles.
+                    strip_tiles = [
+                        xy for xy in sorted_tile_keys
+                        if positions[xy][0] < strip_row1 and positions[xy][0] + tile_h > strip_row0
+                    ]
+                    n_strip_tiles = len(strip_tiles)
+                    acc = np.zeros((actual_strip_h, shape_yxc[1]), dtype=np.float32)
+                    wsum = np.zeros((actual_strip_h, shape_yxc[1]), dtype=np.float32)
+                    for sti, xy in enumerate(strip_tiles, start=1):
+                        _check_cancel()
+                        if progress_cb is not None:
+                            progress_cb(f'Stitching channel {ch + 1}/{n_channels} strip {si + 1}/{n_strips} for cycle {cycle_dir.name}… ({sti}/{n_strip_tiles} tiles)')
+                        ty0, x0 = positions[xy]
+                        tile = np.asarray(load_single_channel_tiff_native(str(tiles[xy]), int(ch)), dtype=np.float32)
+                        actual_tile_h, actual_tile_w = tile.shape
+                        tile_r0 = max(0, strip_row0 - ty0)
+                        tile_r1 = min(actual_tile_h, strip_row1 - ty0)
+                        if tile_r1 <= tile_r0:
+                            continue
+                        strip_r0 = ty0 + tile_r0 - strip_row0
+                        strip_r1 = ty0 + tile_r1 - strip_row0
+                        x1 = x0 + actual_tile_w
+                        w = feather[tile_r0:tile_r1, :actual_tile_w]
+                        acc[strip_r0:strip_r1, x0:x1] += tile[tile_r0:tile_r1, :] * w
+                        wsum[strip_r0:strip_r1, x0:x1] += w
+                    nz = wsum > 0
+                    acc[nz] /= wsum[nz]
                     if progress_cb is not None:
-                        progress_cb(f'Stitching channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}… ({ti}/{n_tiles} tiles)')
-                    tile = np.asarray(load_single_channel_tiff_native(str(tiles[xy]), int(ch)), dtype=np.float32)
-                    y0, x0 = positions[xy]
-                    y1 = y0 + tile.shape[0]
-                    x1 = x0 + tile.shape[1]
-                    w = feather[: tile.shape[0], : tile.shape[1]]
-                    acc[y0:y1, x0:x1] += tile * w
-                    wsum[y0:y1, x0:x1] += w
-                plane = np.zeros_like(acc)
-                nz = wsum > 0
-                plane[nz] = acc[nz] / wsum[nz]
-                if progress_cb is not None:
-                    progress_cb(f'Writing channel {ch + 1}/{n_channels} for cycle {cycle_dir.name}…')
-                writer.write_channel(ch, plane)
+                        progress_cb(f'Writing channel {ch + 1}/{n_channels} strip {si + 1}/{n_strips} for cycle {cycle_dir.name}…')
+                    writer.write_channel_strip(ch, acc, strip_row0)
                 writer.flush()
         if pyramidal_output:
             _check_cancel()
