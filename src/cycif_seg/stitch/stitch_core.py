@@ -22,6 +22,7 @@ from cycif_seg.io.ome_tiff import (
     IncrementalOmeBigTiffWriter,
     convert_flat_ome_to_pyramidal,
     inspect_tiff_yxc,
+    load_channel_strip,
     load_physical_pixel_sizes,
     load_single_channel_tiff_native,
 )
@@ -375,6 +376,57 @@ def _build_neighbor_estimates(
     info = inspect_tiff_yxc(str(first))
     tile_h, tile_w, n_channels = (int(info['shape_yxc'][0]), int(info['shape_yxc'][1]), int(info['shape_yxc'][2]))
     running = RunningOverlap(tile_h, tile_w, frac=0.05)
+
+    def _load_tile_edge(xy: tuple[int, int], edge: str, n_px: int) -> np.ndarray:
+        """Load only the narrow border strip needed for foreground scoring.
+
+        'top'/'bottom' use load_channel_strip for an efficient row-range read.
+        'left'/'right' must read the full tile (TIFF is row-major) but the full
+        array is immediately discarded after the column slice is returned.
+        """
+        path = str(tiles[xy])
+        ch = int(channel_index)
+        if edge == 'top':
+            return np.asarray(load_channel_strip(path, ch, 0, n_px), dtype=np.float32)
+        if edge == 'bottom':
+            return np.asarray(load_channel_strip(path, ch, tile_h - n_px, tile_h), dtype=np.float32)
+        full = np.asarray(load_single_channel_tiff_native(path, ch), dtype=np.float32)
+        if edge == 'left':
+            return full[:, :n_px]
+        return full[:, tile_w - n_px:]  # 'right'
+
+    # Phase 1: score every neighbor pair using thin border strips only.
+    # No tile data is retained in memory after each pair's score is computed.
+    pairs: list[tuple[float, str, tuple[int, int], tuple[int, int]]] = []
+    nom_x = max(8, int(round(tile_w * 0.05)))
+    nom_y = max(8, int(round(tile_h * 0.05)))
+    n_tiles_total = len(tiles)
+    for ti, ((x, y), p) in enumerate(sorted(tiles.items()), start=1):
+        if cancel_cb is not None and bool(cancel_cb()):
+            raise RuntimeError('Cancelled')
+        if progress_cb is not None:
+            try:
+                progress_cb(f'Scoring tile {ti}/{n_tiles_total}…')
+            except Exception:
+                pass
+        if (x + 1, y) in tiles:
+            a = _load_tile_edge((x, y), 'right', nom_x)
+            b = _load_tile_edge((x + 1, y), 'left', nom_x)
+            score = _foreground_fraction(a, threshold) + _foreground_fraction(b, threshold)
+            pairs.append((score, 'x', (x, y), (x + 1, y)))
+        if (x, y + 1) in tiles:
+            a = _load_tile_edge((x, y), 'bottom', nom_y)
+            b = _load_tile_edge((x, y + 1), 'top', nom_y)
+            score = _foreground_fraction(a, threshold) + _foreground_fraction(b, threshold)
+            pairs.append((score, 'y', (x, y), (x, y + 1)))
+    pairs.sort(key=lambda t: (-float(t[0]), t[1], t[2], t[3]))
+
+    # Phase 2: ref-counted full-tile cache — evict each tile as soon as its
+    # last pair has been processed so tiles are freed as early as possible.
+    from collections import Counter
+    ref_counts: dict[tuple[int, int], int] = Counter(
+        xy for _, _, src, dst in pairs for xy in (src, dst)
+    )
     cache: dict[tuple[int, int], np.ndarray] = {}
     cache_lock = threading.Lock()
 
@@ -388,29 +440,11 @@ def _build_neighbor_estimates(
                 cache[xy] = arr
             return cache[xy]
 
-    pairs: list[tuple[float, str, tuple[int, int], tuple[int, int]]] = []
-    nom_x = max(8, int(round(tile_w * 0.05)))
-    nom_y = max(8, int(round(tile_h * 0.05)))
-    n_tiles_total = len(tiles)
-    for ti, ((x, y), p) in enumerate(sorted(tiles.items()), start=1):
-        if cancel_cb is not None and bool(cancel_cb()):
-            raise RuntimeError('Cancelled')
-        if progress_cb is not None:
-            try:
-                progress_cb(f'Loading tile {ti}/{n_tiles_total}…')
-            except Exception:
-                pass
-        if (x + 1, y) in tiles:
-            a = _img((x, y))[:, tile_w - nom_x : tile_w]
-            b = _img((x + 1, y))[:, :nom_x]
-            score = _foreground_fraction(a, threshold) + _foreground_fraction(b, threshold)
-            pairs.append((score, 'x', (x, y), (x + 1, y)))
-        if (x, y + 1) in tiles:
-            a = _img((x, y))[tile_h - nom_y : tile_h, :]
-            b = _img((x, y + 1))[:nom_y, :]
-            score = _foreground_fraction(a, threshold) + _foreground_fraction(b, threshold)
-            pairs.append((score, 'y', (x, y), (x, y + 1)))
-    pairs.sort(key=lambda t: (-float(t[0]), t[1], t[2], t[3]))
+    def _release(xy: tuple[int, int]) -> None:
+        with cache_lock:
+            ref_counts[xy] -= 1
+            if ref_counts[xy] <= 0:
+                cache.pop(xy, None)
 
     estimates: dict[tuple[tuple[int, int], tuple[int, int]], NeighborEstimate] = {}
     any_signal = False
@@ -455,6 +489,8 @@ def _build_neighbor_estimates(
                 any_signal = True
                 any_unmasked = any_unmasked or bool(est.used_unmasked)
             estimates[(src_xy, dst_xy)] = est
+            _release(src_xy)
+            _release(dst_xy)
             if progress_cb is not None:
                 try:
                     extra = ' [unmasked]' if bool(getattr(est, 'used_unmasked', False)) else ''
@@ -486,6 +522,8 @@ def _build_neighbor_estimates(
                     any_signal = True
                     any_unmasked = any_unmasked or bool(est.used_unmasked)
                 estimates[(src_xy, dst_xy)] = est
+                _release(src_xy)
+                _release(dst_xy)
                 completed_count += 1
                 if progress_cb is not None:
                     try:
