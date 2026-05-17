@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cycif-seg"
-version = "0.0.55"
+version = "0.0.56"
 description = "MVP napari app for CycIF segmentation (scribbles + RF pixel classifier)"
 requires-python = ">=3.11"
 dependencies = [
@@ -29,6 +29,7 @@ gui = [
 [project.scripts]
 cycif-seg            = "cycif_seg.app:main"
 cycif-seg-preprocess = "cycif_seg.cli.preprocess:main"
+cycif-seg-run        = "cycif_seg.cli.run_pipeline:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

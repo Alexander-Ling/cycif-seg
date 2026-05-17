@@ -64,6 +64,7 @@ def _dbg(msg: str) -> None:
 class CycleInput:
     path: str
     cycle: int
+    label: str | None = None
     tissue: str | None = None
     species: str | None = None
     registration_marker: str | None = None
@@ -149,6 +150,16 @@ def _find_channel_index(ch_names: list[str], marker: str) -> int | None:
         if m in (nm or "").strip().lower():
             return i
     return None
+
+
+def _resolve_reg_channel(ci: "CycleInput", marker: str) -> int | None:
+    """Find registration marker index, falling back to ci.channel_markers when
+    the stitched file's own channel metadata doesn't contain the marker name."""
+    from cycif_seg.io.ome_tiff import load_channel_names_only as _lcno
+    idx = _find_channel_index(_lcno(ci.path), marker)
+    if idx is None and ci.channel_markers:
+        idx = _find_channel_index(list(ci.channel_markers), marker)
+    return idx
 
 
 def _tiff_info_yxc(path: str) -> tuple[tuple[int, int, int], np.dtype]:
@@ -1185,16 +1196,15 @@ def merge_cycles_to_ome_tiff(
             markers = ci.channel_markers or []
             marker = (markers[j] if j < len(markers) else "").strip()
             base = marker or (nm or "").strip() or "Channel"
-            stem = f"{base}_cy{int(ci.cycle)}"
+            stem = f"{base}_cy{ci.label if ci.label is not None else ci.cycle}"
             k = int(seen.get(stem, 0))
             out_nm = f"{stem}_{k+1}" if k else stem
             seen[stem] = k + 1
             merged_names.append(out_nm)
             out_c += 1
 
-    ref_names = load_channel_names_only(ref_ci.path)
     ref_marker = ref_ci.registration_marker or default_registration_marker
-    ref_ch_idx = _find_channel_index(ref_names, ref_marker)
+    ref_ch_idx = _resolve_reg_channel(ref_ci, ref_marker)
     if ref_ch_idx is None:
         raise ValueError(f"Could not find registration marker {ref_marker!r} in reference cycle {int(ref_ci.cycle)}")
     if _strip_mode:
@@ -1394,8 +1404,7 @@ def merge_cycles_to_ome_tiff(
             _check_cancel(cancel_cb)
             cycle = int(ci.cycle)
             marker = ci.registration_marker or default_registration_marker
-            names = load_channel_names_only(ci.path)
-            ch_idx = _find_channel_index(names, marker)
+            ch_idx = _resolve_reg_channel(ci, marker)
             if ch_idx is None:
                 raise ValueError(f"Could not find registration marker {marker!r} in cycle {cycle}")
 
