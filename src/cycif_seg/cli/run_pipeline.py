@@ -117,6 +117,7 @@ def discover_cycles(
         by_num.setdefault(cycle_num, []).append((suffix, folder))
 
     cycle_infos: list[dict] = []
+    cycle_int_counter = 0  # monotonically increasing; guarantees uniqueness across all cycles
 
     for cycle_num in sorted(by_num):
         entries = by_num[cycle_num]
@@ -133,8 +134,8 @@ def discover_cycles(
 
         for idx, (suffix, folder) in enumerate(sorted(entries, key=lambda x: x[1].name)):
             label = f"{cycle_num}{_letter_suffix(idx)}" if is_dup else str(cycle_num)
-            # Use offset integers to keep ordering: e.g. cycle 1 dups → 10, 11; cycle 2 → 20
-            cycle_int = cycle_num * 10 + idx if is_dup else cycle_num
+            cycle_int = cycle_int_counter
+            cycle_int_counter += 1
 
             # Count tiles
             tiles = discover_cycle_tiles(folder, tile_filename_regex=tile_regex)
