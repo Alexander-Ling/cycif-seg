@@ -239,13 +239,13 @@ def _run_registration(
     pyramidal_output: bool,
     force: bool = False,
 ) -> None:
-    from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
-
-    if not force and output_path.exists():
-        print(f"\n--- Registration ---")
-        print(f"  [skip] Merged file already exists: {output_path}")
-        print(f"  Pass --force-register to overwrite.")
-        return
+    from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
+    from cycif_seg.preprocess.organize_cycles import (
+        CycleInput,
+        inspect_registration_flat_resume_state,
+        merge_cycles_to_ome_tiff,
+        registration_progress_sidecar_path,
+    )
 
     cycles: list[CycleInput] = []
     for ci, spath in zip(cycle_infos, stitched_paths):
@@ -258,7 +258,81 @@ def _run_registration(
         ))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"\n--- Registering {len(cycles)} cycle(s) → {output_path} ---")
+
+    progress_path = registration_progress_sidecar_path(output_path)
+
+    if force:
+        print(f"\n--- Registering {len(cycles)} cycle(s) -> {output_path} ---")
+        print("  [force] Rebuilding merged output from scratch.")
+        _discard_registration_outputs(output_path, progress_path)
+        merge_cycles_to_ome_tiff(
+            cycles=cycles,
+            output_path=str(output_path),
+            default_registration_marker=registration_marker,
+            registration_algorithm=registration_algorithm,
+            strip_height=strip_height,
+            pyramidal_output=pyramidal_output,
+            progress_cb=lambda msg: print(f"  {msg}"),
+        )
+        print(f"  Done. Merged output: {output_path}")
+        return
+
+    print(f"\n--- Registration ---")
+
+    if output_path.exists() and pyramidal_output:
+        try:
+            pyramid_info = inspect_tiff_pyramid(str(output_path))
+            if bool(pyramid_info.get("is_pyramidal", False)):
+                print(f"  [skip] Pyramidal merged output already exists: {output_path}")
+                print("  Pass --force-register to overwrite.")
+                return
+        except Exception:
+            # The file may be a partial flat output. Let the resume inspector
+            # decide whether it is compatible and recoverable.
+            pass
+
+    try:
+        resume_state = inspect_registration_flat_resume_state(
+            cycles,
+            output_path,
+            registration_algorithm=registration_algorithm,
+            low_mem=False,
+            strip_height=strip_height,
+            completion="hybrid",
+            manifest_path=progress_path,
+        )
+    except Exception as exc:
+        if not output_path.exists():
+            raise
+        raise RuntimeError(
+            f"Existing merged output cannot be resumed safely: {exc}. "
+            "Use --force-register to discard it and rebuild."
+        ) from exc
+
+    for msg in resume_state.get("messages", []):
+        print(f"  [resume] {msg}")
+
+    completed_cycles = [int(c) for c in resume_state.get("completed_cycles", [])]
+    first_incomplete = resume_state.get("first_incomplete_cycle", None)
+
+    if first_incomplete is None:
+        if pyramidal_output:
+            print(
+                "  [resume] Flat registration output is complete; "
+                "building/resuming pyramidal output."
+            )
+        else:
+            print(f"  [skip] Flat merged output is already complete: {output_path}")
+            print("  Pass --force-register to overwrite.")
+            return
+    elif completed_cycles:
+        print(
+            "  [resume] Completed cycle(s): "
+            f"{', '.join(str(c) for c in completed_cycles)}; "
+            f"resuming at cycle {int(first_incomplete)}."
+        )
+    else:
+        print(f"  Registering {len(cycles)} cycle(s) -> {output_path}")
 
     merge_cycles_to_ome_tiff(
         cycles=cycles,
@@ -267,9 +341,27 @@ def _run_registration(
         registration_algorithm=registration_algorithm,
         strip_height=strip_height,
         pyramidal_output=pyramidal_output,
+        resume_flat_output=bool(output_path.exists()),
+        completed_cycles=completed_cycles,
+        registration_progress_path=str(resume_state["manifest_path"]),
+        registration_fingerprint=resume_state["fingerprint"],
         progress_cb=lambda msg: print(f"  {msg}"),
     )
     print(f"  Done. Merged output: {output_path}")
+
+
+def _discard_registration_outputs(output_path: Path, progress_path: Path) -> None:
+    """Remove resumable registration artifacts for an explicit forced rebuild."""
+    candidates = [
+        output_path,
+        progress_path,
+        output_path.with_name(f"{output_path.stem}.__pyramid_tmp__.ome.tiff"),
+    ]
+    for path in candidates:
+        try:
+            path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +416,10 @@ def _build_parser() -> argparse.ArgumentParser:
     misc_grp.add_argument("--force-stitch", action="store_true",
                            help="Re-stitch even if *_cyseg-stitched.ome.tiff already exists")
     misc_grp.add_argument("--force-register", action="store_true",
-                           help="Re-register even if the merged output file already exists")
+                           help=(
+                               "Discard resumable registration state and rebuild the "
+                               "merged output even if it already exists"
+                           ))
     misc_grp.add_argument("--dry-run", action="store_true",
                            help="Validate and print plan without executing")
 

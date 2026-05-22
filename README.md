@@ -153,7 +153,9 @@ Use `cycif-seg-run` when a sample directory contains cycle subdirectories named 
 cycif-seg-run SAMPLE_DIR --registration-marker DAPI --strip-height 1000
 ```
 
-This command stitches tile files in each cycle directory, then registers cycles into one merged OME-TIFF. Useful options include:
+This command stitches tile files in each cycle directory, then registers cycles into one merged OME-TIFF. By default, it resumes interrupted work when possible: existing stitched files are reused, partial flat registration outputs are inspected with the registration progress sidecar and a conservative pixel scan, completed cycles are skipped, and interrupted pyramid builds reuse completed level files. If a complete flat merged output exists and pyramidal output is requested, the command continues directly into pyramid construction/resume instead of repeating registration. Use `--force-register` to discard resumable registration state and rebuild the merged output from scratch.
+
+Useful options include:
 
 - Output: `--output-dir PATH`, `--output-name NAME`.
 - Stitching: `--stitch-channel INT`, `--n-workers INT`, `--tile-regex REGEX`.
