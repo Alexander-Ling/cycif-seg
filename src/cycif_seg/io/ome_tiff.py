@@ -848,6 +848,47 @@ def _raw_memmap(path: str, shape: tuple[int, ...], dtype: np.dtype, mode: str = 
     return np.memmap(path, dtype=np.dtype(dtype), mode=mode, shape=tuple(int(v) for v in shape))
 
 
+def _expected_pyramid_level_shapes(shape_cyx: tuple[int, int, int], subifds: int) -> list[tuple[int, int, int]]:
+    c, y, x = (int(shape_cyx[0]), int(shape_cyx[1]), int(shape_cyx[2]))
+    shapes: list[tuple[int, int, int]] = []
+    for _level in range(1, int(subifds) + 1):
+        y = max(1, (y + 1) // 2)
+        x = max(1, (x + 1) // 2)
+        shapes.append((c, y, x))
+    return shapes
+
+
+def _valid_raw_level_file(path: Path, shape: tuple[int, int, int], dtype: np.dtype) -> bool:
+    try:
+        expected_bytes = int(np.prod(tuple(int(v) for v in shape))) * int(np.dtype(dtype).itemsize)
+        if not path.is_file() or int(path.stat().st_size) != expected_bytes:
+            return False
+        mm = _raw_memmap(str(path), shape, dtype, mode='r')
+        _close_memmap(mm)
+        del mm
+        return True
+    except Exception:
+        return False
+
+
+def _find_resume_pyramid_work_dir(base_dir: Path, expected_shapes: list[tuple[int, int, int]], dtype: np.dtype) -> Path | None:
+    candidates: list[Path] = []
+    try:
+        candidates = [
+            p for p in base_dir.glob('cycif_pyramid_work_*')
+            if p.is_dir() and (p / 'levels').is_dir()
+        ]
+    except Exception:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
+    for cand in candidates:
+        levels = cand / 'levels'
+        for idx, shape in enumerate(expected_shapes, start=1):
+            if _valid_raw_level_file(levels / f'level_{idx:02d}.dat', shape, dtype):
+                return cand
+    return None
+
+
 def _close_memmap(arr: np.ndarray | None) -> None:
     """Best-effort close for numpy.memmap backing files on Windows."""
     if arr is None:
@@ -878,6 +919,9 @@ def convert_flat_ome_to_pyramidal(
     out_chunk: int = 1024,
     replace_source: bool = False,
     temp_dir: str | None = None,
+    work_dir: str | None = None,
+    resume: bool = True,
+    keep_work_dir: bool = False,
     progress_cb: Callable[[str], None] | None = None,
     progress_step_cb: Callable[[str, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
@@ -908,21 +952,6 @@ def convert_flat_ome_to_pyramidal(
     src = str(source_path)
     src_path = Path(src)
     dst_path = Path(output_path) if output_path is not None else None
-
-    if temp_dir is None:
-        if dst_path is not None:
-            temp_base = dst_path.parent
-        else:
-            temp_base = src_path.parent
-    else:
-        temp_base = Path(temp_dir)
-    temp_base.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(tempfile.mkdtemp(prefix='cycif_pyramid_work_', dir=str(temp_base)))
-
-    if dst_path is None:
-        dst = str(work_dir / 'pyramidal_output.ome.tiff')
-    else:
-        dst = str(dst_path)
 
     with tifffile.TiffFile(src) as tf:
         series0 = _base_series(tf)
@@ -968,6 +997,11 @@ def convert_flat_ome_to_pyramidal(
         raise ValueError(f'Unable to canonicalize source TIFF to CYX. shape={src_mm.shape}, expected channels={c}')
 
     subifds = _compute_pyramid_subifds((int(y), int(x)), min_size=int(min_level_size))
+    if subifds < 1:
+        raise ValueError(
+            f'Input is too small for a pyramid with min_level_size={int(min_level_size)}: '
+            f'shape_yx=({int(y)}, {int(x)})'
+        )
     metadata = {
         'axes': 'CYX',
         'Channel': {'Name': list(channel_names)},
@@ -976,39 +1010,80 @@ def convert_flat_ome_to_pyramidal(
         metadata.update(physical_pixel_sizes)
     base_resolution, base_resolutionunit = _ome_physical_size_to_tiff_resolution(physical_pixel_sizes)
 
-    tmpdir = work_dir / 'levels'
+    if temp_dir is None:
+        if dst_path is not None:
+            temp_base = dst_path.parent
+        else:
+            temp_base = src_path.parent
+    else:
+        temp_base = Path(temp_dir)
+    temp_base.mkdir(parents=True, exist_ok=True)
+
+    expected_shapes = _expected_pyramid_level_shapes((int(c), int(y), int(x)), int(subifds))
+    if work_dir is not None:
+        work_path = Path(work_dir)
+        work_path.mkdir(parents=True, exist_ok=True)
+    elif resume:
+        work_path = _find_resume_pyramid_work_dir(temp_base, expected_shapes, dtype)
+        if work_path is None:
+            work_path = Path(tempfile.mkdtemp(prefix='cycif_pyramid_work_', dir=str(temp_base)))
+        else:
+            _step(f'Resuming pyramid work directory: {work_path}', 'pyramid_resume')
+    else:
+        work_path = Path(tempfile.mkdtemp(prefix='cycif_pyramid_work_', dir=str(temp_base)))
+
+    if dst_path is None:
+        dst = str(work_path / 'pyramidal_output.ome.tiff')
+    else:
+        dst = str(dst_path)
+    try:
+        Path(dst).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    tmpdir = work_path / 'levels'
     tmpdir.mkdir(parents=True, exist_ok=True)
     level_arrays: list[np.ndarray] = []
     level_paths: list[Path] = []
     prev = None
     lvl = None
+    success = False
     try:
         prev = src_cyx
         prev_y = int(y)
         prev_x = int(x)
         for level in range(1, subifds + 1):
             _check_cancel()
-            out_y = max(1, (prev_y + 1) // 2)
-            out_x = max(1, (prev_x + 1) // 2)
+            _exp_c, out_y, out_x = expected_shapes[level - 1]
             lvl_path = tmpdir / f'level_{level:02d}.dat'
-            lvl = _raw_memmap(str(lvl_path), (int(c), int(out_y), int(out_x)), dtype, mode='w+')
-            step_y = max(1, int(out_chunk))
-            step_x = max(1, int(out_chunk))
-            for oy0 in range(0, int(out_y), step_y):
-                _check_cancel()
-                oy1 = min(int(out_y), oy0 + step_y)
-                for ox0 in range(0, int(out_x), step_x):
+            lvl_shape = (int(c), int(out_y), int(out_x))
+            if resume and _valid_raw_level_file(lvl_path, lvl_shape, dtype):
+                lvl = _raw_memmap(str(lvl_path), lvl_shape, dtype, mode='r+')
+                _step(f'Reusing pyramid level {level}/{subifds}', 'pyramid_reuse_level')
+            else:
+                for stale_level in range(level, subifds + 1):
+                    try:
+                        (tmpdir / f'level_{stale_level:02d}.dat').unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                lvl = _raw_memmap(str(lvl_path), lvl_shape, dtype, mode='w+')
+                step_y = max(1, int(out_chunk))
+                step_x = max(1, int(out_chunk))
+                for oy0 in range(0, int(out_y), step_y):
                     _check_cancel()
-                    ox1 = min(int(out_x), ox0 + step_x)
-                    sy0, sy1 = int(oy0 * 2), int(min(prev_y, oy1 * 2))
-                    sx0, sx1 = int(ox0 * 2), int(min(prev_x, ox1 * 2))
-                    chunk = np.asarray(prev[:, sy0:sy1, sx0:sx1])
-                    lvl[:, oy0:oy1, ox0:ox1] = _block_average_2x2_cyx(chunk, dtype)
-                    _step(
-                        f'Building pyramid level {level}/{subifds} ({oy1}/{out_y} rows)',
-                        'pyramid_build_chunk',
-                    )
-            lvl.flush()
+                    oy1 = min(int(out_y), oy0 + step_y)
+                    for ox0 in range(0, int(out_x), step_x):
+                        _check_cancel()
+                        ox1 = min(int(out_x), ox0 + step_x)
+                        sy0, sy1 = int(oy0 * 2), int(min(prev_y, oy1 * 2))
+                        sx0, sx1 = int(ox0 * 2), int(min(prev_x, ox1 * 2))
+                        chunk = np.asarray(prev[:, sy0:sy1, sx0:sx1])
+                        lvl[:, oy0:oy1, ox0:ox1] = _block_average_2x2_cyx(chunk, dtype)
+                        _step(
+                            f'Building pyramid level {level}/{subifds} ({oy1}/{out_y} rows)',
+                            'pyramid_build_chunk',
+                        )
+                lvl.flush()
             level_arrays.append(lvl)
             level_paths.append(lvl_path)
             prev = lvl
@@ -1018,7 +1093,7 @@ def convert_flat_ome_to_pyramidal(
             photometric='minisblack',
             tile=(int(tile_size), int(tile_size)),
             compression=compression,
-            predictor=True if np.issubdtype(dtype, np.integer) else False,
+            predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
         )
 
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
@@ -1041,6 +1116,10 @@ def convert_flat_ome_to_pyramidal(
                     )
                     write_kwargs['resolutionunit'] = base_resolutionunit
                 tif.write(lvl, subfiletype=1, metadata=None, **write_kwargs)
+        pyramid_info = inspect_tiff_pyramid(dst)
+        if not bool(pyramid_info.get('is_pyramidal')):
+            raise RuntimeError(f'Pyramidal TIFF validation failed for {dst!r}')
+        success = True
     finally:
         # Release memmap references before attempting to delete the backing .dat files.
         try:
@@ -1082,41 +1161,45 @@ def convert_flat_ome_to_pyramidal(
         except Exception:
             pass
 
-        for pth in level_paths:
-            removed = False
-            for _ in range(10):
-                try:
-                    os.remove(pth)
-                    removed = True
-                    break
-                except FileNotFoundError:
-                    removed = True
-                    break
-                except PermissionError:
+        if success and not keep_work_dir:
+            for pth in level_paths:
+                removed = False
+                for _ in range(10):
                     try:
-                        gc.collect()
+                        os.remove(pth)
+                        removed = True
+                        break
+                    except FileNotFoundError:
+                        removed = True
+                        break
+                    except PermissionError:
+                        try:
+                            gc.collect()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                    except Exception:
+                        try:
+                            gc.collect()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                if not removed:
+                    try:
+                        Path(pth).unlink(missing_ok=True)
                     except Exception:
                         pass
-                    time.sleep(0.1)
-                except Exception:
-                    try:
-                        gc.collect()
-                    except Exception:
-                        pass
-                    time.sleep(0.1)
-            if not removed:
-                try:
-                    Path(pth).unlink(missing_ok=True)
-                except Exception:
-                    pass
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
-        if dst_path is not None:
-            # Best-effort cleanup of the temporary work directory after a direct write.
             try:
-                shutil.rmtree(work_dir, ignore_errors=True)
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(work_path, ignore_errors=True)
+            except Exception:
+                pass
+        if not success:
+            try:
+                Path(dst).unlink(missing_ok=True)
             except Exception:
                 pass
 

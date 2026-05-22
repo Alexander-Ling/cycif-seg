@@ -286,6 +286,113 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _cmd_pyramid(args: argparse.Namespace) -> int:
+    from cycif_seg.io.ome_tiff import (
+        convert_flat_ome_to_pyramidal,
+        inspect_tiff_pyramid,
+        inspect_tiff_yxc,
+    )
+
+    input_path = Path(args.input_ome_tiff).expanduser().resolve()
+    if not input_path.is_file():
+        print(f"Error: input OME-TIFF does not exist: {input_path}", file=sys.stderr)
+        return 1
+
+    output_path = Path(args.output).expanduser().resolve() if args.output else None
+    replace_source = bool(args.replace_source)
+    if replace_source == (output_path is not None):
+        print("Error: specify exactly one of --replace-source or --output PATH.", file=sys.stderr)
+        return 1
+    if output_path is not None and output_path == input_path:
+        print("Error: --output must differ from the input path. Use --replace-source for in-place conversion.", file=sys.stderr)
+        return 1
+
+    try:
+        pyr = inspect_tiff_pyramid(str(input_path))
+        if bool(pyr.get("is_pyramidal")):
+            print(f"Error: input already appears to be pyramidal: {input_path}", file=sys.stderr)
+            return 1
+        info = inspect_tiff_yxc(str(input_path))
+    except Exception as e:
+        print(f"Error inspecting input OME-TIFF: {e}", file=sys.stderr)
+        return 1
+
+    y, x, c = info["shape_yxc"]
+    dtype = info["dtype"]
+    min_level_size = max(1, int(args.min_level_size))
+    subifds = 0
+    yy, xx = int(y), int(x)
+    while yy > min_level_size and xx > min_level_size:
+        yy = max(1, (yy + 1) // 2)
+        xx = max(1, (xx + 1) // 2)
+        subifds += 1
+    if subifds < 1:
+        print(
+            f"Error: input is too small for a pyramid with --min-level-size {min_level_size}: "
+            f"{int(y)}x{int(x)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    target_path = input_path if replace_source else output_path
+    tmp_target = target_path.with_name(f"{target_path.stem}.__pyramid_tmp__.ome.tiff")
+    work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir else None
+    compression = None if str(args.compression).strip().lower() in {"", "none", "no", "false"} else args.compression
+
+    print(f"Input:  {input_path}")
+    print(f"Shape:  {int(y)} x {int(x)} x {int(c)} ({dtype})")
+    print(f"Output: {target_path}")
+    print(f"Mode:   {'replace source' if replace_source else 'write output'}")
+    print(f"Levels: {subifds + 1} total ({subifds} downsampled)")
+    if work_dir is not None:
+        print(f"Work:   {work_dir}")
+    if args.dry_run:
+        print("\n[dry-run] No files will be written.")
+        return 0
+
+    start = time.monotonic()
+
+    def _progress(msg: str) -> None:
+        print(f"  {msg}", flush=True)
+
+    try:
+        tmp_out = convert_flat_ome_to_pyramidal(
+            str(input_path),
+            output_path=str(tmp_target),
+            tile_size=max(16, int(args.tile_size)),
+            compression=compression,
+            min_level_size=min_level_size,
+            out_chunk=max(1, int(args.out_chunk)),
+            replace_source=False,
+            temp_dir=str(tmp_target.parent),
+            work_dir=str(work_dir) if work_dir is not None else None,
+            resume=not bool(args.no_resume),
+            keep_work_dir=bool(args.keep_work_dir),
+            progress_cb=_progress,
+        )
+        final_info = inspect_tiff_pyramid(str(tmp_out))
+        if not bool(final_info.get("is_pyramidal")):
+            raise RuntimeError(f"Output failed pyramid validation: {tmp_out}")
+        if replace_source:
+            Path(tmp_out).replace(input_path)
+            final_path = input_path
+        else:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Path(tmp_out).replace(output_path)
+            final_path = output_path
+    except Exception as e:
+        try:
+            tmp_target.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"Error building pyramidal OME-TIFF: {e}", file=sys.stderr)
+        return 1
+
+    elapsed = time.monotonic() - start
+    print(f"Done in {elapsed:.1f}s -> {final_path}")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="cycif-seg-preprocess",
@@ -344,11 +451,47 @@ def main() -> None:
     p_run.add_argument("--dry-run", action="store_true",
                        help="Validate the plan and print what would run, without processing")
 
+    # ---- pyramid subcommand ----
+    p_pyr = sub.add_parser(
+        "pyramid",
+        help="Build or resume a pyramidal OME-TIFF from an existing flat OME-TIFF",
+        description=(
+            "Convert a flat OME-TIFF into a pyramidal OME-TIFF. The command can reuse "
+            "complete cycif_pyramid_work_*/levels/level_XX.dat files from an interrupted "
+            "prior run, but partial final .__pyramid_tmp__.ome.tiff files are discarded."
+        ),
+    )
+    p_pyr.add_argument("input_ome_tiff", metavar="INPUT.ome.tiff",
+                       help="Flat OME-TIFF to convert")
+    out_mode = p_pyr.add_mutually_exclusive_group(required=True)
+    out_mode.add_argument("--replace-source", action="store_true",
+                          help="Replace INPUT with the completed pyramidal OME-TIFF")
+    out_mode.add_argument("--output", metavar="PATH",
+                          help="Write pyramidal OME-TIFF to PATH")
+    p_pyr.add_argument("--work-dir", metavar="DIR",
+                       help="Specific cycif_pyramid_work directory to reuse or create")
+    p_pyr.add_argument("--tile-size", type=int, default=512, metavar="N",
+                       help="TIFF tile size in pixels (default: 512)")
+    p_pyr.add_argument("--compression", default="zlib", metavar="NAME",
+                       help="TIFF compression, or 'none' to disable (default: zlib)")
+    p_pyr.add_argument("--min-level-size", type=int, default=128, metavar="N",
+                       help="Stop adding downsampled levels once Y or X is <= N (default: 128)")
+    p_pyr.add_argument("--out-chunk", type=int, default=1024, metavar="N",
+                       help="Chunk size while building pyramid levels (default: 1024)")
+    p_pyr.add_argument("--no-resume", action="store_true",
+                       help="Do not search for reusable level_XX.dat files")
+    p_pyr.add_argument("--keep-work-dir", action="store_true",
+                       help="Keep level_XX.dat files after successful conversion")
+    p_pyr.add_argument("--dry-run", action="store_true",
+                       help="Inspect input and print planned conversion without writing")
+
     parsed = parser.parse_args()
     if parsed.command == "plan":
         sys.exit(_cmd_plan(parsed))
     elif parsed.command == "run":
         sys.exit(_cmd_run(parsed))
+    elif parsed.command == "pyramid":
+        sys.exit(_cmd_pyramid(parsed))
 
 
 if __name__ == "__main__":
