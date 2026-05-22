@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import json
 import math
 import os
+import time
 from pathlib import Path
 
 import numpy as np
+import tifffile
 from skimage.registration import phase_cross_correlation
 from skimage.filters import threshold_otsu
 from skimage.measure import label as sk_label
@@ -1084,6 +1087,345 @@ def _scale_region_transform(r: _RegionTransform, D: int) -> _RegionTransform:
     )
 
 
+def registration_progress_sidecar_path(output_path: str | Path) -> Path:
+    return Path(str(output_path) + ".cyseg-registration-progress.json")
+
+
+def _cycle_write_order(cycles: list[CycleInput], reference_cycle: int) -> list[int]:
+    cy = [int(ci.cycle) for ci in sorted(cycles, key=lambda x: int(x.cycle))]
+    return [int(reference_cycle)] + [c for c in cy if c != int(reference_cycle)]
+
+
+def _registration_layout(
+    cycles: Iterable[CycleInput],
+    *,
+    reference_cycle: int | None = None,
+) -> dict[str, Any]:
+    cycles_l = sorted(list(cycles), key=lambda x: int(x.cycle))
+    if not cycles_l:
+        raise ValueError("No cycles provided")
+    if reference_cycle is None:
+        reference_cycle = int(cycles_l[0].cycle)
+
+    infos: list[tuple[CycleInput, tuple[int, int, int], np.dtype]] = []
+    canvas_y = 0
+    canvas_x = 0
+    total_ch = 0
+    base_dtype: np.dtype | None = None
+    for ci in cycles_l:
+        shp, dt = _tiff_info_yxc(ci.path)
+        infos.append((ci, shp, dt))
+        canvas_y = max(canvas_y, int(shp[0]))
+        canvas_x = max(canvas_x, int(shp[1]))
+        total_ch += int(shp[2])
+        if base_dtype is None:
+            base_dtype = np.dtype(dt)
+        elif np.dtype(dt) != np.dtype(base_dtype):
+            raise ValueError(f"All cycles must have the same dtype. Got {base_dtype} vs {dt} ({ci.path})")
+    assert base_dtype is not None
+
+    merged_names: list[str] = []
+    channel_offsets: dict[int, int] = {}
+    cycle_n_channels: dict[int, int] = {}
+    seen: dict[str, int] = {}
+    out_c = 0
+    for ci, shp, _ in infos:
+        cycle = int(ci.cycle)
+        channel_offsets[cycle] = out_c
+        n_ch = int(shp[2])
+        cycle_n_channels[cycle] = n_ch
+        ch_names = load_channel_names_only(ci.path)
+        for j in range(n_ch):
+            nm = ch_names[j] if j < len(ch_names) else ""
+            markers = ci.channel_markers or []
+            marker = (markers[j] if j < len(markers) else "").strip()
+            base = marker or (nm or "").strip() or "Channel"
+            stem = f"{base}_cy{ci.label if ci.label is not None else ci.cycle}"
+            k = int(seen.get(stem, 0))
+            out_nm = f"{stem}_{k+1}" if k else stem
+            seen[stem] = k + 1
+            merged_names.append(out_nm)
+            out_c += 1
+
+    return {
+        "cycles": cycles_l,
+        "infos": infos,
+        "reference_cycle": int(reference_cycle),
+        "canvas_yx": (int(canvas_y), int(canvas_x)),
+        "total_ch": int(total_ch),
+        "base_dtype": np.dtype(base_dtype),
+        "merged_names": merged_names,
+        "channel_offsets": channel_offsets,
+        "cycle_n_channels": cycle_n_channels,
+        "write_order": _cycle_write_order(cycles_l, int(reference_cycle)),
+    }
+
+
+def _registration_fingerprint(
+    *,
+    cycles: list[CycleInput],
+    infos: list[tuple[CycleInput, tuple[int, int, int], np.dtype]],
+    output_shape_yxc: tuple[int, int, int],
+    dtype: np.dtype,
+    merged_names: list[str],
+    channel_offsets: dict[int, int],
+    reference_cycle: int,
+    registration_algorithm: str,
+    global_translation_only: bool,
+    tiled_rigid_tile_size: int,
+    tiled_rigid_search_factor: float,
+    low_mem: bool,
+    strip_height: int | None,
+) -> dict[str, Any]:
+    input_records: list[dict[str, Any]] = []
+    shape_by_cycle = {int(ci.cycle): tuple(int(v) for v in shp) for ci, shp, _ in infos}
+    dtype_by_cycle = {int(ci.cycle): str(np.dtype(dt)) for ci, _shp, dt in infos}
+    for ci in cycles:
+        p = Path(ci.path)
+        try:
+            st = p.stat()
+            size = int(st.st_size)
+            mtime_ns = int(st.st_mtime_ns)
+        except Exception:
+            size = -1
+            mtime_ns = -1
+        input_records.append({
+            "cycle": int(ci.cycle),
+            "label": ci.label,
+            "path": str(p),
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "shape_yxc": list(shape_by_cycle[int(ci.cycle)]),
+            "dtype": dtype_by_cycle[int(ci.cycle)],
+            "registration_marker": ci.registration_marker,
+            "channel_markers": list(ci.channel_markers or []),
+        })
+    return {
+        "schema_version": 1,
+        "inputs": input_records,
+        "output_shape_yxc": [int(v) for v in output_shape_yxc],
+        "output_dtype": str(np.dtype(dtype)),
+        "merged_names": list(merged_names),
+        "channel_offsets": {str(int(k)): int(v) for k, v in channel_offsets.items()},
+        "reference_cycle": int(reference_cycle),
+        "registration_algorithm": str(registration_algorithm or "tiled_rigid"),
+        "global_translation_only": bool(global_translation_only),
+        "tiled_rigid_tile_size": int(tiled_rigid_tile_size),
+        "tiled_rigid_search_factor": float(tiled_rigid_search_factor),
+        "low_mem": bool(low_mem),
+        "strip_height": int(strip_height) if strip_height is not None else None,
+    }
+
+
+def _load_registration_manifest(path: str | Path) -> dict[str, Any] | None:
+    p = Path(path)
+    if not p.is_file():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _save_registration_manifest(path: str | Path, manifest: dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _new_registration_manifest(
+    *,
+    output_path: str,
+    fingerprint: dict[str, Any],
+    write_order: list[int],
+    channel_offsets: dict[int, int],
+    cycle_n_channels: dict[int, int],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "output_path": str(output_path),
+        "fingerprint": fingerprint,
+        "write_order": [int(c) for c in write_order],
+        "cycles": {
+            str(int(c)): {
+                "status": "pending",
+                "channel_offset": int(channel_offsets[int(c)]),
+                "n_channels": int(cycle_n_channels[int(c)]),
+            }
+            for c in write_order
+        },
+    }
+
+
+def _manifest_completed_cycles(manifest: dict[str, Any], fingerprint: dict[str, Any], write_order: list[int]) -> set[int]:
+    if not manifest or manifest.get("fingerprint") != fingerprint:
+        return set()
+    cycles_d = manifest.get("cycles") or {}
+    completed: set[int] = set()
+    for cy in write_order:
+        rec = cycles_d.get(str(int(cy))) or {}
+        if rec.get("status") == "complete":
+            completed.add(int(cy))
+        else:
+            break
+    return completed
+
+
+def _channel_has_written_data(mm: np.ndarray, channel_index: int, *, row_chunk: int = 1024) -> bool:
+    idx = int(channel_index)
+    y = int(mm.shape[1])
+    saw_nonzero = False
+    global_min = None
+    global_max = None
+    for y0 in range(0, y, max(1, int(row_chunk))):
+        y1 = min(y, y0 + max(1, int(row_chunk)))
+        arr = np.asarray(mm[idx, y0:y1, :])
+        if arr.size == 0:
+            continue
+        mn = arr.min()
+        mx = arr.max()
+        global_min = mn if global_min is None else min(global_min, mn)
+        global_max = mx if global_max is None else max(global_max, mx)
+        if bool(np.any(arr != 0)):
+            saw_nonzero = True
+        if saw_nonzero and global_min != global_max:
+            return True
+    return False
+
+
+def inspect_registration_flat_resume_state(
+    cycles: Iterable[CycleInput],
+    output_path: str | Path,
+    *,
+    reference_cycle: int | None = None,
+    registration_algorithm: str = "tiled_rigid",
+    global_translation_only: bool = False,
+    tiled_rigid_tile_size: int = 2000,
+    tiled_rigid_search_factor: float = 3,
+    low_mem: bool = True,
+    strip_height: int | None = None,
+    completion: str = "hybrid",
+    manifest_path: str | Path | None = None,
+    force_from_cycle: int | None = None,
+) -> dict[str, Any]:
+    layout = _registration_layout(cycles, reference_cycle=reference_cycle)
+    output_path = Path(output_path)
+    shape_yxc = (int(layout["canvas_yx"][0]), int(layout["canvas_yx"][1]), int(layout["total_ch"]))
+    fingerprint = _registration_fingerprint(
+        cycles=layout["cycles"],
+        infos=layout["infos"],
+        output_shape_yxc=shape_yxc,
+        dtype=layout["base_dtype"],
+        merged_names=layout["merged_names"],
+        channel_offsets=layout["channel_offsets"],
+        reference_cycle=int(layout["reference_cycle"]),
+        registration_algorithm=registration_algorithm,
+        global_translation_only=global_translation_only,
+        tiled_rigid_tile_size=tiled_rigid_tile_size,
+        tiled_rigid_search_factor=tiled_rigid_search_factor,
+        low_mem=low_mem,
+        strip_height=strip_height,
+    )
+    write_order = [int(v) for v in layout["write_order"]]
+    sidecar = Path(manifest_path) if manifest_path is not None else registration_progress_sidecar_path(output_path)
+
+    if force_from_cycle is not None:
+        force = int(force_from_cycle)
+        if force not in write_order:
+            raise ValueError(f"--force-from-cycle {force} is not in expected write order: {write_order}")
+        forced_complete = set(write_order[:write_order.index(force)])
+        if forced_complete and not output_path.is_file():
+            raise ValueError("--force-from-cycle cannot skip earlier cycles because the flat output file does not exist")
+        return {
+            "layout": layout,
+            "fingerprint": fingerprint,
+            "manifest_path": str(sidecar),
+            "completed_cycles": sorted(forced_complete),
+            "first_incomplete_cycle": force,
+            "source": "force",
+            "messages": [f"forced resume from cycle {force}"],
+        }
+
+    messages: list[str] = []
+    completed: set[int] = set()
+    mode = str(completion or "hybrid").strip().lower()
+    manifest = _load_registration_manifest(sidecar)
+    if mode in {"hybrid", "manifest"} and manifest is not None:
+        completed = _manifest_completed_cycles(manifest, fingerprint, write_order)
+        if completed:
+            messages.append(f"trusted manifest complete cycles: {sorted(completed)}")
+            if not output_path.is_file():
+                messages.append("manifest listed complete cycles but flat output is missing; ignoring manifest completion")
+                completed = set()
+        elif manifest.get("fingerprint") != fingerprint:
+            messages.append("manifest exists but does not match current inputs/settings")
+
+    if mode == "manifest":
+        first = next((c for c in write_order if c not in completed), None)
+        return {
+            "layout": layout,
+            "fingerprint": fingerprint,
+            "manifest_path": str(sidecar),
+            "completed_cycles": sorted(completed),
+            "first_incomplete_cycle": first,
+            "source": "manifest",
+            "messages": messages,
+        }
+
+    if not completed and output_path.is_file():
+        info = inspect_tiff_yxc(str(output_path))
+        got_shape = tuple(int(v) for v in info["shape_yxc"])
+        got_dtype = np.dtype(info["dtype"])
+        if got_shape != shape_yxc:
+            raise ValueError(f"Existing output shape mismatch. Expected {shape_yxc}, got {got_shape}")
+        if got_dtype != np.dtype(layout["base_dtype"]):
+            raise ValueError(f"Existing output dtype mismatch. Expected {layout['base_dtype']}, got {got_dtype}")
+        if list(info.get("channel_names") or []) != list(layout["merged_names"]):
+            raise ValueError("Existing output channel names do not match expected registration output")
+        mm = tifffile.memmap(str(output_path), mode="r")
+        try:
+            if tuple(int(v) for v in mm.shape) != (shape_yxc[2], shape_yxc[0], shape_yxc[1]):
+                raise ValueError(f"Existing output memmap shape mismatch: {mm.shape}")
+            for cy in write_order:
+                out_c0 = int(layout["channel_offsets"][int(cy)])
+                n_ch = int(layout["cycle_n_channels"][int(cy)])
+                ok = True
+                for ch in range(n_ch):
+                    if not _channel_has_written_data(mm, out_c0 + ch):
+                        ok = False
+                        break
+                if ok:
+                    completed.add(int(cy))
+                else:
+                    messages.append(f"pixel scan stopped at incomplete/suspicious cycle {int(cy)}")
+                    break
+        finally:
+            try:
+                from cycif_seg.io.ome_tiff import _close_memmap as _close_mm  # type: ignore
+                _close_mm(mm)
+            except Exception:
+                pass
+            try:
+                del mm
+            except Exception:
+                pass
+    elif not output_path.is_file():
+        messages.append("no existing flat output found")
+
+    first = next((c for c in write_order if c not in completed), None)
+    return {
+        "layout": layout,
+        "fingerprint": fingerprint,
+        "manifest_path": str(sidecar),
+        "completed_cycles": sorted(completed),
+        "first_incomplete_cycle": first,
+        "source": "pixel-scan" if completed or output_path.is_file() else "new",
+        "messages": messages,
+    }
+
+
 def merge_cycles_to_ome_tiff(
     cycles: Iterable[CycleInput],
     output_path: str,
@@ -1106,6 +1448,10 @@ def merge_cycles_to_ome_tiff(
     pyramidal_compression: str | int | None = "zlib",
     pyramidal_min_level_size: int = 128,
     pyramid_progress_chunk: int = 1024,
+    resume_flat_output: bool = False,
+    completed_cycles: Iterable[int] | None = None,
+    registration_progress_path: str | None = None,
+    registration_fingerprint: dict[str, Any] | None = None,
     progress_cb: Callable[[str], None] | None = None,
     progress_event_cb: Optional[Callable[[dict], None]] = None,
     cancel_cb: Callable[[], bool] | None = None,
@@ -1185,12 +1531,15 @@ def merge_cycles_to_ome_tiff(
 
     merged_names: list[str] = []
     channel_offsets: dict[int, int] = {}
+    cycle_n_channels: dict[int, int] = {}
     seen: dict[str, int] = {}
     out_c = 0
     for ci, shp, _ in infos:
-        channel_offsets[int(ci.cycle)] = out_c
+        cycle = int(ci.cycle)
+        channel_offsets[cycle] = out_c
         ch_names = load_channel_names_only(ci.path)
         n_ch = int(shp[2])
+        cycle_n_channels[cycle] = n_ch
         for j in range(n_ch):
             nm = ch_names[j] if j < len(ch_names) else ""
             markers = ci.channel_markers or []
@@ -1227,6 +1576,8 @@ def merge_cycles_to_ome_tiff(
     total_ch = int(total_input_ch)
     total_ticks = 1 + len(moving_infos) * 4 + len(cycles) + (1 if pyramidal_output else 0)
     tick = 0
+    completed_cycle_set = {int(c) for c in (completed_cycles or [])}
+    write_order = _cycle_write_order(cycles, int(reference_cycle))
 
     _progress(
         f"1. Loading reference Cycle {int(ref_ci.cycle)}...",
@@ -1241,13 +1592,53 @@ def merge_cycles_to_ome_tiff(
 
     region_search_radius = max(8, int(round(max(1, tiled_rigid_tile_size) * max(1.0, float(tiled_rigid_search_factor)) / 4.0)))
     out_path = str(output_path)
+    output_shape_yxc = (int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch))
+    fingerprint = registration_fingerprint or _registration_fingerprint(
+        cycles=cycles,
+        infos=infos,
+        output_shape_yxc=output_shape_yxc,
+        dtype=base_dtype,
+        merged_names=merged_names,
+        channel_offsets=channel_offsets,
+        reference_cycle=int(reference_cycle),
+        registration_algorithm=registration_algorithm,
+        global_translation_only=global_translation_only,
+        tiled_rigid_tile_size=int(tiled_rigid_tile_size),
+        tiled_rigid_search_factor=float(tiled_rigid_search_factor),
+        low_mem=bool(low_mem),
+        strip_height=int(_strip_h) if _strip_h is not None else None,
+    )
+    progress_path = Path(registration_progress_path) if registration_progress_path else registration_progress_sidecar_path(out_path)
+    manifest = _load_registration_manifest(progress_path)
+    if not manifest or manifest.get("fingerprint") != fingerprint:
+        manifest = _new_registration_manifest(
+            output_path=out_path,
+            fingerprint=fingerprint,
+            write_order=write_order,
+            channel_offsets=channel_offsets,
+            cycle_n_channels=cycle_n_channels,
+        )
+        for cy in completed_cycle_set:
+            if str(int(cy)) in manifest["cycles"]:
+                manifest["cycles"][str(int(cy))]["status"] = "complete"
+    open_existing_output = bool(resume_flat_output and Path(out_path).is_file())
     with IncrementalOmeBigTiffWriter(
         out_path,
-        (int(canvas_yx[0]), int(canvas_yx[1]), int(total_ch)),
+        output_shape_yxc,
         base_dtype,
         merged_names,
         physical_pixel_sizes=ref_pixel_sizes,
+        open_existing=open_existing_output,
     ) as writer:
+        _save_registration_manifest(progress_path, manifest)
+
+        def _set_cycle_status(cycle: int, status: str) -> None:
+            rec = manifest.setdefault("cycles", {}).setdefault(str(int(cycle)), {})
+            rec["status"] = str(status)
+            if status == "complete":
+                rec["completed_at_unix"] = time.time()
+            _save_registration_manifest(progress_path, manifest)
+
         def _write_cycle_channels(
             ci: CycleInput,
             shp: tuple[int, int, int],
@@ -1376,33 +1767,58 @@ def merge_cycles_to_ome_tiff(
         if ref_info is None:
             raise ValueError(f"reference_cycle={reference_cycle} not found in inputs")
         ref_ci_write, ref_shp, _ref_dt = ref_info
-        _progress(
-            f"7. Writing registered channels for Cycle {int(reference_cycle)}...",
-            progress_cb=progress_cb,
-            progress_event_cb=progress_event_cb,
-            phase="write_cycle",
-            idx=tick,
-            n=total_ticks,
-            cycle=int(reference_cycle),
-        )
-        if _strip_mode:
-            _write_cycle_channels_strip(ref_ci_write, ref_shp, None, 0.0, 0.0)
+        if int(reference_cycle) in completed_cycle_set:
+            _progress(
+                f"7. Skipping already-complete Cycle {int(reference_cycle)}...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="write_cycle",
+                idx=tick,
+                n=total_ticks,
+                cycle=int(reference_cycle),
+            )
         else:
-            _write_cycle_channels(ref_ci_write, ref_shp, None)
-        writer.flush_and_release()
-        if _debug_preprocess:
-            _rss_ref = ""
-            try:
-                import psutil as _ps
-                _rss_ref = f"  RAM={_ps.Process().memory_info().rss / 1024**2:.0f} MB"
-            except Exception:
-                pass
-            print(f"[preprocess] reference cycle written + released{_rss_ref}", flush=True)
+            _progress(
+                f"7. Writing registered channels for Cycle {int(reference_cycle)}...",
+                progress_cb=progress_cb,
+                progress_event_cb=progress_event_cb,
+                phase="write_cycle",
+                idx=tick,
+                n=total_ticks,
+                cycle=int(reference_cycle),
+            )
+            _set_cycle_status(int(reference_cycle), "in_progress")
+            if _strip_mode:
+                _write_cycle_channels_strip(ref_ci_write, ref_shp, None, 0.0, 0.0)
+            else:
+                _write_cycle_channels(ref_ci_write, ref_shp, None)
+            writer.flush_and_release()
+            _set_cycle_status(int(reference_cycle), "complete")
+            if _debug_preprocess:
+                _rss_ref = ""
+                try:
+                    import psutil as _ps
+                    _rss_ref = f"  RAM={_ps.Process().memory_info().rss / 1024**2:.0f} MB"
+                except Exception:
+                    pass
+                print(f"[preprocess] reference cycle written + released{_rss_ref}", flush=True)
         tick += 1
 
         for _i_moving, (ci, shp, _dt) in enumerate(moving_infos):
             _check_cancel(cancel_cb)
             cycle = int(ci.cycle)
+            if cycle in completed_cycle_set:
+                _progress(
+                    f"2-7. Skipping already-complete Cycle {cycle}...",
+                    progress_cb=progress_cb,
+                    progress_event_cb=progress_event_cb,
+                    phase="write_cycle",
+                    idx=tick,
+                    n=total_ticks,
+                    cycle=cycle,
+                )
+                tick += 5
+                continue
             marker = ci.registration_marker or default_registration_marker
             ch_idx = _resolve_reg_channel(ci, marker)
             if ch_idx is None:
@@ -1570,6 +1986,7 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
                 cycle=cycle,
             )
+            _set_cycle_status(cycle, "in_progress")
             if _strip_mode:
                 # Strip mode: islands and mov_reg not needed for writing
                 if islands is not None:
@@ -1589,6 +2006,7 @@ def merge_cycles_to_ome_tiff(
                 _write_cycle_channels(ci, shp, field_yx)
                 del field_yx
             writer.flush_and_release()
+            _set_cycle_status(cycle, "complete")
             if _debug_preprocess:
                 _rss_post = ""
                 try:

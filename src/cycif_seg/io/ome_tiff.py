@@ -467,6 +467,7 @@ class IncrementalOmeBigTiffWriter:
         dtype: np.dtype,
         channel_names: list[str] | None = None,
         physical_pixel_sizes: dict | None = None,
+        open_existing: bool = False,
     ):
         if len(shape_yxc) != 3:
             raise ValueError(f"Expected output shape (Y,X,C). Got {shape_yxc}")
@@ -480,6 +481,26 @@ class IncrementalOmeBigTiffWriter:
         if channel_names is None or len(channel_names) != c:
             channel_names = [f"Channel {i}" for i in range(c)]
         self.channel_names = list(channel_names)
+
+        if bool(open_existing):
+            info = inspect_tiff_yxc(self.path)
+            got_shape = tuple(int(v) for v in info["shape_yxc"])
+            got_dtype = np.dtype(info["dtype"])
+            if got_shape != self.shape_yxc:
+                raise ValueError(f"Existing TIFF shape mismatch. Expected {self.shape_yxc}, got {got_shape}")
+            if got_dtype != self.dtype:
+                raise ValueError(f"Existing TIFF dtype mismatch. Expected {self.dtype}, got {got_dtype}")
+            got_names = list(info.get("channel_names") or [])
+            if len(got_names) != len(self.channel_names):
+                raise ValueError(
+                    f"Existing TIFF channel count mismatch. Expected {len(self.channel_names)}, got {len(got_names)}"
+                )
+            if [str(x) for x in got_names] != [str(x) for x in self.channel_names]:
+                raise ValueError("Existing TIFF channel names do not match expected registration output")
+            self._mm = tifffile.memmap(self.path, mode="r+")
+            if tuple(int(v) for v in self._mm.shape) != (c, y, x):
+                raise ValueError(f"Existing TIFF memmap shape mismatch. Expected {(c, y, x)}, got {self._mm.shape}")
+            return
 
         metadata = {
             "axes": "CYX",

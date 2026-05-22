@@ -24,13 +24,18 @@ from cycif_seg.preprocess.batch_plan import (
     default_tiled_rigid_tile_size,
     default_tiled_rigid_search_factor,
     enabled_cycle_numbers,
+    find_stitched_cycle_files_in_sample_dir,
     plan_from_dict,
     plan_to_dict,
     sample_has_cycle_config,
     scan_root_for_samples,
     validate_samples_ready,
 )
-from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
+from cycif_seg.preprocess.organize_cycles import (
+    CycleInput,
+    inspect_registration_flat_resume_state,
+    merge_cycles_to_ome_tiff,
+)
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -393,6 +398,200 @@ def _cmd_pyramid(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cycles_from_sample(sample: BatchSample) -> list[CycleInput]:
+    cycles_in: list[CycleInput] = []
+    for i, p in enumerate(sample.files):
+        if sample.cycles_enabled and i < len(sample.cycles_enabled) and not bool(sample.cycles_enabled[i]):
+            continue
+        cy = int(sample.cycles[i] if sample.cycles and i < len(sample.cycles) else i)
+        cycles_in.append(
+            CycleInput(
+                path=str(p),
+                cycle=cy,
+                label=str(cy),
+                tissue=sample.tissue or None,
+                species=sample.species or None,
+                registration_marker=(
+                    sample.registration_markers[i]
+                    if sample.registration_markers and i < len(sample.registration_markers)
+                    else None
+                ),
+                channel_markers=(
+                    sample.channel_markers[i]
+                    if sample.channel_markers and i < len(sample.channel_markers)
+                    else None
+                ),
+                channel_antibodies=(
+                    sample.channel_antibodies[i]
+                    if sample.channel_antibodies and i < len(sample.channel_antibodies)
+                    else None
+                ),
+            )
+        )
+    return cycles_in
+
+
+def _sample_from_sample_dir(args: argparse.Namespace) -> BatchSample:
+    from cycif_seg.io.ome_tiff import load_channel_names_only_fast
+
+    sample_dir = Path(args.sample_dir).expanduser().resolve()
+    if not sample_dir.is_dir():
+        raise FileNotFoundError(f"sample directory does not exist: {sample_dir}")
+    stitched = find_stitched_cycle_files_in_sample_dir(sample_dir)
+    if not stitched:
+        raise ValueError(f"No stitched cycle OME-TIFFs found in sample directory: {sample_dir}")
+    files = [p for p, _cy in stitched]
+    cycles = [int(cy) for _p, cy in stitched]
+    reg_marker = str(args.registration_marker or "DAPI").strip() or "DAPI"
+    channel_markers: list[list[str]] = []
+    registration_markers: list[str] = []
+    for p in files:
+        names = list(load_channel_names_only_fast(str(p)) or [])
+        registration_markers.append(
+            next((nm for nm in names if nm.strip().upper() == reg_marker.upper()), names[0] if names else reg_marker)
+        )
+        channel_markers.append(names)
+    return BatchSample(
+        name=sample_dir.name,
+        input_dir=sample_dir,
+        files=files,
+        output_path=Path(args.output).expanduser().resolve() if args.output else None,
+        cycles=cycles,
+        registration_markers=registration_markers,
+        channel_markers=channel_markers,
+        channel_antibodies=[[""] * len(x) for x in channel_markers],
+        cycles_enabled=[True] * len(files),
+        registration_algorithm=str(args.registration_algorithm or "tiled_rigid"),
+        global_translation_only=bool(str(args.registration_algorithm or "").strip().lower() == "translation"),
+        tiled_rigid_tile_size=max(128, int(args.tile_size)),
+        tiled_rigid_search_factor=max(1.0, float(args.search_factor)),
+        pyramidal_output=False,
+        low_mem=True,
+        strip_height=int(args.strip_height) if args.strip_height and int(args.strip_height) > 0 else None,
+    )
+
+
+def _load_resume_sample(args: argparse.Namespace) -> BatchSample:
+    if args.plan:
+        plan_path = Path(args.plan).expanduser()
+        d = json.loads(plan_path.read_text(encoding="utf-8"))
+        result = plan_from_dict(d)
+        samples = [s for s in result["samples"] if s.enabled]
+        if args.sample:
+            samples = [s for s in samples if s.name == args.sample]
+        if not samples:
+            raise ValueError("No enabled sample matched the resume-registration selection")
+        if len(samples) > 1:
+            names = ", ".join(s.name for s in samples)
+            raise ValueError(f"Plan has multiple enabled samples; pass --sample. Enabled samples: {names}")
+        s = samples[0]
+        if args.output:
+            s.output_path = Path(args.output).expanduser().resolve()
+        return s
+    return _sample_from_sample_dir(args)
+
+
+def _cmd_resume_registration(args: argparse.Namespace) -> int:
+    try:
+        sample = _load_resume_sample(args)
+    except Exception as e:
+        print(f"Error loading resume inputs: {e}", file=sys.stderr)
+        return 1
+    if not sample.output_path:
+        print("Error: output path is required (from plan or --output).", file=sys.stderr)
+        return 1
+
+    cycles_in = _cycles_from_sample(sample)
+    if not cycles_in:
+        print("Error: no enabled cycles to register.", file=sys.stderr)
+        return 1
+
+    out_path = Path(sample.output_path).expanduser().resolve()
+    strip_height = (
+        int(args.strip_height)
+        if args.strip_height is not None and int(args.strip_height) > 0
+        else getattr(sample, "strip_height", None)
+    )
+    registration_algorithm = str(getattr(sample, "registration_algorithm", "tiled_rigid") or "tiled_rigid")
+    if args.registration_algorithm:
+        registration_algorithm = str(args.registration_algorithm)
+    global_translation_only = bool(getattr(sample, "global_translation_only", False))
+    if registration_algorithm.strip().lower() == "translation":
+        global_translation_only = True
+
+    try:
+        state = inspect_registration_flat_resume_state(
+            cycles_in,
+            out_path,
+            registration_algorithm=registration_algorithm,
+            global_translation_only=global_translation_only,
+            tiled_rigid_tile_size=max(128, int(getattr(sample, "tiled_rigid_tile_size", default_tiled_rigid_tile_size))),
+            tiled_rigid_search_factor=max(1.0, float(getattr(sample, "tiled_rigid_search_factor", default_tiled_rigid_search_factor))),
+            low_mem=True,
+            strip_height=strip_height,
+            completion=str(args.completion),
+            force_from_cycle=args.force_from_cycle,
+        )
+    except Exception as e:
+        print(f"Error inspecting partial registration output: {e}", file=sys.stderr)
+        return 1
+
+    completed = [int(c) for c in state["completed_cycles"]]
+    first_incomplete = state["first_incomplete_cycle"]
+    print(f"Sample: {sample.name}")
+    print(f"Output: {out_path}")
+    print(f"Detection: {state['source']}")
+    print(f"Complete cycles: {completed if completed else 'none'}")
+    if first_incomplete is None:
+        print("First incomplete cycle: none (flat registration appears complete)")
+    else:
+        print(f"First incomplete cycle: {first_incomplete}")
+    for msg in state.get("messages") or []:
+        print(f"  {msg}")
+
+    if args.dry_run:
+        print("\n[dry-run] No files will be written.")
+        return 0
+    if first_incomplete is None and not args.pyramidal:
+        return 0
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.monotonic()
+
+    def _progress(msg: str) -> None:
+        print(f"  {msg}", flush=True)
+
+    try:
+        rep = merge_cycles_to_ome_tiff(
+            cycles_in,
+            str(out_path),
+            default_registration_marker=str(args.registration_marker or "DAPI"),
+            registration_algorithm=registration_algorithm,
+            global_translation_only=global_translation_only,
+            tiled_rigid_allow_rotation=bool(getattr(sample, "tiled_rigid_allow_rotation", False)),
+            tiled_rigid_tile_size=max(128, int(getattr(sample, "tiled_rigid_tile_size", default_tiled_rigid_tile_size))),
+            tiled_rigid_search_factor=max(1.0, float(getattr(sample, "tiled_rigid_search_factor", default_tiled_rigid_search_factor))),
+            fast_large_island_refinement=False,
+            fast_large_island_sample_count=max(1, int(getattr(sample, "fast_large_island_sample_count", 5) or 5)),
+            pyramidal_output=bool(args.pyramidal),
+            progress_cb=_progress,
+            low_mem=True,
+            strip_height=strip_height,
+            resume_flat_output=True,
+            completed_cycles=completed,
+            registration_progress_path=str(state["manifest_path"]),
+            registration_fingerprint=state["fingerprint"],
+        )
+    except Exception as e:
+        print(f"Error resuming registration: {e}", file=sys.stderr)
+        traceback.print_exc()
+        return 1
+
+    elapsed = time.monotonic() - start
+    print(f"Done in {elapsed:.1f}s -> {rep.get('output_path') or out_path}")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="cycif-seg-preprocess",
@@ -485,6 +684,45 @@ def main() -> None:
     p_pyr.add_argument("--dry-run", action="store_true",
                        help="Inspect input and print planned conversion without writing")
 
+    # ---- resume-registration subcommand ----
+    p_res = sub.add_parser(
+        "resume-registration",
+        help="Resume a partially completed flat registration OME-TIFF",
+        description=(
+            "Inspect an existing flat merged OME-TIFF, determine completed cycles from a "
+            "registration progress sidecar or conservative pixel scan, and resume writing "
+            "from the first incomplete cycle."
+        ),
+    )
+    src_grp = p_res.add_mutually_exclusive_group(required=True)
+    src_grp.add_argument("--plan", metavar="PLAN.json",
+                         help="Preprocessing plan JSON containing the sample configuration")
+    src_grp.add_argument("--sample-dir", metavar="DIR",
+                         help="Sample directory containing stitched cycle OME-TIFFs")
+    p_res.add_argument("--sample", metavar="NAME",
+                       help="Sample name to use when --plan contains multiple enabled samples")
+    p_res.add_argument("--output", metavar="PATH",
+                       help="Output flat merged OME-TIFF path (required with --sample-dir; overrides plan output)")
+    p_res.add_argument("--registration-marker", default="DAPI", metavar="NAME",
+                       help="Registration channel name for --sample-dir mode or fallback (default: DAPI)")
+    p_res.add_argument("--registration-algorithm", default=None,
+                       choices=["tiled_rigid", "translation"],
+                       help="Override registration algorithm")
+    p_res.add_argument("--tile-size", type=int, default=default_tiled_rigid_tile_size, metavar="N",
+                       help=f"Tiled-rigid tile size for --sample-dir mode (default: {default_tiled_rigid_tile_size})")
+    p_res.add_argument("--search-factor", type=float, default=default_tiled_rigid_search_factor, metavar="F",
+                       help=f"Tiled-rigid search factor for --sample-dir mode (default: {default_tiled_rigid_search_factor})")
+    p_res.add_argument("--strip-height", type=int, default=None, metavar="N",
+                       help="Process output in horizontal strips of N rows")
+    p_res.add_argument("--completion", default="hybrid", choices=["hybrid", "manifest", "pixel-scan"],
+                       help="How to determine completed cycles (default: hybrid)")
+    p_res.add_argument("--force-from-cycle", type=int, default=None, metavar="N",
+                       help="Trust cycles before N and resume by rewriting cycle N onward")
+    p_res.add_argument("--pyramidal", action="store_true",
+                       help="Build the pyramidal OME-TIFF after the flat registration completes")
+    p_res.add_argument("--dry-run", action="store_true",
+                       help="Inspect and print resume plan without writing")
+
     parsed = parser.parse_args()
     if parsed.command == "plan":
         sys.exit(_cmd_plan(parsed))
@@ -492,6 +730,8 @@ def main() -> None:
         sys.exit(_cmd_run(parsed))
     elif parsed.command == "pyramid":
         sys.exit(_cmd_pyramid(parsed))
+    elif parsed.command == "resume-registration":
+        sys.exit(_cmd_resume_registration(parsed))
 
 
 if __name__ == "__main__":
