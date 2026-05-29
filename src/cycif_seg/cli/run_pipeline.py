@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -245,6 +246,7 @@ def _run_registration(
         inspect_registration_flat_resume_state,
         merge_cycles_to_ome_tiff,
         registration_progress_sidecar_path,
+        registration_zarr_store_path,
     )
 
     cycles: list[CycleInput] = []
@@ -264,7 +266,7 @@ def _run_registration(
     if force:
         print(f"\n--- Registering {len(cycles)} cycle(s) -> {output_path} ---")
         print("  [force] Rebuilding merged output from scratch.")
-        _discard_registration_outputs(output_path, progress_path)
+        _discard_registration_outputs(output_path, progress_path, registration_zarr_store_path(output_path))
         merge_cycles_to_ome_tiff(
             cycles=cycles,
             output_path=str(output_path),
@@ -350,16 +352,21 @@ def _run_registration(
     print(f"  Done. Merged output: {output_path}")
 
 
-def _discard_registration_outputs(output_path: Path, progress_path: Path) -> None:
+def _discard_registration_outputs(output_path: Path, progress_path: Path, zarr_store_path: Path | None = None) -> None:
     """Remove resumable registration artifacts for an explicit forced rebuild."""
     candidates = [
         output_path,
         progress_path,
         output_path.with_name(f"{output_path.stem}.__pyramid_tmp__.ome.tiff"),
     ]
+    if zarr_store_path is not None:
+        candidates.append(zarr_store_path)
     for path in candidates:
         try:
-            path.unlink(missing_ok=True)
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
         except FileNotFoundError:
             pass
 

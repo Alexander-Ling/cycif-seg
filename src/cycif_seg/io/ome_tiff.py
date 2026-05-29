@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import math
 import os
 import tempfile
@@ -631,6 +632,183 @@ class IncrementalOmeBigTiffWriter:
         self.close()
         return False
 
+
+class IncrementalZarrRegisteredWriter:
+    """Incrementally write a registered (Y, X, C) image to a chunked Zarr array.
+
+    The array is stored as CYX with channel-sized chunks, so callers can write a
+    full channel or one horizontal channel strip at a time.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        shape_yxc: tuple[int, int, int],
+        dtype: np.dtype,
+        channel_names: list[str] | None = None,
+        physical_pixel_sizes: dict | None = None,
+        *,
+        chunk_yx: tuple[int, int] = (512, 512),
+        write_workers: int = 1,
+        max_pending_writes: int | None = None,
+        open_existing: bool = False,
+    ):
+        if zarr is None:
+            raise RuntimeError("zarr is required for chunked registration output")
+        if len(shape_yxc) != 3:
+            raise ValueError(f"Expected output shape (Y,X,C). Got {shape_yxc}")
+        y, x, c = (int(shape_yxc[0]), int(shape_yxc[1]), int(shape_yxc[2]))
+        if y <= 0 or x <= 0 or c <= 0:
+            raise ValueError(f"Invalid output shape: {shape_yxc}")
+
+        self.path = str(path)
+        self.shape_yxc = (y, x, c)
+        self.shape_cyx = (c, y, x)
+        self.dtype = np.dtype(dtype)
+        if channel_names is None or len(channel_names) != c:
+            channel_names = [f"Channel {i}" for i in range(c)]
+        self.channel_names = list(channel_names)
+        self.physical_pixel_sizes = _normalize_physical_pixel_sizes(physical_pixel_sizes)
+        cy = max(1, min(y, int(chunk_yx[0])))
+        cx = max(1, min(x, int(chunk_yx[1])))
+        self.chunks = (1, cy, cx)
+        self.write_workers = max(1, int(write_workers))
+        self.max_pending_writes = (
+            max(1, int(max_pending_writes))
+            if max_pending_writes is not None
+            else max(1, self.write_workers * 2)
+        )
+        self._executor = (
+            ThreadPoolExecutor(max_workers=self.write_workers, thread_name_prefix="cycif-zarr-write")
+            if self.write_workers > 1 else None
+        )
+
+        if bool(open_existing):
+            arr = zarr.open(self.path, mode="r+")
+            if tuple(int(v) for v in arr.shape) != self.shape_cyx:
+                raise ValueError(f"Existing Zarr shape mismatch. Expected {self.shape_cyx}, got {arr.shape}")
+            if np.dtype(arr.dtype) != self.dtype:
+                raise ValueError(f"Existing Zarr dtype mismatch. Expected {self.dtype}, got {arr.dtype}")
+            got_names = list(arr.attrs.get("channel_names", []))
+            if [str(v) for v in got_names] != [str(v) for v in self.channel_names]:
+                raise ValueError("Existing Zarr channel names do not match expected registration output")
+            self._arr = arr
+            return
+
+        p = Path(self.path)
+        if p.exists():
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        self._arr = zarr.open(
+            self.path,
+            mode="w",
+            shape=self.shape_cyx,
+            chunks=self.chunks,
+            dtype=self.dtype,
+            compressor=None,
+        )
+        self._arr.attrs["axes"] = "CYX"
+        self._arr.attrs["shape_yxc"] = tuple(int(v) for v in self.shape_yxc)
+        self._arr.attrs["channel_names"] = list(self.channel_names)
+        self._arr.attrs["physical_pixel_sizes"] = dict(self.physical_pixel_sizes or {})
+
+    @property
+    def array(self):
+        return self._arr
+
+    def write_channel(self, channel_index: int, plane_yx: np.ndarray) -> None:
+        idx = int(channel_index)
+        if idx < 0 or idx >= int(self.shape_yxc[2]):
+            raise IndexError(f"channel_index out of range: {channel_index}")
+        if plane_yx.ndim != 2:
+            raise ValueError(f"Expected (Y,X) plane. Got shape={plane_yx.shape}")
+        exp = (int(self.shape_yxc[0]), int(self.shape_yxc[1]))
+        got = (int(plane_yx.shape[0]), int(plane_yx.shape[1]))
+        if got != exp:
+            raise ValueError(f"Plane shape mismatch. Expected {exp}, got {got}")
+        self.write_channel_strip(idx, plane_yx, 0)
+
+    def write_channel_strip(self, channel_index: int, strip_yx: np.ndarray, row_offset: int) -> None:
+        idx = int(channel_index)
+        if idx < 0 or idx >= int(self.shape_yxc[2]):
+            raise IndexError(f"channel_index out of range: {channel_index}")
+        if strip_yx.ndim != 2:
+            raise ValueError(f"Expected (strip_H, X). Got shape={strip_yx.shape}")
+        r0 = int(row_offset)
+        r1 = r0 + int(strip_yx.shape[0])
+        if r0 < 0 or r1 > int(self.shape_yxc[0]):
+            raise ValueError(f"Strip [{r0}:{r1}] out of bounds for canvas height {self.shape_yxc[0]}")
+        if int(strip_yx.shape[1]) != int(self.shape_yxc[1]):
+            raise ValueError(f"Strip width mismatch. Expected {self.shape_yxc[1]}, got {strip_yx.shape[1]}")
+        strip_cast = strip_yx.astype(self.dtype, copy=False)
+        if self._executor is None:
+            self._arr[idx, r0:r1, :] = strip_cast
+            return
+
+        pending: set[Future] = set()
+
+        def _drain(*, wait_for_one: bool) -> None:
+            nonlocal pending
+            if not pending:
+                return
+            if wait_for_one:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            else:
+                done, pending = wait(pending)
+            for fut in done:
+                fut.result()
+
+        for ay0, ay1, ax0, ax1 in self._iter_strip_chunk_windows(r0, r1):
+            ly0 = ay0 - r0
+            ly1 = ay1 - r0
+            chunk = np.asarray(strip_cast[ly0:ly1, ax0:ax1]).copy()
+            pending.add(self._executor.submit(self._write_chunk, idx, ay0, ay1, ax0, ax1, chunk))
+            if len(pending) >= self.max_pending_writes:
+                _drain(wait_for_one=True)
+        _drain(wait_for_one=False)
+
+    def _iter_strip_chunk_windows(self, row_start: int, row_stop: int):
+        chunk_y = max(1, int(self.chunks[1]))
+        chunk_x = max(1, int(self.chunks[2]))
+        width = int(self.shape_yxc[1])
+        y = int(row_start)
+        while y < int(row_stop):
+            y_chunk_stop = min(int(row_stop), ((y // chunk_y) + 1) * chunk_y)
+            for x in range(0, width, chunk_x):
+                yield y, y_chunk_stop, x, min(width, x + chunk_x)
+            y = y_chunk_stop
+
+    def _write_chunk(self, channel_index: int, y0: int, y1: int, x0: int, x1: int, data: np.ndarray) -> None:
+        self._arr[int(channel_index), int(y0):int(y1), int(x0):int(x1)] = data
+
+    def flush(self) -> None:
+        try:
+            store = getattr(self._arr, "store", None)
+            if hasattr(store, "flush"):
+                store.flush()
+        except Exception:
+            pass
+
+    def flush_and_release(self) -> None:
+        self.flush()
+
+    def close(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=False)
+            self._executor = None
+        self.flush()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
 def save_ome_tiff_yxc(
     path: str,
     img_yxc: np.ndarray,
@@ -1235,6 +1413,253 @@ def convert_flat_ome_to_pyramidal(
                 'The destination file may still be open in another program or the source/destination may be on different volumes.',
             ) from e
         return src
+    return dst
+
+
+def convert_registered_zarr_to_pyramidal(
+    source_path: str,
+    output_path: str,
+    *,
+    channel_names: list[str] | None = None,
+    physical_pixel_sizes: dict | None = None,
+    tile_size: int = 512,
+    compression: str | int | None = 'zlib',
+    min_level_size: int = 128,
+    out_chunk: int = 1024,
+    temp_dir: str | None = None,
+    work_dir: str | None = None,
+    resume: bool = True,
+    keep_work_dir: bool = False,
+    progress_cb: Callable[[str], None] | None = None,
+    progress_step_cb: Callable[[str, str], None] | None = None,
+    cancel_cb: Callable[[], bool] | None = None,
+) -> str:
+    """Convert a chunked CYX registered Zarr array into a pyramidal OME-TIFF."""
+    if zarr is None:
+        raise RuntimeError("zarr is required for chunked registration output")
+
+    def _check_cancel() -> None:
+        try:
+            if cancel_cb is not None and bool(cancel_cb()):
+                raise RuntimeError('Cancelled')
+        except RuntimeError:
+            raise
+        except Exception:
+            return
+
+    def _step(msg: str, phase: str) -> None:
+        if progress_cb:
+            progress_cb(msg)
+        if progress_step_cb:
+            progress_step_cb(msg, phase)
+
+    src_cyx = zarr.open(str(source_path), mode='r')
+    shape = tuple(int(v) for v in src_cyx.shape)
+    if len(shape) != 3:
+        raise ValueError(f'Expected 3D CYX Zarr array. Got shape={shape}')
+    c, y, x = shape
+    dtype = np.dtype(src_cyx.dtype)
+
+    attrs = getattr(src_cyx, 'attrs', {})
+    if channel_names is None or len(channel_names) != int(c):
+        channel_names = list(attrs.get('channel_names', []) or [])
+    if channel_names is None or len(channel_names) != int(c):
+        channel_names = [f'Channel {i}' for i in range(int(c))]
+    channel_names = [(nm if nm and str(nm).strip() else f'Channel {i}') for i, nm in enumerate(channel_names)]
+    if physical_pixel_sizes is None:
+        physical_pixel_sizes = dict(attrs.get('physical_pixel_sizes', {}) or {})
+    physical_pixel_sizes = _normalize_physical_pixel_sizes(physical_pixel_sizes)
+
+    subifds = _compute_pyramid_subifds((int(y), int(x)), min_size=int(min_level_size))
+    if subifds < 1:
+        raise ValueError(
+            f'Input is too small for a pyramid with min_level_size={int(min_level_size)}: '
+            f'shape_yx=({int(y)}, {int(x)})'
+        )
+
+    metadata = {
+        'axes': 'CYX',
+        'Channel': {'Name': list(channel_names)},
+    }
+    if physical_pixel_sizes:
+        metadata.update(physical_pixel_sizes)
+    base_resolution, base_resolutionunit = _ome_physical_size_to_tiff_resolution(physical_pixel_sizes)
+
+    dst_path = Path(output_path)
+    temp_base = Path(temp_dir) if temp_dir is not None else dst_path.parent
+    temp_base.mkdir(parents=True, exist_ok=True)
+    expected_shapes = _expected_pyramid_level_shapes((int(c), int(y), int(x)), int(subifds))
+    if work_dir is not None:
+        work_path = Path(work_dir)
+        work_path.mkdir(parents=True, exist_ok=True)
+    elif resume:
+        work_path = _find_resume_pyramid_work_dir(temp_base, expected_shapes, dtype)
+        if work_path is None:
+            work_path = Path(tempfile.mkdtemp(prefix='cycif_pyramid_work_', dir=str(temp_base)))
+        else:
+            _step(f'Resuming pyramid work directory: {work_path}', 'pyramid_resume')
+    else:
+        work_path = Path(tempfile.mkdtemp(prefix='cycif_pyramid_work_', dir=str(temp_base)))
+
+    dst = str(dst_path)
+    try:
+        Path(dst).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    tmpdir = work_path / 'levels'
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    level_arrays: list[np.ndarray] = []
+    level_paths: list[Path] = []
+    prev = None
+    lvl = None
+    success = False
+    try:
+        prev = src_cyx
+        prev_y = int(y)
+        prev_x = int(x)
+        for level in range(1, subifds + 1):
+            _check_cancel()
+            _exp_c, out_y, out_x = expected_shapes[level - 1]
+            lvl_path = tmpdir / f'level_{level:02d}.dat'
+            lvl_shape = (int(c), int(out_y), int(out_x))
+            if resume and _valid_raw_level_file(lvl_path, lvl_shape, dtype):
+                lvl = _raw_memmap(str(lvl_path), lvl_shape, dtype, mode='r+')
+                _step(f'Reusing pyramid level {level}/{subifds}', 'pyramid_reuse_level')
+            else:
+                for stale_level in range(level, subifds + 1):
+                    try:
+                        (tmpdir / f'level_{stale_level:02d}.dat').unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                lvl = _raw_memmap(str(lvl_path), lvl_shape, dtype, mode='w+')
+                step_y = max(1, int(out_chunk))
+                step_x = max(1, int(out_chunk))
+                for oy0 in range(0, int(out_y), step_y):
+                    _check_cancel()
+                    oy1 = min(int(out_y), oy0 + step_y)
+                    for ox0 in range(0, int(out_x), step_x):
+                        _check_cancel()
+                        ox1 = min(int(out_x), ox0 + step_x)
+                        sy0, sy1 = int(oy0 * 2), int(min(prev_y, oy1 * 2))
+                        sx0, sx1 = int(ox0 * 2), int(min(prev_x, ox1 * 2))
+                        chunk = np.asarray(prev[:, sy0:sy1, sx0:sx1])
+                        lvl[:, oy0:oy1, ox0:ox1] = _block_average_2x2_cyx(chunk, dtype)
+                        _step(
+                            f'Building pyramid level {level}/{subifds} ({oy1}/{out_y} rows)',
+                            'pyramid_build_chunk',
+                        )
+                lvl.flush()
+            level_arrays.append(lvl)
+            level_paths.append(lvl_path)
+            prev = lvl
+            prev_y, prev_x = int(out_y), int(out_x)
+
+        options = dict(
+            photometric='minisblack',
+            tile=(int(tile_size), int(tile_size)),
+            compression=compression,
+            predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
+            maxworkers=os.cpu_count() or 4,
+        )
+
+        with tifffile.TiffWriter(dst, bigtiff=True) as tif:
+            _check_cancel()
+            _step('Writing pyramid base level', 'pyramid_write_level')
+            write_kwargs = dict(options)
+            if base_resolution is not None and base_resolutionunit is not None:
+                write_kwargs['resolution'] = base_resolution
+                write_kwargs['resolutionunit'] = base_resolutionunit
+            tif.write(src_cyx, subifds=int(subifds), metadata=metadata, **write_kwargs)
+            for level, lvl in enumerate(level_arrays, start=1):
+                _check_cancel()
+                _step(f'Writing pyramid level {level}/{subifds}', 'pyramid_write_level')
+                write_kwargs = dict(options)
+                if base_resolution is not None and base_resolutionunit is not None:
+                    mag = float(2 ** int(level))
+                    write_kwargs['resolution'] = (
+                        float(base_resolution[0]) / mag,
+                        float(base_resolution[1]) / mag,
+                    )
+                    write_kwargs['resolutionunit'] = base_resolutionunit
+                tif.write(lvl, subfiletype=1, metadata=None, **write_kwargs)
+        pyramid_info = inspect_tiff_pyramid(dst)
+        if not bool(pyramid_info.get('is_pyramidal')):
+            raise RuntimeError(f'Pyramidal TIFF validation failed for {dst!r}')
+        success = True
+    finally:
+        try:
+            _close_memmap(lvl)
+        except Exception:
+            pass
+        try:
+            _close_memmap(prev if isinstance(prev, np.memmap) else None)
+        except Exception:
+            pass
+        for arr in list(level_arrays):
+            try:
+                _close_memmap(arr)
+            except Exception:
+                pass
+        try:
+            del lvl
+        except Exception:
+            pass
+        try:
+            del prev
+        except Exception:
+            pass
+        try:
+            level_arrays.clear()
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
+
+        if success and not keep_work_dir:
+            for pth in level_paths:
+                removed = False
+                for _ in range(10):
+                    try:
+                        os.remove(pth)
+                        removed = True
+                        break
+                    except FileNotFoundError:
+                        removed = True
+                        break
+                    except PermissionError:
+                        try:
+                            gc.collect()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                    except Exception:
+                        try:
+                            gc.collect()
+                        except Exception:
+                            pass
+                        time.sleep(0.1)
+                if not removed:
+                    try:
+                        Path(pth).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            try:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                shutil.rmtree(work_path, ignore_errors=True)
+            except Exception:
+                pass
+        if not success:
+            try:
+                Path(dst).unlink(missing_ok=True)
+            except Exception:
+                pass
+
     return dst
 
 

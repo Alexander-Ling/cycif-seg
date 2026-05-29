@@ -9,6 +9,7 @@ import gc
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -29,6 +30,7 @@ except Exception:  # pragma: no cover
 
 from cycif_seg.io.ome_tiff import (
     IncrementalOmeBigTiffWriter,
+    IncrementalZarrRegisteredWriter,
     estimate_pyramid_conversion_ticks,
     inspect_tiff_pyramid,
     inspect_tiff_yxc,
@@ -38,6 +40,7 @@ from cycif_seg.io.ome_tiff import (
     load_physical_pixel_sizes,
     load_single_channel_tiff_native,
     convert_flat_ome_to_pyramidal,
+    convert_registered_zarr_to_pyramidal,
 )
 
 
@@ -1138,6 +1141,10 @@ def registration_progress_sidecar_path(output_path: str | Path) -> Path:
     return Path(str(output_path) + ".cyseg-registration-progress.json")
 
 
+def registration_zarr_store_path(output_path: str | Path) -> Path:
+    return Path(str(output_path) + ".cyseg-registered.zarr")
+
+
 def _cycle_write_order(cycles: list[CycleInput], reference_cycle: int) -> list[int]:
     cy = [int(ci.cycle) for ci in sorted(cycles, key=lambda x: int(x.cycle))]
     return [int(reference_cycle)] + [c for c in cy if c != int(reference_cycle)]
@@ -1342,6 +1349,27 @@ def _channel_has_written_data(mm: np.ndarray, channel_index: int, *, row_chunk: 
     return False
 
 
+def _registered_zarr_has_expected_layout(
+    store_path: Path,
+    shape_yxc: tuple[int, int, int],
+    dtype: np.dtype,
+    channel_names: list[str],
+) -> bool:
+    try:
+        import zarr as _zarr  # type: ignore
+
+        arr = _zarr.open(str(store_path), mode="r")
+        exp_cyx = (int(shape_yxc[2]), int(shape_yxc[0]), int(shape_yxc[1]))
+        if tuple(int(v) for v in arr.shape) != exp_cyx:
+            return False
+        if np.dtype(arr.dtype) != np.dtype(dtype):
+            return False
+        got_names = list(arr.attrs.get("channel_names", []) or [])
+        return [str(v) for v in got_names] == [str(v) for v in channel_names]
+    except Exception:
+        return False
+
+
 def inspect_registration_flat_resume_state(
     cycles: Iterable[CycleInput],
     output_path: str | Path,
@@ -1377,14 +1405,15 @@ def inspect_registration_flat_resume_state(
     )
     write_order = [int(v) for v in layout["write_order"]]
     sidecar = Path(manifest_path) if manifest_path is not None else registration_progress_sidecar_path(output_path)
+    zarr_store = registration_zarr_store_path(output_path)
 
     if force_from_cycle is not None:
         force = int(force_from_cycle)
         if force not in write_order:
             raise ValueError(f"--force-from-cycle {force} is not in expected write order: {write_order}")
         forced_complete = set(write_order[:write_order.index(force)])
-        if forced_complete and not output_path.is_file():
-            raise ValueError("--force-from-cycle cannot skip earlier cycles because the flat output file does not exist")
+        if forced_complete and not (output_path.is_file() or zarr_store.is_dir()):
+            raise ValueError("--force-from-cycle cannot skip earlier cycles because no resumable registration output exists")
         return {
             "layout": layout,
             "fingerprint": fingerprint,
@@ -1403,8 +1432,8 @@ def inspect_registration_flat_resume_state(
         completed = _manifest_completed_cycles(manifest, fingerprint, write_order)
         if completed:
             messages.append(f"trusted manifest complete cycles: {sorted(completed)}")
-            if not output_path.is_file():
-                messages.append("manifest listed complete cycles but flat output is missing; ignoring manifest completion")
+            if not (output_path.is_file() or zarr_store.is_dir()):
+                messages.append("manifest listed complete cycles but registration output is missing; ignoring manifest completion")
                 completed = set()
         elif manifest.get("fingerprint") != fingerprint:
             messages.append("manifest exists but does not match current inputs/settings")
@@ -1421,7 +1450,16 @@ def inspect_registration_flat_resume_state(
             "messages": messages,
         }
 
-    if not completed and output_path.is_file():
+    if not completed and zarr_store.is_dir():
+        if not _registered_zarr_has_expected_layout(
+            zarr_store,
+            shape_yxc,
+            np.dtype(layout["base_dtype"]),
+            list(layout["merged_names"]),
+        ):
+            raise ValueError(f"Existing Zarr registration store is incompatible: {zarr_store}")
+        messages.append(f"found resumable Zarr registration store: {zarr_store}")
+    elif not completed and output_path.is_file():
         info = inspect_tiff_yxc(str(output_path))
         got_shape = tuple(int(v) for v in info["shape_yxc"])
         got_dtype = np.dtype(info["dtype"])
@@ -1458,8 +1496,8 @@ def inspect_registration_flat_resume_state(
                 del mm
             except Exception:
                 pass
-    elif not output_path.is_file():
-        messages.append("no existing flat output found")
+    elif not output_path.is_file() and not zarr_store.is_dir():
+        messages.append("no existing registration output found")
 
     first = next((c for c in write_order if c not in completed), None)
     return {
@@ -2065,7 +2103,20 @@ def merge_cycles_to_ome_tiff(
         for cy in completed_cycle_set:
             if str(int(cy)) in manifest["cycles"]:
                 manifest["cycles"][str(int(cy))]["status"] = "complete"
-    open_existing_output = bool(resume_flat_output and Path(out_path).is_file())
+    registered_zarr_path = registration_zarr_store_path(out_path)
+    use_zarr_registration_store = bool(pyramidal_output)
+    step1_workers = (
+        max(1, int(elastic_touchup_workers))
+        if elastic_touchup_workers and int(elastic_touchup_workers) > 0
+        else max(1, (os.cpu_count() or 2) - 1)
+    )
+    if _debug_preprocess:
+        print(f"[preprocess] step1_workers={step1_workers}", flush=True)
+    open_existing_output = (
+        bool(resume_flat_output and registered_zarr_path.is_dir())
+        if use_zarr_registration_store
+        else bool(resume_flat_output and Path(out_path).is_file())
+    )
     _doing_debug_write = (debug_elastic_touchup or _debug_elastic_touchup_global) and elastic_touchup
     _debug_rigid_out_path: str | None = None
     if _doing_debug_write:
@@ -2077,14 +2128,26 @@ def merge_cycles_to_ome_tiff(
         _dbg_out_dir = Path(debug_dir) if debug_dir else Path(output_path).parent
         _debug_rigid_out_path = str(_dbg_out_dir / f"{_dbg_out_name}_rigid_only.ome.tiff")
     with ExitStack() as _writer_stack:
-        writer = _writer_stack.enter_context(IncrementalOmeBigTiffWriter(
-            out_path,
-            output_shape_yxc,
-            base_dtype,
-            merged_names,
-            physical_pixel_sizes=ref_pixel_sizes,
-            open_existing=open_existing_output,
-        ))
+        if use_zarr_registration_store:
+            writer = _writer_stack.enter_context(IncrementalZarrRegisteredWriter(
+                str(registered_zarr_path),
+                output_shape_yxc,
+                base_dtype,
+                merged_names,
+                physical_pixel_sizes=ref_pixel_sizes,
+                chunk_yx=(int(pyramidal_tile_size), int(pyramidal_tile_size)),
+                write_workers=step1_workers,
+                open_existing=open_existing_output,
+            ))
+        else:
+            writer = _writer_stack.enter_context(IncrementalOmeBigTiffWriter(
+                out_path,
+                output_shape_yxc,
+                base_dtype,
+                merged_names,
+                physical_pixel_sizes=ref_pixel_sizes,
+                open_existing=open_existing_output,
+            ))
         debug_writer = (
             _writer_stack.enter_context(IncrementalOmeBigTiffWriter(
                 _debug_rigid_out_path,
@@ -2271,7 +2334,7 @@ def merge_cycles_to_ome_tiff(
                     _w = _warp_strip_by_field(_src, _oy0, _sH, _scy0, _fys, _fxs, order=1)
                     return ch, _cast_preserve_dtype(_w, base_dtype)
 
-                _n_workers = min(n_ch, os.cpu_count() or 4)
+                _n_workers = min(n_ch, step1_workers)
                 with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
                     _strip_futs = [_pool.submit(_compute_strip_ch, ch) for ch in range(n_ch)]
                     for _sfut in _strip_futs:
@@ -2545,11 +2608,7 @@ def merge_cycles_to_ome_tiff(
                     _et_regs    = regs
                     _et_large_px = int(elastic_touchup_large_island_px)
 
-                _n_elastic_workers = (
-                    max(1, int(elastic_touchup_workers))
-                    if elastic_touchup_workers and int(elastic_touchup_workers) > 0
-                    else max(1, (os.cpu_count() or 2) - 1)
-                )
+                _n_elastic_workers = int(step1_workers)
                 if _debug_elastic_field:
                     print(
                         f"[elastic] cycle {cycle}: starting elastic touch-up on "
@@ -2707,21 +2766,41 @@ def merge_cycles_to_ome_tiff(
                 n=total_ticks,
             )
 
-        convert_flat_ome_to_pyramidal(
-            out_path,
-            tmp_pyramid_path,
-            tile_size=int(pyramidal_tile_size),
-            compression=pyramidal_compression,
-            min_level_size=int(pyramidal_min_level_size),
-            out_chunk=max(1, int(pyramid_progress_chunk)),
-            replace_source=True,
-            progress_cb=_pyr_progress,
-        )
+        if use_zarr_registration_store:
+            convert_registered_zarr_to_pyramidal(
+                str(registered_zarr_path),
+                tmp_pyramid_path,
+                channel_names=merged_names,
+                physical_pixel_sizes=ref_pixel_sizes,
+                tile_size=int(pyramidal_tile_size),
+                compression=pyramidal_compression,
+                min_level_size=int(pyramidal_min_level_size),
+                out_chunk=max(1, int(pyramid_progress_chunk)),
+                progress_cb=_pyr_progress,
+                cancel_cb=cancel_cb,
+            )
+            os.replace(tmp_pyramid_path, out_path)
+            try:
+                shutil.rmtree(registered_zarr_path, ignore_errors=True)
+            except Exception:
+                pass
+        else:
+            convert_flat_ome_to_pyramidal(
+                out_path,
+                tmp_pyramid_path,
+                tile_size=int(pyramidal_tile_size),
+                compression=pyramidal_compression,
+                min_level_size=int(pyramidal_min_level_size),
+                out_chunk=max(1, int(pyramid_progress_chunk)),
+                replace_source=True,
+                progress_cb=_pyr_progress,
+            )
         tick += 1
 
     return {
         "output_path": out_path,
         "pyramidal_output_path": pyramid_output_path,
+        "registration_work_store": str(registered_zarr_path) if use_zarr_registration_store else None,
         "reference_cycle": int(reference_cycle),
         "canvas_shape_yx": tuple(int(v) for v in canvas_yx),
         "n_cycles": int(len(cycles)),
