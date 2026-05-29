@@ -44,7 +44,7 @@ from cycif_seg.ui.steps.step2a_nuclei_panel import Step2aNucleiPanel
 from cycif_seg.ui.steps.step2b_edit_panel import Step2bEditPanel
 from cycif_seg.ui.settings_panel import SettingsPanel
 from cycif_seg.io.ome_tiff import set_tiff_loading_debug
-from cycif_seg.preprocess.organize_cycles import set_preprocess_debug
+from cycif_seg.preprocess.organize_cycles import set_preprocess_debug, set_debug_elastic_touchup, set_debug_elastic_field
 from cycif_seg.features.multiscale import build_features
 from cycif_seg.model.rf_pixel import train_rf, predict_proba_tiled
 
@@ -236,6 +236,12 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         )
         self.settings_panel.chk_debug_preprocess.stateChanged.connect(
             lambda state: set_preprocess_debug(state != 0)
+        )
+        self.settings_panel.chk_debug_elastic_touchup.stateChanged.connect(
+            lambda state: set_debug_elastic_touchup(state != 0)
+        )
+        self.settings_panel.chk_debug_elastic_field.stateChanged.connect(
+            lambda state: set_debug_elastic_field(state != 0)
         )
 
         # Global status + progress (visible across tabs)

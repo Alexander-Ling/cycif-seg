@@ -216,6 +216,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "foreground_mask": "foreground mask",
             "identify_islands": "foreground islands",
             "foreground_island_refine": "island refinement",
+            "elastic_touchup": "elastic touch-up",
             "write_cycle": "writing",
             "pyramid": "building pyramid",
         }
@@ -245,6 +246,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 tiled_rigid_search_factor=max(1.0, float(getattr(s, "tiled_rigid_search_factor", default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
                 fast_large_island_refinement=False,
                 fast_large_island_sample_count=max(1, int(getattr(s, "fast_large_island_sample_count", 5) or 5)),
+                elastic_touchup=bool(getattr(s, "elastic_touchup", False)),
+                elastic_touchup_tile_size=max(64, int(getattr(s, "elastic_touchup_tile_size", 1024) or 1024)),
+                elastic_touchup_skip_corr=float(getattr(s, "elastic_touchup_skip_corr", 0.95) or 0.95),
+                elastic_touchup_bspline_spacing=max(4, int(getattr(s, "elastic_touchup_bspline_spacing", 50) or 50)),
+                elastic_touchup_max_iterations=max(1, int(getattr(s, "elastic_touchup_max_iterations", 100) or 100)),
+                elastic_touchup_large_island_px=max(1, int(getattr(s, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000)),
+                debug_elastic_touchup=bool(getattr(args, "debug_elastic_touchup", False)) or bool(getattr(s, "debug_elastic_touchup", False)),
+                debug_dir=str(getattr(args, "debug_dir") or getattr(s, "debug_dir") or "") or None,
                 pyramidal_output=bool(getattr(s, "pyramidal_output", False)),
                 progress_event_cb=_ev,
                 cancel_cb=None,
@@ -468,6 +477,13 @@ def _sample_from_sample_dir(args: argparse.Namespace) -> BatchSample:
         pyramidal_output=False,
         low_mem=True,
         strip_height=int(args.strip_height) if args.strip_height and int(args.strip_height) > 0 else None,
+        elastic_touchup=bool(getattr(args, "elastic_touchup", False)),
+        elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", 1024) or 1024)),
+        elastic_touchup_skip_corr=float(getattr(args, "elastic_touchup_skip_corr", 0.95) or 0.95),
+        elastic_touchup_bspline_spacing=max(4, int(getattr(args, "elastic_touchup_bspline_spacing", 50) or 50)),
+        elastic_touchup_max_iterations=max(1, int(getattr(args, "elastic_touchup_max_iterations", 100) or 100)),
+        debug_elastic_touchup=bool(getattr(args, "debug_elastic_touchup", False)),
+        debug_dir=str(getattr(args, "debug_dir") or "") or None,
     )
 
 
@@ -573,6 +589,14 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
             tiled_rigid_search_factor=max(1.0, float(getattr(sample, "tiled_rigid_search_factor", default_tiled_rigid_search_factor))),
             fast_large_island_refinement=False,
             fast_large_island_sample_count=max(1, int(getattr(sample, "fast_large_island_sample_count", 5) or 5)),
+            elastic_touchup=bool(getattr(args, "elastic_touchup", False)) or bool(getattr(sample, "elastic_touchup", False)),
+            elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", None) or getattr(sample, "elastic_touchup_tile_size", 1024) or 1024)),
+            elastic_touchup_skip_corr=float(getattr(args, "elastic_touchup_skip_corr", None) or getattr(sample, "elastic_touchup_skip_corr", 0.95) or 0.95),
+            elastic_touchup_bspline_spacing=max(4, int(getattr(args, "elastic_touchup_bspline_spacing", None) or getattr(sample, "elastic_touchup_bspline_spacing", 50) or 50)),
+            elastic_touchup_max_iterations=max(1, int(getattr(sample, "elastic_touchup_max_iterations", 100) or 100)),
+            elastic_touchup_large_island_px=max(1, int(getattr(sample, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000)),
+            debug_elastic_touchup=bool(getattr(args, "debug_elastic_touchup", False)) or bool(getattr(sample, "debug_elastic_touchup", False)),
+            debug_dir=str(getattr(args, "debug_dir") or getattr(sample, "debug_dir") or "") or None,
             pyramidal_output=bool(args.pyramidal),
             progress_cb=_progress,
             low_mem=True,
@@ -647,6 +671,20 @@ def main() -> None:
                            "low_mem=True (the default) auto-selects canvas_height/10 when not given. "
                            "Set to 0 to disable strip mode even when low_mem is active."
                        ))
+    p_run.add_argument("--elastic-touchup", action="store_true",
+                       help="Enable TV-L1 optical flow elastic touch-up after island refinement")
+    p_run.add_argument("--elastic-touchup-tile-size", type=int, default=1024, metavar="N",
+                       help="Tile size (px) for large-island elastic tiling (default: 1024)")
+    p_run.add_argument("--elastic-touchup-skip-corr", type=float, default=0.95, metavar="F",
+                       help="Skip elastic if masked correlation already exceeds this value (default: 0.95)")
+    p_run.add_argument("--elastic-touchup-bspline-spacing", type=int, default=50, metavar="N",
+                       help="B-spline grid spacing in pixels at full resolution (default: 50; lower = more local deformation)")
+    p_run.add_argument("--elastic-touchup-max-iterations", type=int, default=100, metavar="N",
+                       help="Maximum elastix iterations per resolution level (default: 100)")
+    p_run.add_argument("--debug-elastic-touchup", action="store_true",
+                       help="Save DAPI registration channel after rigid and after elastic touch-up for each cycle")
+    p_run.add_argument("--debug-dir", type=str, default=None, metavar="DIR",
+                       help="Directory for debug output images (default: <output_stem>_debug/ next to output file)")
     p_run.add_argument("--dry-run", action="store_true",
                        help="Validate the plan and print what would run, without processing")
 
@@ -720,6 +758,20 @@ def main() -> None:
                        help="Trust cycles before N and resume by rewriting cycle N onward")
     p_res.add_argument("--pyramidal", action="store_true",
                        help="Build the pyramidal OME-TIFF after the flat registration completes")
+    p_res.add_argument("--elastic-touchup", action="store_true",
+                       help="Enable TV-L1 optical flow elastic touch-up after island refinement")
+    p_res.add_argument("--elastic-touchup-tile-size", type=int, default=1024, metavar="N",
+                       help="Tile size (px) for large-island elastic tiling (default: 1024)")
+    p_res.add_argument("--elastic-touchup-skip-corr", type=float, default=0.95, metavar="F",
+                       help="Skip elastic if masked correlation already exceeds this value (default: 0.95)")
+    p_res.add_argument("--elastic-touchup-bspline-spacing", type=int, default=50, metavar="N",
+                       help="B-spline grid spacing in pixels at full resolution (default: 50; lower = more local deformation)")
+    p_res.add_argument("--elastic-touchup-max-iterations", type=int, default=100, metavar="N",
+                       help="Maximum elastix iterations per resolution level (default: 100)")
+    p_res.add_argument("--debug-elastic-touchup", action="store_true",
+                       help="Save DAPI registration channel after rigid and after elastic touch-up for each cycle")
+    p_res.add_argument("--debug-dir", type=str, default=None, metavar="DIR",
+                       help="Directory for debug output images (default: <output_stem>_debug/ next to output file)")
     p_res.add_argument("--dry-run", action="store_true",
                        help="Inspect and print resume plan without writing")
 

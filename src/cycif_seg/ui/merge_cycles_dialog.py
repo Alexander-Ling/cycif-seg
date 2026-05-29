@@ -145,6 +145,55 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
+        # Elastic touch-up
+        elastic_group = QtWidgets.QGroupBox("Elastic touch-up")
+        elastic_layout = QtWidgets.QVBoxLayout(elastic_group)
+        self.chk_elastic_touchup = QtWidgets.QCheckBox("Enable B-spline elastic touch-up after island refinement")
+        self.chk_elastic_touchup.setChecked(True)
+        self.chk_elastic_touchup.setToolTip(
+            "After rigid island refinement, apply a full-resolution B-spline elastic\n"
+            "correction to each foreground island using elastix (via SimpleITK).\n"
+            "Helps correct residual local misregistration that rigid correction misses."
+        )
+        elastic_layout.addWidget(self.chk_elastic_touchup)
+        elastic_form = QtWidgets.QFormLayout()
+        self.spn_bspline_spacing = QtWidgets.QSpinBox()
+        self.spn_bspline_spacing.setRange(4, 500)
+        self.spn_bspline_spacing.setSingleStep(10)
+        self.spn_bspline_spacing.setValue(50)
+        self.spn_bspline_spacing.setToolTip(
+            "B-spline control-point grid spacing in pixels at full resolution.\n"
+            "Lower values allow more local deformation (default: 50)."
+        )
+        self.spn_max_iterations = QtWidgets.QSpinBox()
+        self.spn_max_iterations.setRange(1, 1000)
+        self.spn_max_iterations.setSingleStep(10)
+        self.spn_max_iterations.setValue(100)
+        self.spn_max_iterations.setToolTip(
+            "Maximum elastix optimizer iterations per resolution level (default: 100)."
+        )
+        elastic_form.addRow("B-spline grid spacing (px):", self.spn_bspline_spacing)
+        elastic_form.addRow("Max iterations:", self.spn_max_iterations)
+        elastic_layout.addLayout(elastic_form)
+        self.spn_bspline_spacing.setEnabled(True)
+        self.spn_max_iterations.setEnabled(True)
+        self.chk_elastic_touchup.toggled.connect(self.spn_bspline_spacing.setEnabled)
+        self.chk_elastic_touchup.toggled.connect(self.spn_max_iterations.setEnabled)
+        root.addWidget(elastic_group)
+        try:
+            if isinstance(self._initial_cfg, dict):
+                vet = self._initial_cfg.get("elastic_touchup")
+                if vet is not None:
+                    self.chk_elastic_touchup.setChecked(bool(vet))
+                vbs = self._initial_cfg.get("elastic_touchup_bspline_spacing")
+                if vbs is not None:
+                    self.spn_bspline_spacing.setValue(max(4, int(vbs)))
+                vmi = self._initial_cfg.get("elastic_touchup_max_iterations")
+                if vmi is not None:
+                    self.spn_max_iterations.setValue(max(1, int(vmi)))
+        except Exception:
+            pass
+
         self.tabs = QtWidgets.QTabWidget()
         self.tbl_registration = QtWidgets.QTableWidget()
         self.tbl_channels = QtWidgets.QTableWidget()
@@ -485,5 +534,8 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "pyramidal_output": bool(self.chk_pyramidal_output.isChecked()),
             "low_mem": bool(self.chk_low_mem.isChecked()),
             "strip_height": int(self.spn_strip_height.value()) if self.spn_strip_height.value() > 0 else None,
+            "elastic_touchup": bool(self.chk_elastic_touchup.isChecked()),
+            "elastic_touchup_bspline_spacing": int(self.spn_bspline_spacing.value()),
+            "elastic_touchup_max_iterations": int(self.spn_max_iterations.value()),
             "cycles": cycles_out,
         }

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cycif-seg"
-version = "0.0.61"
+version = "0.0.62"
 description = "MVP napari app for CycIF segmentation (scribbles + RF pixel classifier)"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
   "scikit-image",
   "scipy",
   "scikit-learn",
-  "simpleitk",
+  "itk-elastix",
   "ome-types",
 ]
 

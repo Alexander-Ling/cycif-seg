@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 import gc
 import json
 import math
@@ -46,6 +47,8 @@ _STEP1_DEBUG = str(os.environ.get("CYCIF_SEG_STEP1_DEBUG", "0")).strip().lower()
 
 # UI-toggled debug flag for batch preprocessing (Settings panel checkbox).
 _debug_preprocess: bool = False
+_debug_elastic_touchup_global: bool = False
+_debug_elastic_field: bool = False
 
 
 def set_preprocess_debug(enabled: bool) -> None:
@@ -56,6 +59,26 @@ def set_preprocess_debug(enabled: bool) -> None:
 
 def is_preprocess_debug() -> bool:
     return _debug_preprocess
+
+
+def set_debug_elastic_touchup(enabled: bool) -> None:
+    """Enable or disable elastic touch-up debug image output (Settings panel checkbox)."""
+    global _debug_elastic_touchup_global
+    _debug_elastic_touchup_global = bool(enabled)
+
+
+def is_debug_elastic_touchup() -> bool:
+    return _debug_elastic_touchup_global
+
+
+def set_debug_elastic_field(enabled: bool) -> None:
+    """Enable or disable per-island elastic field statistics output."""
+    global _debug_elastic_field
+    _debug_elastic_field = bool(enabled)
+
+
+def is_debug_elastic_field() -> bool:
+    return _debug_elastic_field
 
 
 def _dbg(msg: str) -> None:
@@ -1066,7 +1089,7 @@ def _warp_strip_by_field(
     _CHUNK = 512
     for j0 in range(0, strip_H, _CHUNK):
         j1 = min(strip_H, j0 + _CHUNK)
-        # Canvas Y coordinates for the output rows, shifted by field → source canvas row
+        # Canvas Y coordinates for the output rows, shifted by field -> source canvas row
         # Convert to src_canvas_strip-local index by subtracting src_canvas_y0
         src_y = (gy[j0:j1, np.newaxis] - field_y[j0:j1] - float(src_canvas_y0)).ravel()
         src_x = (gx[np.newaxis, :] - field_x[j0:j1]).ravel()
@@ -1426,6 +1449,373 @@ def inspect_registration_flat_resume_state(
     }
 
 
+# Crops larger than this in either dimension are downsampled before being
+# passed to elastix, then the resulting field is upsampled back.
+_ELASTIX_MAX_DIM: int = 512
+
+# Elastix is run in a subprocess so that ITK's internal thread pool never
+# initialises inside the napari/Qt process, where it hard-crashes due to a
+# DLL conflict.  The worker script is written to a temp file at call time.
+_ELASTIX_WORKER_SCRIPT = r"""
+import sys, numpy as np, itk
+
+d    = np.load(sys.argv[1])
+ref  = d['ref'].astype(np.float32)
+mov  = d['mov'].astype(np.float32)
+isl  = d['isl'].astype(bool)
+gs   = int(d['gs'][0])
+itr  = int(d['it'][0])
+
+fixed_itk  = itk.GetImageFromArray(ref)
+moving_itk = itk.GetImageFromArray(mov)
+
+po = itk.ParameterObject.New()
+pm = po.GetDefaultParameterMap('bspline')
+pm['Registration']                        = ['MultiResolutionRegistration']
+pm['Metric']                              = ['AdvancedNormalizedCorrelation']
+pm['ImageSampler']                        = ['RandomCoordinate']
+pm['NumberOfSpatialSamples']              = ['2000']
+pm['MaximumNumberOfIterations']           = [str(itr)]
+pm['FinalGridSpacingInPhysicalUnits']     = [str(gs)]
+pm['WriteResultImage']                    = ['false']
+pm['WriteTransformParametersEachIteration'] = ['false']
+pm['WriteResultImageAfterEachResolution'] = ['false']
+po.AddParameterMap(pm)
+
+_, tf = itk.elastix_registration_method(
+    fixed_itk, moving_itk, parameter_object=po, log_to_console=False)
+df_img = itk.transformix_deformation_field(moving_itk, tf, log_to_console=False)
+df = itk.GetArrayFromImage(df_img)   # (H, W, 2): [0]=dx [1]=dy
+fy = -df[..., 1].astype(np.float32)
+fx = -df[..., 0].astype(np.float32)
+fy[~isl] = 0.0
+fx[~isl] = 0.0
+np.savez_compressed(sys.argv[2], fy=fy, fx=fx)
+"""
+
+
+def _run_elastix_bspline(
+    fixed_crop: np.ndarray,
+    moving_crop: np.ndarray,
+    island_crop: np.ndarray,
+    *,
+    grid_spacing_px: int,
+    max_iterations: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Compute a dense displacement field via elastix B-spline registration.
+
+    Runs in a subprocess to keep ITK's DLL state isolated from the napari/Qt
+    process.  Crops larger than _ELASTIX_MAX_DIM are downsampled first and the
+    resulting field is upsampled back to the original resolution.
+
+    Returns (field_y, field_x) in our warp convention:
+        output[y, x] = moving[y - field_y[y,x], x - field_x[y,x]]
+    """
+    import sys
+    import subprocess
+    import tempfile
+
+    H, W = int(fixed_crop.shape[0]), int(fixed_crop.shape[1])
+    ds = max(1, int(math.ceil(max(H, W) / _ELASTIX_MAX_DIM)))
+
+    if ds > 1:
+        ref_n = _normalized_for_registration(_downsample_image(fixed_crop, ds))
+        mov_n = _normalized_for_registration(_downsample_image(moving_crop, ds))
+        # Trim island using the same floor-div footprint _downsample_image uses
+        # so isl_ds shape matches ref_n exactly (avoids off-by-one on odd dims).
+        _iy = (island_crop.shape[0] // ds) * ds
+        _ix = (island_crop.shape[1] // ds) * ds
+        isl_ds = island_crop[:_iy, :_ix][::ds, ::ds].astype(bool)
+        gs_px  = max(4, grid_spacing_px // ds)
+    else:
+        ref_n  = _normalized_for_registration(fixed_crop)
+        mov_n  = _normalized_for_registration(moving_crop)
+        isl_ds = island_crop.astype(bool)
+        gs_px  = int(grid_spacing_px)
+
+    if not np.isfinite(ref_n).all():
+        ref_n = np.nan_to_num(ref_n, nan=0.0, posinf=1.0, neginf=0.0)
+    if not np.isfinite(mov_n).all():
+        mov_n = np.nan_to_num(mov_n, nan=0.0, posinf=1.0, neginf=0.0)
+
+    try:
+        with tempfile.TemporaryDirectory() as _td:
+            _script = os.path.join(_td, 'w.py')
+            _inp    = os.path.join(_td, 'inp.npz')
+            _out    = os.path.join(_td, 'out.npz')
+
+            with open(_script, 'w', encoding='utf-8') as _f:
+                _f.write(_ELASTIX_WORKER_SCRIPT)
+
+            np.savez_compressed(
+                _inp,
+                ref=ref_n, mov=mov_n, isl=isl_ds.view(np.uint8),
+                gs=np.array([gs_px],        dtype=np.int32),
+                it=np.array([max_iterations], dtype=np.int32),
+            )
+
+            _proc = subprocess.run(
+                [sys.executable, _script, _inp, _out],
+                timeout=300,
+                capture_output=True,
+            )
+
+            if _proc.returncode != 0 or not os.path.isfile(_out):
+                return None
+
+            # Read bytes into memory before the TemporaryDirectory cleanup
+            # removes the file, and to release the file handle immediately so
+            # Windows file-locking (AV scan, indexer) doesn't block np.load.
+            import io as _io
+            _npz_bytes: bytes | None = None
+            for _attempt in range(5):
+                try:
+                    with open(_out, 'rb') as _f:
+                        _npz_bytes = _f.read()
+                    break
+                except (PermissionError, OSError):
+                    import time as _time
+                    _time.sleep(0.1 * (2 ** _attempt))
+            if _npz_bytes is None:
+                if _debug_elastic_field:
+                    print("[elastic]     could not read output file (file lock)", flush=True)
+                return None
+
+            _data = np.load(_io.BytesIO(_npz_bytes))
+            field_y_raw = _data['fy'].astype(np.float32)
+            field_x_raw = _data['fx'].astype(np.float32)
+
+    except Exception as _e:
+        if _debug_elastic_field:
+            print(f"[elastic]     subprocess error: {_e}", flush=True)
+        return None
+
+    if ds > 1:
+        from scipy.ndimage import zoom as _sz
+        field_y = (_sz(field_y_raw, ds, order=1) * float(ds))[:H, :W]
+        field_x = (_sz(field_x_raw, ds, order=1) * float(ds))[:H, :W]
+        if field_y.shape[0] < H or field_y.shape[1] < W:
+            _fy = np.zeros((H, W), dtype=np.float32)
+            _fx = np.zeros((H, W), dtype=np.float32)
+            _fy[:field_y.shape[0], :field_y.shape[1]] = field_y
+            _fx[:field_x.shape[0], :field_x.shape[1]] = field_x
+            field_y, field_x = _fy, _fx
+    else:
+        field_y = field_y_raw
+        field_x = field_x_raw
+
+    island = island_crop.astype(bool)
+    field_y[~island] = 0.0
+    field_x[~island] = 0.0
+    return field_y, field_x
+
+
+def _elastic_touchup_island(
+    ref_reg: np.ndarray,
+    mov_reg: np.ndarray,
+    island_mask: np.ndarray,
+    rigid_shift: tuple[float, float],
+    fg_mask: np.ndarray,
+    *,
+    tile_size: int,
+    skip_corr_threshold: float,
+    min_fg_pixels: int,
+    grid_spacing_px: int,
+    max_iterations: int,
+    large_island_px: int,
+    executor=None,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]] | None:
+    n_fg = int(island_mask.sum())
+    if n_fg < int(min_fg_pixels):
+        if _debug_elastic_field:
+            print(f"[elastic]   SKIP: too few fg pixels ({n_fg} < {min_fg_pixels})", flush=True)
+        return None
+    y0, y1, x0, x1 = _bbox_from_mask(island_mask)
+    h, w = y1 - y0, x1 - x0
+    if h <= 0 or w <= 0:
+        return None
+
+    ref_crop = ref_reg[y0:y1, x0:x1]
+    dy, dx = float(rigid_shift[0]), float(rigid_shift[1])
+    mov_crop = _extract_translated_crop(mov_reg, (y0, y1, x0, x1), dy, dx)
+    fg_crop = fg_mask[y0:y1, x0:x1]
+    island_crop = island_mask[y0:y1, x0:x1]
+
+    corr = _masked_corr_score(ref_crop, mov_crop, fg_crop)
+    if _debug_elastic_field:
+        _path = "tiled" if h * w >= int(large_island_px) else "direct"
+        _verdict = "SKIP corr>threshold" if corr > float(skip_corr_threshold) else f"processing [{_path}]"
+        print(
+            f"[elastic]   bbox=({y0},{y1},{x0},{x1}) fg={n_fg} "
+            f"corr={corr:.4f} thr={skip_corr_threshold:.4f} shift=({dy:.1f},{dx:.1f}) -> {_verdict}",
+            flush=True,
+        )
+    if corr > float(skip_corr_threshold):
+        return None
+
+    if h * w < int(large_island_px):
+        result = _run_elastix_bspline(
+            ref_crop, mov_crop, island_crop,
+            grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
+        )
+        if result is None:
+            if _debug_elastic_field:
+                print("[elastic]   -> no correction (elastix returned None)", flush=True)
+            return None
+        disp_y, disp_x = result
+        if _debug_elastic_field:
+            _mag = np.sqrt(disp_y ** 2 + disp_x ** 2)
+            _isl = island_crop.astype(bool)
+            _vals = _mag[_isl] if _isl.any() else _mag.ravel()
+            print(
+                f"[elastic]   -> direct disp: max={float(np.max(_mag)):.3f}px "
+                f"mean(island)={float(np.mean(_vals)):.3f}px "
+                f"p95(island)={float(np.percentile(_vals, 95)):.3f}px",
+                flush=True,
+            )
+        return disp_y, disp_x, (y0, y1, x0, x1)
+
+    # Tiled path: 50% stride, tent-weight blending
+    stride = max(1, int(tile_size) // 2)
+    disp_y_acc = np.zeros((h, w), dtype=np.float32)
+    disp_x_acc = np.zeros((h, w), dtype=np.float32)
+    weight_acc = np.zeros((h, w), dtype=np.float32)
+
+    ty_starts = list(range(0, h, stride))
+    tx_starts = list(range(0, w, stride))
+
+    # Collect qualifying tiles first so we know count before submitting
+    _tile_tasks: list[tuple] = []
+    _tile_corrs: list[float] = []
+    _n_tiles_island_px = 0
+    _n_tiles_corr_skipped = 0
+    for _ty0 in ty_starts:
+        _ty1 = min(h, _ty0 + int(tile_size))
+        _th = _ty1 - _ty0
+        _tent_y = np.minimum(
+            np.arange(_th, dtype=np.float32) + 1,
+            np.arange(_th - 1, -1, -1, dtype=np.float32) + 1,
+        ).clip(1e-6)
+        for _tx0 in tx_starts:
+            _tx1 = min(w, _tx0 + int(tile_size))
+            _tw = _tx1 - _tx0
+            _tent_x = np.minimum(
+                np.arange(_tw, dtype=np.float32) + 1,
+                np.arange(_tw - 1, -1, -1, dtype=np.float32) + 1,
+            ).clip(1e-6)
+            _tent = (_tent_y[:, np.newaxis] * _tent_x[np.newaxis, :]).astype(np.float32)
+            _t_island = island_crop[_ty0:_ty1, _tx0:_tx1]
+            if int(_t_island.sum()) < 200:
+                continue
+            _n_tiles_island_px += 1
+            _t_corr = _masked_corr_score(
+                ref_crop[_ty0:_ty1, _tx0:_tx1],
+                mov_crop[_ty0:_ty1, _tx0:_tx1],
+                _t_island,
+            )
+            if _t_corr >= float(skip_corr_threshold):
+                _n_tiles_corr_skipped += 1
+                continue
+            _tile_corrs.append(float(_t_corr))
+            _tile_tasks.append((
+                _ty0, _ty1, _tx0, _tx1, _tent,
+                ref_crop[_ty0:_ty1, _tx0:_tx1].copy(),
+                mov_crop[_ty0:_ty1, _tx0:_tx1].copy(),
+                _t_island.copy(),
+            ))
+
+    _avg_corr_submitted = float(np.mean(_tile_corrs)) if _tile_corrs else 0.0
+
+    if _debug_elastic_field:
+        print(
+            f"[elastic]   tiled: {_n_tiles_island_px} island tiles  "
+            f"corr_skipped={_n_tiles_corr_skipped}  "
+            f"submitting={len(_tile_tasks)}  "
+            f"avg_corr={_avg_corr_submitted:.3f}  "
+            f"parallel={'yes' if executor is not None and len(_tile_tasks) > 1 else 'no'}",
+            flush=True,
+        )
+
+    _n_tiles_tried = len(_tile_tasks)
+    _n_tiles_ok = 0
+    _BAR_W = 20
+
+    def _run_tile(_ty0, _ty1, _tx0, _tx1, _tent, _t_ref, _t_mov, _t_isl):
+        _tres = _run_elastix_bspline(
+            _t_ref, _t_mov, _t_isl,
+            grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
+        )
+        if _tres is None:
+            return None
+        return _ty0, _ty1, _tx0, _tx1, _tent, _tres[0], _tres[1]
+
+    def _accumulate(_res):
+        nonlocal _n_tiles_ok
+        if _res is None:
+            return
+        _ty0r, _ty1r, _tx0r, _tx1r, _tentr, _tdy, _tdx = _res
+        _n_tiles_ok += 1
+        disp_y_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tdy * _tentr
+        disp_x_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tdx * _tentr
+        weight_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tentr
+
+    def _bar(_done, _total):
+        _f = min(_BAR_W, _done * _BAR_W // _total) if _total else _BAR_W
+        return ('=' * _f + ('>' if _f < _BAR_W else '') + ' ' * max(0, _BAR_W - _f - 1))
+
+    if executor is not None and len(_tile_tasks) > 1:
+        _tile_futs = [executor.submit(_run_tile, *_args) for _args in _tile_tasks]
+        _n_done = 0
+        for _fut in as_completed(_tile_futs):
+            _accumulate(_fut.result())
+            _n_done += 1
+            if _debug_elastic_field:
+                print(
+                    f"\r[elastic]   [{_bar(_n_done, _n_tiles_tried)}]"
+                    f" {_n_done}/{_n_tiles_tried}  ok={_n_tiles_ok}",
+                    end='', flush=True,
+                )
+        if _debug_elastic_field:
+            print(flush=True)
+    else:
+        _n_done = 0
+        for _args in _tile_tasks:
+            _accumulate(_run_tile(*_args))
+            _n_done += 1
+            if _debug_elastic_field:
+                print(
+                    f"\r[elastic]   [{_bar(_n_done, _n_tiles_tried)}]"
+                    f" {_n_done}/{_n_tiles_tried}  ok={_n_tiles_ok}",
+                    end='', flush=True,
+                )
+        if _debug_elastic_field and _n_tiles_tried > 0:
+            print(flush=True)
+
+    nz = weight_acc > 0
+    if not nz.any():
+        if _debug_elastic_field:
+            print(
+                f"[elastic]   -> tiled: no corrections accumulated "
+                f"(tiles_tried={_n_tiles_tried}, tiles_ok={_n_tiles_ok})",
+                flush=True,
+            )
+        return None
+    disp_y_acc[nz] /= weight_acc[nz]
+    disp_x_acc[nz] /= weight_acc[nz]
+    if _debug_elastic_field:
+        _mag = np.sqrt(disp_y_acc[nz] ** 2 + disp_x_acc[nz] ** 2)
+        _isl_nz = (island_crop.astype(bool))[nz]
+        _vals = _mag[_isl_nz] if _isl_nz.any() else _mag
+        print(
+            f"[elastic]   -> tiled disp ({_n_tiles_ok}/{_n_tiles_tried} tiles): "
+            f"max={float(np.max(_mag)):.3f}px "
+            f"mean(island)={float(np.mean(_vals)):.3f}px "
+            f"p95(island)={float(np.percentile(_vals, 95)):.3f}px",
+            flush=True,
+        )
+    return disp_y_acc, disp_x_acc, (y0, y1, x0, x1)
+
+
 def merge_cycles_to_ome_tiff(
     cycles: Iterable[CycleInput],
     output_path: str,
@@ -1443,6 +1833,15 @@ def merge_cycles_to_ome_tiff(
     upsample_factor: int = 10,
     low_mem: bool = False,
     strip_height: int | None = None,
+    elastic_touchup: bool = False,
+    elastic_touchup_tile_size: int = 1024,
+    elastic_touchup_skip_corr: float = 0.95,
+    elastic_touchup_bspline_spacing: int = 50,
+    elastic_touchup_max_iterations: int = 100,
+    elastic_touchup_large_island_px: int = 4_000_000,
+    elastic_touchup_workers: int = 0,
+    debug_elastic_touchup: bool = False,
+    debug_dir: str | None = None,
     pyramidal_output: bool = False,
     pyramidal_tile_size: int = 512,
     pyramidal_compression: str | int | None = "zlib",
@@ -1622,14 +2021,36 @@ def merge_cycles_to_ome_tiff(
             if str(int(cy)) in manifest["cycles"]:
                 manifest["cycles"][str(int(cy))]["status"] = "complete"
     open_existing_output = bool(resume_flat_output and Path(out_path).is_file())
-    with IncrementalOmeBigTiffWriter(
-        out_path,
-        output_shape_yxc,
-        base_dtype,
-        merged_names,
-        physical_pixel_sizes=ref_pixel_sizes,
-        open_existing=open_existing_output,
-    ) as writer:
+    _doing_debug_write = (debug_elastic_touchup or _debug_elastic_touchup_global) and elastic_touchup
+    _debug_rigid_out_path: str | None = None
+    if _doing_debug_write:
+        _dbg_out_name = Path(output_path).name
+        for _ext in ('.ome.tiff', '.ome.tif', '.tiff', '.tif'):
+            if _dbg_out_name.lower().endswith(_ext.lower()):
+                _dbg_out_name = _dbg_out_name[:-len(_ext)]
+                break
+        _dbg_out_dir = Path(debug_dir) if debug_dir else Path(output_path).parent
+        _debug_rigid_out_path = str(_dbg_out_dir / f"{_dbg_out_name}_rigid_only.ome.tiff")
+    with ExitStack() as _writer_stack:
+        writer = _writer_stack.enter_context(IncrementalOmeBigTiffWriter(
+            out_path,
+            output_shape_yxc,
+            base_dtype,
+            merged_names,
+            physical_pixel_sizes=ref_pixel_sizes,
+            open_existing=open_existing_output,
+        ))
+        debug_writer = (
+            _writer_stack.enter_context(IncrementalOmeBigTiffWriter(
+                _debug_rigid_out_path,
+                output_shape_yxc,
+                base_dtype,
+                merged_names,
+                physical_pixel_sizes=ref_pixel_sizes,
+                open_existing=False,
+            ))
+            if _doing_debug_write else None
+        )
         _save_registration_manifest(progress_path, manifest)
 
         def _set_cycle_status(cycle: int, status: str) -> None:
@@ -1643,22 +2064,29 @@ def merge_cycles_to_ome_tiff(
             ci: CycleInput,
             shp: tuple[int, int, int],
             field_yx: tuple[np.ndarray, np.ndarray] | None,
+            target_writer=None,
         ) -> None:
             _check_cancel(cancel_cb)
             cycle = int(ci.cycle)
             out_c0 = int(channel_offsets[cycle])
             n_ch = int(shp[2])
-            for ch in range(n_ch):
-                plane_native = load_single_channel_tiff_native(ci.path, int(ch))
-                plane = _pad_plane_to_canvas(plane_native, canvas_yx, out_dtype=np.float32)
-                del plane_native
-                if field_yx is None:
-                    reg_plane = plane
-                else:
-                    field_y, field_x = field_yx
-                    reg_plane = _warp_plane_by_field(plane, field_y, field_x, order=1)
-                writer.write_channel(out_c0 + ch, _cast_preserve_dtype(reg_plane, base_dtype))
-                del plane, reg_plane
+            _fy, _fx = field_yx if field_yx is not None else (None, None)
+            _w = target_writer if target_writer is not None else writer
+
+            def _compute_ch(ch: int) -> np.ndarray:
+                _plane = load_single_channel_tiff_native(ci.path, int(ch))
+                _plane = _pad_plane_to_canvas(_plane, canvas_yx, out_dtype=np.float32)
+                if _fy is not None:
+                    _plane = _warp_plane_by_field(_plane, _fy, _fx, order=1)
+                return _cast_preserve_dtype(_plane, base_dtype)
+
+            # map_coordinates (the warp) releases the GIL, so threads give real
+            # parallelism here. Cap at 4 to bound peak in-flight plane memory.
+            _n_workers = min(n_ch, 4)
+            with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+                _futures = [_pool.submit(_compute_ch, ch) for ch in range(n_ch)]
+                for ch, _fut in enumerate(_futures):
+                    _w.write_channel(out_c0 + ch, _fut.result())
 
         def _write_cycle_channels_strip(
             ci: CycleInput,
@@ -1666,9 +2094,12 @@ def merge_cycles_to_ome_tiff(
             regs_fullres: list[_RegionTransform] | None,
             base_dy: float,
             base_dx: float,
+            elastic_corrections: list[tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]] | None = None,
+            target_writer=None,
         ) -> None:
             """Strip-based writer: processes the canvas in horizontal bands to minimise RAM."""
             _check_cancel(cancel_cb)
+            _w = target_writer if target_writer is not None else writer
             cycle = int(ci.cycle)
             out_c0 = int(channel_offsets[cycle])
             n_ch = int(shp[2])
@@ -1725,6 +2156,25 @@ def merge_cycles_to_ome_tiff(
                 else:
                     field_y_s = field_x_s = None
 
+                if elastic_corrections and field_y_s is not None:
+                    for _ec_dy, _ec_dx, (_ey0, _ey1, _ex0, _ex1) in elastic_corrections:
+                        _ov_y0 = max(out_y0, _ey0)
+                        _ov_y1 = min(out_y1, _ey1)
+                        if _ov_y0 >= _ov_y1:
+                            continue
+                        _ex0_c = max(0, _ex0)
+                        _ex1_c = min(canvas_W, _ex1)
+                        if _ex0_c >= _ex1_c:
+                            continue
+                        _sl_y0 = _ov_y0 - out_y0
+                        _sl_y1 = _ov_y1 - out_y0
+                        _cl_y0 = _ov_y0 - _ey0
+                        _cl_y1 = _ov_y1 - _ey0
+                        _cl_x0 = _ex0_c - _ex0
+                        _cl_x1 = _ex1_c - _ex0
+                        field_y_s[_sl_y0:_sl_y1, _ex0_c:_ex1_c] += _ec_dy[_cl_y0:_cl_y1, _cl_x0:_cl_x1]
+                        field_x_s[_sl_y0:_sl_y1, _ex0_c:_ex1_c] += _ec_dx[_cl_y0:_cl_y1, _cl_x0:_cl_x1]
+
                 # Source canvas rows needed (with shift padding)
                 src_cy0 = max(0, out_y0 - shift_pad)
                 src_cy1 = min(canvas_H, out_y1 + shift_pad)
@@ -1734,34 +2184,37 @@ def merge_cycles_to_ome_tiff(
                 ovlp_cy0 = max(src_cy0, canvas_pad_y0)
                 ovlp_cy1 = min(src_cy1, canvas_pad_y0 + ys)
 
-                for ch in range(n_ch):
-                    _check_cancel(cancel_cb)
-                    src_canvas = np.zeros((src_H, canvas_W), dtype=np.float32)
+                # Process all channels for this strip in parallel.
+                # load_channel_strip uses read-only memmaps (thread-safe); the
+                # warp (map_coordinates) releases the GIL for true parallelism.
+                # Strips are small so we allow up to cpu_count workers.
+                _fys, _fxs = field_y_s, field_x_s
+                _oy0, _sH, _scy0 = out_y0, strip_H, src_cy0
+                _ocy0, _ocy1 = ovlp_cy0, ovlp_cy1
+                _sH_src = src_H
 
-                    if ovlp_cy0 < ovlp_cy1:
-                        file_y0 = in_y0 + (ovlp_cy0 - canvas_pad_y0)
-                        file_y1 = in_y0 + (ovlp_cy1 - canvas_pad_y0)
-                        raw = load_channel_strip(ci.path, ch, file_y0, file_y1)
-                        dest_y0 = ovlp_cy0 - src_cy0
-                        dest_y1 = ovlp_cy1 - src_cy0
-                        src_canvas[dest_y0:dest_y1, canvas_pad_x0:canvas_pad_x0 + xs] = \
-                            raw[:, in_x0:in_x0 + xs].astype(np.float32, copy=False)
-                        del raw
-
-                    if field_y_s is None:
-                        # Reference cycle or global-translation-only: just slice and cast
-                        rel_y0 = out_y0 - src_cy0
-                        rel_y1 = out_y1 - src_cy0
-                        out_strip = _cast_preserve_dtype(src_canvas[rel_y0:rel_y1], base_dtype)
-                    else:
-                        warped = _warp_strip_by_field(
-                            src_canvas, out_y0, strip_H, src_cy0, field_y_s, field_x_s, order=1
+                def _compute_strip_ch(ch: int) -> tuple[int, np.ndarray]:
+                    _src = np.zeros((_sH_src, canvas_W), dtype=np.float32)
+                    if _ocy0 < _ocy1:
+                        _fy0 = in_y0 + (_ocy0 - canvas_pad_y0)
+                        _fy1 = in_y0 + (_ocy1 - canvas_pad_y0)
+                        _raw = load_channel_strip(ci.path, ch, _fy0, _fy1)
+                        _dy0, _dy1 = _ocy0 - _scy0, _ocy1 - _scy0
+                        _src[_dy0:_dy1, canvas_pad_x0:canvas_pad_x0 + xs] = (
+                            _raw[:, in_x0:in_x0 + xs].astype(np.float32, copy=False)
                         )
-                        out_strip = _cast_preserve_dtype(warped, base_dtype)
-                        del warped
+                    if _fys is None:
+                        _ry0, _ry1 = _oy0 - _scy0, (_oy0 + _sH) - _scy0
+                        return ch, _cast_preserve_dtype(_src[_ry0:_ry1], base_dtype)
+                    _w = _warp_strip_by_field(_src, _oy0, _sH, _scy0, _fys, _fxs, order=1)
+                    return ch, _cast_preserve_dtype(_w, base_dtype)
 
-                    writer.write_channel_strip(out_c0 + ch, out_strip, out_y0)
-                    del src_canvas, out_strip
+                _n_workers = min(n_ch, os.cpu_count() or 4)
+                with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+                    _strip_futs = [_pool.submit(_compute_strip_ch, ch) for ch in range(n_ch)]
+                    for _sfut in _strip_futs:
+                        _sch, _out = _sfut.result()
+                        _w.write_channel_strip(out_c0 + _sch, _out, out_y0)
 
         ref_info = next((item for item in infos if int(item[0].cycle) == int(reference_cycle)), None)
         if ref_info is None:
@@ -1790,9 +2243,15 @@ def merge_cycles_to_ome_tiff(
             _set_cycle_status(int(reference_cycle), "in_progress")
             if _strip_mode:
                 _write_cycle_channels_strip(ref_ci_write, ref_shp, None, 0.0, 0.0)
+                if debug_writer is not None:
+                    _write_cycle_channels_strip(ref_ci_write, ref_shp, None, 0.0, 0.0, target_writer=debug_writer)
             else:
                 _write_cycle_channels(ref_ci_write, ref_shp, None)
+                if debug_writer is not None:
+                    _write_cycle_channels(ref_ci_write, ref_shp, None, target_writer=debug_writer)
             writer.flush_and_release()
+            if debug_writer is not None:
+                debug_writer.flush_and_release()
             _set_cycle_status(int(reference_cycle), "complete")
             if _debug_preprocess:
                 _rss_ref = ""
@@ -1973,12 +2432,112 @@ def merge_cycles_to_ome_tiff(
                     f"({'downsampled+scaled' if _strip_mode else 'full-res'})",
                     flush=True,
                 )
-            if _i_moving == len(moving_infos) - 1:
-                del ref_reg
             tick += 1
 
+            # Stage 7: elastic touch-up
+            _elastic_corrections: list[tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]] = []
+            if elastic_touchup and _use_islands and islands is not None:
+                _progress(
+                    f"7. Registering Cycle {cycle}: elastic touch-up...",
+                    progress_cb=progress_cb,
+                    progress_event_cb=progress_event_cb,
+                    phase="elastic_touchup",
+                    idx=tick,
+                    n=total_ticks,
+                    cycle=cycle,
+                )
+                if _strip_mode:
+                    # ref_reg/mov_reg are downsampled (D=4); DAPI nuclei are ~2.5 px at
+                    # that scale — too small for reliable registration.  Load the
+                    # registration channel at full resolution from disk for this stage.
+                    from scipy.ndimage import zoom as _sz  # type: ignore
+                    _ref_full_fr = _pad_plane_to_canvas(
+                        load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx)),
+                        canvas_yx, out_dtype=np.float32,
+                    )
+                    _mov_full_fr = _pad_plane_to_canvas(
+                        load_single_channel_tiff_native(ci.path, int(ch_idx)),
+                        canvas_yx, out_dtype=np.float32,
+                    )
+                    # Nearest-neighbour upsample preserves integer island labels.
+                    _islands_fr = _sz(islands, D, order=0).astype(islands.dtype)
+                    _ref_fg_fr  = _foreground_mask(_ref_full_fr)
+                    _et_ref     = _ref_full_fr
+                    _et_mov     = _mov_full_fr
+                    _et_islands = _islands_fr
+                    _et_fg      = _ref_fg_fr
+                    _et_regs    = regs_raw
+                    # Island pixel counts are D² larger at full res; scale threshold.
+                    _et_large_px = int(elastic_touchup_large_island_px) * D * D
+                else:
+                    _ref_fg_fr = _ref_full_fr = _mov_full_fr = _islands_fr = None
+                    _et_ref     = ref_reg
+                    _et_mov     = mov_reg
+                    _et_islands = islands
+                    _et_fg      = _foreground_mask(ref_reg)
+                    _et_regs    = regs
+                    _et_large_px = int(elastic_touchup_large_island_px)
+
+                _n_elastic_workers = (
+                    max(1, int(elastic_touchup_workers))
+                    if elastic_touchup_workers and int(elastic_touchup_workers) > 0
+                    else max(1, (os.cpu_count() or 2) - 1)
+                )
+                if _debug_elastic_field:
+                    print(
+                        f"[elastic] cycle {cycle}: starting elastic touch-up on "
+                        f"{len(_et_regs)} island(s)  "
+                        f"skip_corr_thr={elastic_touchup_skip_corr}  "
+                        f"grid_spacing={elastic_touchup_bspline_spacing}px  "
+                        f"max_iter={elastic_touchup_max_iterations}  "
+                        f"large_island_px={_et_large_px}  "
+                        f"workers={_n_elastic_workers}",
+                        flush=True,
+                    )
+
+                with ThreadPoolExecutor(max_workers=_n_elastic_workers) as _et_pool:
+                    for _ereg_i, _ereg in enumerate(_et_regs, start=1):
+                        _et_shift = (
+                            _ereg.shift_y * float(D) if _strip_mode else _ereg.shift_y,
+                            _ereg.shift_x * float(D) if _strip_mode else _ereg.shift_x,
+                        )
+                        if _debug_elastic_field:
+                            print(
+                                f"[elastic]  island {_ereg_i}/{len(_et_regs)} "
+                                f"label={_ereg.label} pixels={_ereg.pixels}",
+                                flush=True,
+                            )
+                        _eresult = _elastic_touchup_island(
+                            _et_ref, _et_mov, _et_islands == _ereg.label,
+                            _et_shift, _et_fg,
+                            tile_size=int(elastic_touchup_tile_size),
+                            skip_corr_threshold=float(elastic_touchup_skip_corr),
+                            min_fg_pixels=32,
+                            grid_spacing_px=int(elastic_touchup_bspline_spacing),
+                            max_iterations=int(elastic_touchup_max_iterations),
+                            large_island_px=_et_large_px,
+                            executor=_et_pool,
+                        )
+                        if _eresult is not None:
+                            _elastic_corrections.append(_eresult)
+
+                if _debug_elastic_field:
+                    print(
+                        f"[elastic] cycle {cycle}: {len(_elastic_corrections)}/{len(_et_regs)} "
+                        f"island(s) produced elastic corrections",
+                        flush=True,
+                    )
+
+                if not _strip_mode:
+                    del _et_fg
+                if _strip_mode and _ref_full_fr is not None:
+                    del _ref_full_fr, _mov_full_fr, _islands_fr, _ref_fg_fr
+
+            if _i_moving == len(moving_infos) - 1:
+                del ref_reg
+
             _progress(
-                f"7. Writing registered channels for Cycle {cycle}...",
+                f"8. Writing registered channels for Cycle {cycle}...",
                 progress_cb=progress_cb,
                 progress_event_cb=progress_event_cb,
                 phase="write_cycle",
@@ -1994,18 +2553,32 @@ def merge_cycles_to_ome_tiff(
                 del mov_reg
                 # Pass regs directly (even if empty) so global shift (dy, dx) is applied;
                 # None is reserved for the reference cycle (no shift at all).
-                _write_cycle_channels_strip(ci, shp, regs, dy, dx)
+                _write_cycle_channels_strip(ci, shp, regs, dy, dx,
+                                            elastic_corrections=_elastic_corrections or None)
+                if debug_writer is not None:
+                    _write_cycle_channels_strip(ci, shp, regs, dy, dx,
+                                                elastic_corrections=None,
+                                                target_writer=debug_writer)
                 del regs
             else:
                 # Full-plane mode: compute dense shift field then write
                 _label_img = islands if (_use_islands and islands is not None) else np.zeros((1, 1), dtype=np.int32)
                 field_yx = _piecewise_shift_field(canvas_yx, _label_img, regs, (dy, dx))
+                _fy, _fx = field_yx
+                if debug_writer is not None:
+                    _write_cycle_channels(ci, shp, field_yx, target_writer=debug_writer)
+                for _edy, _edx, (_ey0, _ey1, _ex0, _ex1) in _elastic_corrections:
+                    _fy[_ey0:_ey1, _ex0:_ex1] += _edy
+                    _fx[_ey0:_ey1, _ex0:_ex1] += _edx
                 if islands is not None:
                     del islands
                 del regs, mov_reg
                 _write_cycle_channels(ci, shp, field_yx)
                 del field_yx
+            del _elastic_corrections
             writer.flush_and_release()
+            if debug_writer is not None:
+                debug_writer.flush_and_release()
             _set_cycle_status(cycle, "complete")
             if _debug_preprocess:
                 _rss_post = ""

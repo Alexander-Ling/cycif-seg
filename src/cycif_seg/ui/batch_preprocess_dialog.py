@@ -10,7 +10,7 @@ from qtpy import QtCore, QtWidgets
 from napari.utils.notifications import show_info, show_warning
 from napari.qt.threading import thread_worker
 
-from cycif_seg.preprocess.organize_cycles import CycleInput, is_preprocess_debug, merge_cycles_to_ome_tiff
+from cycif_seg.preprocess.organize_cycles import CycleInput, is_preprocess_debug, is_debug_elastic_touchup, merge_cycles_to_ome_tiff
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
 from cycif_seg.preprocess.batch_plan import (
     BatchSample,
@@ -561,6 +561,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "pyramidal_output": bool(getattr(s, 'pyramidal_output', True)),
                 "low_mem": bool(getattr(s, 'low_mem', True)),
                 "strip_height": getattr(s, 'strip_height', None),
+                "elastic_touchup": bool(getattr(s, 'elastic_touchup', False)),
+                "elastic_touchup_bspline_spacing": int(getattr(s, 'elastic_touchup_bspline_spacing', 50) or 50),
+                "elastic_touchup_max_iterations": int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -617,6 +620,12 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.low_mem = bool(cfg.get('low_mem') if cfg.get('low_mem') is not None else getattr(s, 'low_mem', True))
             _sh = cfg.get('strip_height') if 'strip_height' in cfg else getattr(s, 'strip_height', None)
             s.strip_height = int(_sh) if _sh is not None and int(_sh) > 0 else None
+            if 'elastic_touchup' in cfg:
+                s.elastic_touchup = bool(cfg.get('elastic_touchup'))
+            if 'elastic_touchup_bspline_spacing' in cfg:
+                s.elastic_touchup_bspline_spacing = max(4, int(cfg.get('elastic_touchup_bspline_spacing') or 50))
+            if 'elastic_touchup_max_iterations' in cfg:
+                s.elastic_touchup_max_iterations = max(1, int(cfg.get('elastic_touchup_max_iterations') or 100))
         except Exception:
             pass
 
@@ -908,6 +917,15 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         tiled_rigid_search_factor=max(1.0, float(getattr(s, 'tiled_rigid_search_factor', default_tiled_rigid_search_factor) or default_tiled_rigid_search_factor)),
                         fast_large_island_refinement=False,
                         fast_large_island_sample_count=max(1, int(getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count)),
+                        elastic_touchup=bool(getattr(s, 'elastic_touchup', False)),
+                        elastic_touchup_tile_size=max(64, int(getattr(s, 'elastic_touchup_tile_size', 1024) or 1024)),
+                        elastic_touchup_skip_corr=float(getattr(s, 'elastic_touchup_skip_corr', 0.95) or 0.95),
+                        elastic_touchup_bspline_spacing=max(4, int(getattr(s, 'elastic_touchup_bspline_spacing', 50) or 50)),
+                        elastic_touchup_max_iterations=max(1, int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100)),
+                        elastic_touchup_large_island_px=max(1, int(getattr(s, 'elastic_touchup_large_island_px', 4_000_000) or 4_000_000)),
+                        elastic_touchup_workers=max(0, int(getattr(s, 'elastic_touchup_workers', 0) or 0)),
+                        debug_elastic_touchup=is_debug_elastic_touchup(),
+                        debug_dir=str(getattr(s, 'debug_dir') or '') or None,
                         pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),
                         progress_event_cb=_ev,
                         cancel_cb=lambda: bool(self._cancel_requested),

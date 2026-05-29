@@ -1115,6 +1115,7 @@ def convert_flat_ome_to_pyramidal(
             tile=(int(tile_size), int(tile_size)),
             compression=compression,
             predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
+            maxworkers=os.cpu_count() or 4,
         )
 
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
@@ -1513,8 +1514,58 @@ def load_channel_multiscale_lazy(path: str, channel_index: int) -> list | None:
                 print(f"{_tag} SKIP — could not read level metadata", flush=True)
             return None
 
-        # Build one dask.delayed array per pyramid level.
-        # Each delayed call re-opens the file and reads the channel plane for that level.
+        # Preferred path: tile-granularity loading via zarr.
+        # tifffile.aszarr() exposes each TIFF tile as its own zarr chunk, so dask
+        # asks for only the tiles napari's viewport actually covers rather than
+        # loading the entire pyramid level at once.  Individual tile reads happen
+        # in dask's thread pool and are typically <10 ms each, keeping the UI
+        # responsive even for very large images.
+        try:
+            import zarr as _zarr
+
+            # Keep one TiffFile open for the lifetime of the returned arrays;
+            # the zarr stores hold a reference to it so it stays open until GC.
+            _tf_lazy = tifffile.TiffFile(path)
+            _stores: list = []
+            dask_levels: list = []
+
+            for li, yx, dtype, lvl_axes in levels_meta:
+                store = _tf_lazy.aszarr(series=0, level=li)
+                _stores.append(store)
+                z = _zarr.open(store, mode="r")
+                arr = da.from_zarr(z)
+                # arr shape is (C, Y, X) for CYX layout; select our channel.
+                if arr.ndim == 3:
+                    la = lvl_axes.upper()
+                    if la.startswith("C") or (not la and arr.shape[0] <= arr.shape[1]):
+                        arr = arr[idx]
+                    else:
+                        arr = arr[..., idx] if la.endswith("C") else arr[idx]
+                if _dbg:
+                    print(
+                        f"{_tag}   → zarr level {li}: shape={arr.shape} "
+                        f"chunks={arr.chunks} dtype={arr.dtype}",
+                        flush=True,
+                    )
+                dask_levels.append(arr)
+
+            # Subclass list to carry references that prevent premature GC of the
+            # file handle and zarr stores (dask graph alone may not retain them).
+            class _LevelList(list):
+                __slots__ = ("_tf", "_stores")
+
+            result = _LevelList(dask_levels)
+            result._tf = _tf_lazy
+            result._stores = _stores
+            if _dbg:
+                print(f"{_tag} OK (zarr) — {len(result)} pyramid level(s)", flush=True)
+            return result
+
+        except Exception as _zarr_err:
+            if _dbg:
+                print(f"{_tag} zarr path failed ({_zarr_err}), falling back to delayed", flush=True)
+
+        # Fallback: one dask.delayed per level (loads entire level at once).
         def _read_level_channel(p: str, level_idx: int, ch_idx: int, lvl_axes: str):
             with tifffile.TiffFile(p) as _tf:
                 _lvl = _tf.series[0].levels[level_idx]
@@ -1526,16 +1577,16 @@ def load_channel_multiscale_lazy(path: str, channel_index: int) -> list | None:
                 else:
                     return np.asarray(_lvl.asarray(key=ch_idx))
 
-        dask_levels: list = []
+        dask_levels = []
         for li, yx, dtype, lvl_axes in levels_meta:
             delayed_plane = dask.delayed(_read_level_channel)(path, li, idx, lvl_axes)
             dask_arr = da.from_delayed(delayed_plane, shape=yx, dtype=dtype)
             dask_levels.append(dask_arr)
             if _dbg:
-                print(f"{_tag}   → dask level {li}: shape={yx} dtype={dtype}", flush=True)
+                print(f"{_tag}   → delayed level {li}: shape={yx} dtype={dtype}", flush=True)
 
         if _dbg:
-            print(f"{_tag} OK — {len(dask_levels)} pyramid level(s)", flush=True)
+            print(f"{_tag} OK (delayed) — {len(dask_levels)} pyramid level(s)", flush=True)
         return dask_levels
     except Exception as _e:
         if _dbg:

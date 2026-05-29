@@ -35,5 +35,33 @@ class SettingsPanel(QtWidgets.QWidget):
         )
         debug_layout.addWidget(self.chk_debug_preprocess)
 
+        self.chk_debug_elastic_touchup = QtWidgets.QCheckBox(
+            "Save elastic touch-up debug images"
+        )
+        self.chk_debug_elastic_touchup.setChecked(False)
+        self.chk_debug_elastic_touchup.setToolTip(
+            "After each moving cycle, save the registered DAPI channel twice:\n"
+            "  cycle_NNN_1_after_rigid.tiff  — after rigid island refinement only\n"
+            "  cycle_NNN_2_after_elastic.tiff — after B-spline elastic correction\n"
+            "Output folder: <output_stem>_debug/ next to the output OME-TIFF.\n"
+            "Only has effect when elastic touch-up is enabled for the sample."
+        )
+        debug_layout.addWidget(self.chk_debug_elastic_touchup)
+
+        self.chk_debug_elastic_field = QtWidgets.QCheckBox(
+            "Print elastic touch-up field statistics"
+        )
+        self.chk_debug_elastic_field.setChecked(False)
+        self.chk_debug_elastic_field.setToolTip(
+            "Print per-island diagnostics during elastic touch-up:\n"
+            "  - island size, bounding box, and post-rigid correlation score\n"
+            "  - whether each island was skipped (corr > threshold) or processed\n"
+            "  - whether SimpleITK/elastix is installed and working\n"
+            "  - displacement field magnitude (max, mean, p95) when applied\n"
+            "  - per-cycle summary of how many corrections were applied\n"
+            "Only has effect when elastic touch-up is enabled for the sample."
+        )
+        debug_layout.addWidget(self.chk_debug_elastic_field)
+
         layout.addWidget(debug_group)
         layout.addStretch(1)
