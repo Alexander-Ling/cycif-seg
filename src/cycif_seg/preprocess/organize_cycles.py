@@ -895,6 +895,20 @@ def _refine_region_transforms(
         region_mask = island_labels == lab
         pixels = int(region_mask.sum())
 
+        # Islands too small for reliable phase cross-correlation get the global shift.
+        # search_radius^2 is a practical lower bound: a patch smaller than the search
+        # window cannot distinguish a good shift from a spurious one.
+        _min_reliable_px = max(32, int(search_radius) * int(search_radius))
+        if pixels < _min_reliable_px:
+            regions.append(_RegionTransform(
+                label=int(lab),
+                bbox=_bbox_from_mask(region_mask),
+                shift_y=base_dy,
+                shift_x=base_dx,
+                pixels=pixels,
+            ))
+            continue
+
         if bool(fast_large_island_refinement):
             sampled_shift = _estimate_sampled_region_shift(
                 fixed_n,
@@ -1044,11 +1058,14 @@ def _build_strip_shift_field(
     regs: list[_RegionTransform],
     base_dy: float,
     base_dx: float,
+    island_labels_strip: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build a (strip_H, canvas_x) shift field for output rows [out_y0:out_y1].
 
     Uses only the compact list of _RegionTransform objects — no full-canvas arrays.
     Background pixels (not covered by any region bbox) get the global shift.
+    If island_labels_strip is provided (shape (strip_H, canvas_x)), shifts are applied
+    only to pixels matching each region's label rather than filling the entire bounding box.
     """
     strip_H = out_y1 - out_y0
     field_y = np.full((strip_H, canvas_x), float(base_dy), dtype=np.float32)
@@ -1061,8 +1078,15 @@ def _build_strip_shift_field(
         rx1_c = min(canvas_x, rx1)
         if local_y0 >= local_y1 or rx0_c >= rx1_c:
             continue
-        field_y[local_y0:local_y1, rx0_c:rx1_c] = float(reg.shift_y)
-        field_x[local_y0:local_y1, rx0_c:rx1_c] = float(reg.shift_x)
+        if island_labels_strip is not None:
+            fy_crop = field_y[local_y0:local_y1, rx0_c:rx1_c]
+            fx_crop = field_x[local_y0:local_y1, rx0_c:rx1_c]
+            mask = island_labels_strip[local_y0:local_y1, rx0_c:rx1_c] == int(reg.label)
+            fy_crop[mask] = float(reg.shift_y)
+            fx_crop[mask] = float(reg.shift_x)
+        else:
+            field_y[local_y0:local_y1, rx0_c:rx1_c] = float(reg.shift_y)
+            field_x[local_y0:local_y1, rx0_c:rx1_c] = float(reg.shift_x)
     return field_y, field_x
 
 
@@ -2096,6 +2120,8 @@ def merge_cycles_to_ome_tiff(
             base_dx: float,
             elastic_corrections: list[tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]]] | None = None,
             target_writer=None,
+            islands_ds: np.ndarray | None = None,
+            downsample: int = 1,
         ) -> None:
             """Strip-based writer: processes the canvas in horizontal bands to minimise RAM."""
             _check_cancel(cancel_cb)
@@ -2149,9 +2175,24 @@ def merge_cycles_to_ome_tiff(
                         flush=True,
                     )
 
+                _island_lbl_strip: np.ndarray | None = None
+                if islands_ds is not None and regs_fullres is not None:
+                    _ds = int(downsample) or 1
+                    _ds_y0 = out_y0 // _ds
+                    _ds_y1 = min(islands_ds.shape[0], (out_y1 + _ds - 1) // _ds)
+                    _istrip_ds = islands_ds[_ds_y0:_ds_y1]
+                    _istrip_full = np.repeat(np.repeat(_istrip_ds, _ds, axis=0), _ds, axis=1)
+                    _offs = out_y0 - _ds_y0 * _ds
+                    _island_lbl_strip = np.zeros((strip_H, canvas_W), dtype=islands_ds.dtype)
+                    _valid_h = min(strip_H, _istrip_full.shape[0] - _offs)
+                    _valid_w = min(canvas_W, _istrip_full.shape[1])
+                    if _valid_h > 0 and _valid_w > 0:
+                        _island_lbl_strip[:_valid_h, :_valid_w] = _istrip_full[_offs:_offs + _valid_h, :_valid_w]
+
                 if regs_fullres is not None:
                     field_y_s, field_x_s = _build_strip_shift_field(
-                        out_y0, out_y1, canvas_W, regs_fullres, base_dy, base_dx
+                        out_y0, out_y1, canvas_W, regs_fullres, base_dy, base_dx,
+                        island_labels_strip=_island_lbl_strip,
                     )
                 else:
                     field_y_s = field_x_s = None
@@ -2352,6 +2393,11 @@ def merge_cycles_to_ome_tiff(
             )
             if _use_islands:
                 moving_fg = _foreground_mask(mov_reg)
+                if _strip_mode and D > 1 and binary_dilation is not None and moving_fg.any():
+                    # At 1/D resolution, sparse tissue bridges (few cells per tile) can fall
+                    # below the tile-activity threshold and appear split. Applying D-1 extra
+                    # iterations brings the total to D, equivalent to 1 iteration at full scale.
+                    moving_fg = binary_dilation(moving_fg, iterations=D - 1)
                 _shift_for_mask = (_dy_ds, _dx_ds) if _strip_mode else (dy, dx)
                 moved_mask = _apply_translation(moving_fg.astype(np.float32), _shift_for_mask[0], _shift_for_mask[1], order=0) > 0.5
                 del moving_fg
@@ -2547,18 +2593,25 @@ def merge_cycles_to_ome_tiff(
             )
             _set_cycle_status(cycle, "in_progress")
             if _strip_mode:
-                # Strip mode: islands and mov_reg not needed for writing
-                if islands is not None:
-                    del islands
                 del mov_reg
+                # Pass islands_ds so _build_strip_shift_field applies shifts only to
+                # actual island pixels instead of entire bounding boxes (prevents
+                # bbox bleed that causes duplicate-content drift artifacts).
+                _islands_to_pass = islands if (_use_islands and islands is not None) else None
                 # Pass regs directly (even if empty) so global shift (dy, dx) is applied;
                 # None is reserved for the reference cycle (no shift at all).
                 _write_cycle_channels_strip(ci, shp, regs, dy, dx,
-                                            elastic_corrections=_elastic_corrections or None)
+                                            elastic_corrections=_elastic_corrections or None,
+                                            islands_ds=_islands_to_pass,
+                                            downsample=D)
                 if debug_writer is not None:
                     _write_cycle_channels_strip(ci, shp, regs, dy, dx,
                                                 elastic_corrections=None,
-                                                target_writer=debug_writer)
+                                                target_writer=debug_writer,
+                                                islands_ds=_islands_to_pass,
+                                                downsample=D)
+                if islands is not None:
+                    del islands
                 del regs
             else:
                 # Full-plane mode: compute dense shift field then write
