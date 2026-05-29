@@ -112,6 +112,16 @@ Useful options:
 - `--strip-height N`: process registration in horizontal strips to reduce RAM.
 - `--dry-run`: validate and print the planned work without processing.
 
+**Elastic touch-up** is enabled by default. After tiled-rigid island refinement, a B-spline elastic registration pass is run per cycle to correct sub-pixel residual misalignment. The default settings (tile size 1024 px, B-spline spacing 50 px, 100 iterations, max step length 1.0 px) work well in most cases. CLI flags let you override individual parameters without editing the plan JSON:
+
+- `--no-elastic-touchup`: disable the elastic pass entirely.
+- `--elastic-touchup-max-step-length F`: maximum optimizer step per iteration in pixels (default: 1.0). Lower values restrict how far pixels travel; raise to 2–4 if registration needs more correction.
+- `--elastic-touchup-max-iterations N`: elastix iterations per resolution level (default: 100).
+- `--elastic-touchup-bspline-spacing N`: B-spline control point spacing in full-resolution pixels (default: 50; lower = more local deformation).
+- `--elastic-touchup-tile-size N`: tile size for the large-island tiled path (default: 1024).
+- `--elastic-touchup-skip-corr F`: skip the elastic pass for a cycle when masked NCC already exceeds this threshold (default: 0.95).
+- `--elastic-touchup-workers N`: parallel worker threads for tile processing (default: 0 = auto).
+
 ### Recovery utilities
 
 Build or resume a pyramidal OME-TIFF from an existing flat OME-TIFF:
@@ -143,7 +153,7 @@ cycif-seg-preprocess resume-registration `
   --registration-marker DAPI
 ```
 
-This command uses a sidecar file named `<output>.cyseg-registration-progress.json` when available, otherwise it performs a conservative pixel scan to find the first incomplete cycle. Useful options include `--completion hybrid|manifest|pixel-scan`, `--force-from-cycle N`, `--registration-algorithm tiled_rigid|translation`, `--strip-height N`, `--pyramidal`, and `--dry-run`.
+This command uses a sidecar file named `<output>.cyseg-registration-progress.json` when available, otherwise it performs a conservative pixel scan to find the first incomplete cycle. Useful options include `--completion hybrid|manifest|pixel-scan`, `--force-from-cycle N`, `--registration-algorithm tiled_rigid|translation`, `--strip-height N`, `--pyramidal`, and `--dry-run`. The same `--elastic-touchup` / `--no-elastic-touchup` and `--elastic-touchup-*` flags available for `run` also work here and override the plan or sample-directory defaults.
 
 ### Single-sample pipeline
 

@@ -172,13 +172,26 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.spn_max_iterations.setToolTip(
             "Maximum elastix optimizer iterations per resolution level (default: 100)."
         )
+        self.spn_max_step_length = QtWidgets.QDoubleSpinBox()
+        self.spn_max_step_length.setRange(0.01, 20.0)
+        self.spn_max_step_length.setSingleStep(0.25)
+        self.spn_max_step_length.setDecimals(2)
+        self.spn_max_step_length.setValue(1.0)
+        self.spn_max_step_length.setToolTip(
+            "Maximum optimizer step length per iteration (pixels at the working scale).\n"
+            "Lower values limit how far pixels can travel; try 0.5–1.0 to reduce smearing.\n"
+            "Theoretical max displacement ≈ step × iterations × downsample_factor (default: 1.0)."
+        )
         elastic_form.addRow("B-spline grid spacing (px):", self.spn_bspline_spacing)
         elastic_form.addRow("Max iterations:", self.spn_max_iterations)
+        elastic_form.addRow("Max step length:", self.spn_max_step_length)
         elastic_layout.addLayout(elastic_form)
         self.spn_bspline_spacing.setEnabled(True)
         self.spn_max_iterations.setEnabled(True)
+        self.spn_max_step_length.setEnabled(True)
         self.chk_elastic_touchup.toggled.connect(self.spn_bspline_spacing.setEnabled)
         self.chk_elastic_touchup.toggled.connect(self.spn_max_iterations.setEnabled)
+        self.chk_elastic_touchup.toggled.connect(self.spn_max_step_length.setEnabled)
         root.addWidget(elastic_group)
         try:
             if isinstance(self._initial_cfg, dict):
@@ -191,6 +204,9 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 vmi = self._initial_cfg.get("elastic_touchup_max_iterations")
                 if vmi is not None:
                     self.spn_max_iterations.setValue(max(1, int(vmi)))
+                vmsl = self._initial_cfg.get("elastic_touchup_max_step_length")
+                if vmsl is not None:
+                    self.spn_max_step_length.setValue(max(0.01, float(vmsl)))
         except Exception:
             pass
 
@@ -537,5 +553,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "elastic_touchup": bool(self.chk_elastic_touchup.isChecked()),
             "elastic_touchup_bspline_spacing": int(self.spn_bspline_spacing.value()),
             "elastic_touchup_max_iterations": int(self.spn_max_iterations.value()),
+            "elastic_touchup_max_step_length": float(self.spn_max_step_length.value()),
             "cycles": cycles_out,
         }

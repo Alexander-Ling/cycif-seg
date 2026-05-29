@@ -564,6 +564,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "elastic_touchup": bool(getattr(s, 'elastic_touchup', False)),
                 "elastic_touchup_bspline_spacing": int(getattr(s, 'elastic_touchup_bspline_spacing', 50) or 50),
                 "elastic_touchup_max_iterations": int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100),
+                "elastic_touchup_max_step_length": float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -626,6 +627,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.elastic_touchup_bspline_spacing = max(4, int(cfg.get('elastic_touchup_bspline_spacing') or 50))
             if 'elastic_touchup_max_iterations' in cfg:
                 s.elastic_touchup_max_iterations = max(1, int(cfg.get('elastic_touchup_max_iterations') or 100))
+            if 'elastic_touchup_max_step_length' in cfg:
+                s.elastic_touchup_max_step_length = max(0.01, float(cfg.get('elastic_touchup_max_step_length') or 1.0))
         except Exception:
             pass
 
@@ -863,6 +866,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         "foreground_mask": f"registering {cycle_txt}: foreground mask",
                         "identify_islands": f"registering {cycle_txt}: foreground islands",
                         "foreground_island_refine": f"registering {cycle_txt}: island refinement",
+                        "elastic_touchup_island": f"elastic touch-up {cycle_txt}",
                         "write_cycle": f"writing {cycle_txt}",
                         "pyramid": "building pyramid",
                     }
@@ -887,6 +891,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         "foreground_mask",
                         "identify_islands",
                         "foreground_island_refine",
+                        "elastic_touchup_island",
                         "write_cycle",
                         "pyramid",
                     }
@@ -924,6 +929,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         elastic_touchup_max_iterations=max(1, int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100)),
                         elastic_touchup_large_island_px=max(1, int(getattr(s, 'elastic_touchup_large_island_px', 4_000_000) or 4_000_000)),
                         elastic_touchup_workers=max(0, int(getattr(s, 'elastic_touchup_workers', 0) or 0)),
+                        elastic_touchup_max_step_length=max(0.01, float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0)),
                         debug_elastic_touchup=is_debug_elastic_touchup(),
                         debug_dir=str(getattr(s, 'debug_dir') or '') or None,
                         pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),

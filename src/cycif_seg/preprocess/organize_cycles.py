@@ -1489,6 +1489,7 @@ mov  = d['mov'].astype(np.float32)
 isl  = d['isl'].astype(bool)
 gs   = int(d['gs'][0])
 itr  = int(d['it'][0])
+msl  = float(d['msl'][0])
 
 fixed_itk  = itk.GetImageFromArray(ref)
 moving_itk = itk.GetImageFromArray(mov)
@@ -1501,6 +1502,7 @@ pm['ImageSampler']                        = ['RandomCoordinate']
 pm['NumberOfSpatialSamples']              = ['2000']
 pm['MaximumNumberOfIterations']           = [str(itr)]
 pm['FinalGridSpacingInPhysicalUnits']     = [str(gs)]
+pm['MaximumStepLength']                   = [str(msl)]
 pm['WriteResultImage']                    = ['false']
 pm['WriteTransformParametersEachIteration'] = ['false']
 pm['WriteResultImageAfterEachResolution'] = ['false']
@@ -1525,6 +1527,7 @@ def _run_elastix_bspline(
     *,
     grid_spacing_px: int,
     max_iterations: int,
+    max_step_length: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Compute a dense displacement field via elastix B-spline registration.
 
@@ -1574,8 +1577,9 @@ def _run_elastix_bspline(
             np.savez_compressed(
                 _inp,
                 ref=ref_n, mov=mov_n, isl=isl_ds.view(np.uint8),
-                gs=np.array([gs_px],        dtype=np.int32),
+                gs=np.array([gs_px],         dtype=np.int32),
                 it=np.array([max_iterations], dtype=np.int32),
+                msl=np.array([max(0.01, float(max_step_length))], dtype=np.float32),
             )
 
             _proc = subprocess.run(
@@ -1647,7 +1651,12 @@ def _elastic_touchup_island(
     grid_spacing_px: int,
     max_iterations: int,
     large_island_px: int,
+    max_step_length: float = 1.0,
     executor=None,
+    progress_event_cb=None,
+    island_idx: int = 0,
+    island_total: int = 0,
+    cycle: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]] | None:
     n_fg = int(island_mask.sum())
     if n_fg < int(min_fg_pixels):
@@ -1681,6 +1690,7 @@ def _elastic_touchup_island(
         result = _run_elastix_bspline(
             ref_crop, mov_crop, island_crop,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
+            max_step_length=max_step_length,
         )
         if result is None:
             if _debug_elastic_field:
@@ -1768,6 +1778,7 @@ def _elastic_touchup_island(
         _tres = _run_elastix_bspline(
             _t_ref, _t_mov, _t_isl,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
+            max_step_length=max_step_length,
         )
         if _tres is None:
             return None
@@ -1782,6 +1793,15 @@ def _elastic_touchup_island(
         disp_y_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tdy * _tentr
         disp_x_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tdx * _tentr
         weight_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tentr
+        if progress_event_cb is not None:
+            progress_event_cb({
+                "msg": (
+                    f"7. elastic touch-up Cycle {cycle}: "
+                    f"island {island_idx}/{island_total} — "
+                    f"{_n_tiles_ok}/{_n_tiles_tried} tiles"
+                ),
+                "phase": "elastic_touchup_tile",
+            })
 
     def _bar(_done, _total):
         _f = min(_BAR_W, _done * _BAR_W // _total) if _total else _BAR_W
@@ -1864,6 +1884,7 @@ def merge_cycles_to_ome_tiff(
     elastic_touchup_max_iterations: int = 100,
     elastic_touchup_large_island_px: int = 4_000_000,
     elastic_touchup_workers: int = 0,
+    elastic_touchup_max_step_length: float = 1.0,
     debug_elastic_touchup: bool = False,
     debug_dir: str | None = None,
     pyramidal_output: bool = False,
@@ -2541,15 +2562,25 @@ def merge_cycles_to_ome_tiff(
                         flush=True,
                     )
 
+                _n_et_regs = len(_et_regs)
                 with ThreadPoolExecutor(max_workers=_n_elastic_workers) as _et_pool:
                     for _ereg_i, _ereg in enumerate(_et_regs, start=1):
+                        _progress(
+                            f"7. Registering Cycle {cycle}: elastic touch-up island {_ereg_i}/{_n_et_regs}...",
+                            progress_cb=progress_cb,
+                            progress_event_cb=progress_event_cb,
+                            phase="elastic_touchup_island",
+                            idx=_ereg_i,
+                            n=_n_et_regs,
+                            cycle=cycle,
+                        )
                         _et_shift = (
                             _ereg.shift_y * float(D) if _strip_mode else _ereg.shift_y,
                             _ereg.shift_x * float(D) if _strip_mode else _ereg.shift_x,
                         )
                         if _debug_elastic_field:
                             print(
-                                f"[elastic]  island {_ereg_i}/{len(_et_regs)} "
+                                f"[elastic]  island {_ereg_i}/{_n_et_regs} "
                                 f"label={_ereg.label} pixels={_ereg.pixels}",
                                 flush=True,
                             )
@@ -2562,7 +2593,12 @@ def merge_cycles_to_ome_tiff(
                             grid_spacing_px=int(elastic_touchup_bspline_spacing),
                             max_iterations=int(elastic_touchup_max_iterations),
                             large_island_px=_et_large_px,
+                            max_step_length=float(elastic_touchup_max_step_length),
                             executor=_et_pool,
+                            progress_event_cb=progress_event_cb,
+                            island_idx=_ereg_i,
+                            island_total=_n_et_regs,
+                            cycle=cycle,
                         )
                         if _eresult is not None:
                             _elastic_corrections.append(_eresult)

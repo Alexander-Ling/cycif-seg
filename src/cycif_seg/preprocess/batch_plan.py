@@ -98,6 +98,7 @@ class BatchSample:
     elastic_touchup_max_iterations: int = 100
     elastic_touchup_large_island_px: int = 4_000_000
     elastic_touchup_workers: int = 0
+    elastic_touchup_max_step_length: float = 1.0
     debug_elastic_touchup: bool = False
     debug_dir: str | None = None
 
@@ -252,6 +253,7 @@ def plan_to_dict(
             "elastic_touchup_max_iterations": int(getattr(s, "elastic_touchup_max_iterations", 100) or 100),
             "elastic_touchup_large_island_px": int(getattr(s, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000),
             "elastic_touchup_workers": int(getattr(s, "elastic_touchup_workers", 0) or 0),
+            "elastic_touchup_max_step_length": float(getattr(s, "elastic_touchup_max_step_length", 1.0) or 1.0),
         })
     return d
 
@@ -312,6 +314,7 @@ def plan_from_dict(d: dict) -> dict[str, Any]:
         s.elastic_touchup_max_iterations = max(1, int(rec.get("elastic_touchup_max_iterations", defs.get("elastic_touchup_max_iterations", 100)) or 100))
         s.elastic_touchup_large_island_px = max(1, int(rec.get("elastic_touchup_large_island_px", defs.get("elastic_touchup_large_island_px", 4_000_000)) or 4_000_000))
         s.elastic_touchup_workers = max(0, int(rec.get("elastic_touchup_workers", defs.get("elastic_touchup_workers", 0)) or 0))
+        s.elastic_touchup_max_step_length = max(0.01, float(rec.get("elastic_touchup_max_step_length", defs.get("elastic_touchup_max_step_length", 1.0)) or 1.0))
         s.debug_elastic_touchup = bool(rec.get("debug_elastic_touchup", defs.get("debug_elastic_touchup", False)))
         s.debug_dir = str(rec.get("debug_dir") or defs.get("debug_dir") or "") or None
         s.cycles = list(rec.get("cycles") or []) or None
