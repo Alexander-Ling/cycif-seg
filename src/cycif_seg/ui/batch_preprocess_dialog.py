@@ -565,6 +565,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "elastic_touchup_bspline_spacing": int(getattr(s, 'elastic_touchup_bspline_spacing', 50) or 50),
                 "elastic_touchup_max_iterations": int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100),
                 "elastic_touchup_max_step_length": float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0),
+                "elastic_touchup_tile_size": int(getattr(s, 'elastic_touchup_tile_size', 1024) or 1024),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -629,6 +630,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.elastic_touchup_max_iterations = max(1, int(cfg.get('elastic_touchup_max_iterations') or 100))
             if 'elastic_touchup_max_step_length' in cfg:
                 s.elastic_touchup_max_step_length = max(0.01, float(cfg.get('elastic_touchup_max_step_length') or 1.0))
+            if 'elastic_touchup_tile_size' in cfg:
+                s.elastic_touchup_tile_size = max(64, int(cfg.get('elastic_touchup_tile_size') or 1024))
         except Exception:
             pass
 
@@ -891,12 +894,13 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         "foreground_mask",
                         "identify_islands",
                         "foreground_island_refine",
-                        "elastic_touchup_island",
                         "write_cycle",
                         "pyramid",
                     }
                     if n > 0 and phase in top_level_phases:
                         self.sig_set_cycle_progress.emit(int(idx), int(n))
+                        self.sig_set_cycle_label.emit(_progress_label(ev, idx, n))
+                    elif phase == "elastic_touchup_island":
                         self.sig_set_cycle_label.emit(_progress_label(ev, idx, n))
 
                 # Run merge

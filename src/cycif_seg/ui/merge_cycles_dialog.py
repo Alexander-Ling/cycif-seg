@@ -182,16 +182,28 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "Lower values limit how far pixels can travel; try 0.5–1.0 to reduce smearing.\n"
             "Theoretical max displacement ≈ step × iterations × downsample_factor (default: 1.0)."
         )
+        self.spn_elastic_tile_size = QtWidgets.QSpinBox()
+        self.spn_elastic_tile_size.setRange(64, 10000)
+        self.spn_elastic_tile_size.setSingleStep(256)
+        self.spn_elastic_tile_size.setValue(1024)
+        self.spn_elastic_tile_size.setToolTip(
+            "Tile size in pixels used for large-island elastic correction tiling.\n"
+            "Smaller values allow finer local corrections at the cost of more tiles.\n"
+            "(default: 1024, min: 64)"
+        )
         elastic_form.addRow("B-spline grid spacing (px):", self.spn_bspline_spacing)
         elastic_form.addRow("Max iterations:", self.spn_max_iterations)
         elastic_form.addRow("Max step length:", self.spn_max_step_length)
+        elastic_form.addRow("Elastic tile size (px):", self.spn_elastic_tile_size)
         elastic_layout.addLayout(elastic_form)
         self.spn_bspline_spacing.setEnabled(True)
         self.spn_max_iterations.setEnabled(True)
         self.spn_max_step_length.setEnabled(True)
+        self.spn_elastic_tile_size.setEnabled(True)
         self.chk_elastic_touchup.toggled.connect(self.spn_bspline_spacing.setEnabled)
         self.chk_elastic_touchup.toggled.connect(self.spn_max_iterations.setEnabled)
         self.chk_elastic_touchup.toggled.connect(self.spn_max_step_length.setEnabled)
+        self.chk_elastic_touchup.toggled.connect(self.spn_elastic_tile_size.setEnabled)
         root.addWidget(elastic_group)
         try:
             if isinstance(self._initial_cfg, dict):
@@ -207,6 +219,9 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 vmsl = self._initial_cfg.get("elastic_touchup_max_step_length")
                 if vmsl is not None:
                     self.spn_max_step_length.setValue(max(0.01, float(vmsl)))
+                vets = self._initial_cfg.get("elastic_touchup_tile_size")
+                if vets is not None:
+                    self.spn_elastic_tile_size.setValue(max(64, int(vets)))
         except Exception:
             pass
 
@@ -554,5 +569,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "elastic_touchup_bspline_spacing": int(self.spn_bspline_spacing.value()),
             "elastic_touchup_max_iterations": int(self.spn_max_iterations.value()),
             "elastic_touchup_max_step_length": float(self.spn_max_step_length.value()),
+            "elastic_touchup_tile_size": int(self.spn_elastic_tile_size.value()),
             "cycles": cycles_out,
         }
