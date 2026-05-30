@@ -208,7 +208,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
     def _request_cancel(self) -> None:
         self._cancel_requested = True
         self.btn_stop.setEnabled(False)
-        self._set_status("Cancel requested… finishing current step.")
+        self._set_status("Cancel requested… stopping queued preprocessing work.")
 
     def _pick_root(self) -> None:
         d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select batch input folder", self.txt_root.text() or str(Path.cwd()))

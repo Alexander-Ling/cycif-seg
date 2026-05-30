@@ -18,6 +18,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import builtins
 import re
 import shutil
 import sys
@@ -29,6 +30,11 @@ from string import ascii_lowercase
 _CYCLE_DIR_RE = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
 _STITCH_SUFFIX = "cyseg-stitched"
 _MERGE_SUFFIX = "cyseg-merged"
+
+
+def print(*args, **kwargs):  # type: ignore[override]
+    kwargs.setdefault("flush", True)
+    return builtins.print(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ Two subcommands:
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import sys
 import time
@@ -36,6 +37,11 @@ from cycif_seg.preprocess.organize_cycles import (
     inspect_registration_flat_resume_state,
     merge_cycles_to_ome_tiff,
 )
+
+
+def print(*args, **kwargs):  # type: ignore[override]
+    kwargs.setdefault("flush", True)
+    return builtins.print(*args, **kwargs)
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -301,6 +307,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             elapsed = time.monotonic() - start_s
             print(f"  ERROR after {elapsed:.0f}s: {e}", file=sys.stderr)
             traceback.print_exc()
+            sys.stderr.flush()
             failures.append({"sample_name": s.name, "error": str(e)})
 
     total_elapsed = time.monotonic() - start_total
@@ -644,6 +651,7 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Error resuming registration: {e}", file=sys.stderr)
         traceback.print_exc()
+        sys.stderr.flush()
         return 1
 
     elapsed = time.monotonic() - start

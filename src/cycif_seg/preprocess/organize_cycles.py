@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 import gc
 import json
@@ -141,6 +141,27 @@ def _check_cancel(cancel_cb: Callable[[], bool] | None) -> None:
         raise
     except Exception:
         return
+
+
+def _cancel_futures(futures: Iterable[Future]) -> None:
+    for fut in list(futures):
+        fut.cancel()
+
+
+def _iter_completed_futures(
+    futures: Iterable[Future],
+    cancel_cb: Callable[[], bool] | None,
+):
+    pending = set(futures)
+    while pending:
+        _check_cancel(cancel_cb)
+        done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+        if not done:
+            continue
+        for fut in done:
+            _check_cancel(cancel_cb)
+            yield fut
+        _check_cancel(cancel_cb)
 
 
 def _progress(
@@ -769,7 +790,9 @@ def _estimate_sampled_region_shift(
     cell_size: int,
     sample_count: int,
     search_radius: int,
+    cancel_cb: Callable[[], bool] | None = None,
 ) -> tuple[float, float] | None:
+    _check_cancel(cancel_cb)
     cells = _island_sample_cells(region_mask, cell_size=cell_size)
     if len(cells) <= 4:
         return None
@@ -782,6 +805,7 @@ def _estimate_sampled_region_shift(
     buffer_pad = int(max(4, math.ceil(max_abs_shift) + 2))
     tasks = []
     for y0, y1, x0, x1 in selected:
+        _check_cancel(cancel_cb)
         fixed_crop = fixed_n[y0:y1, x0:x1]
         moving_base_crop = _extract_translated_crop(moving_n, (y0, y1, x0, x1), base_dy, base_dx, order=1)
         mask_crop = _score_mask_for_crop(region_mask[y0:y1, x0:x1])
@@ -805,10 +829,22 @@ def _estimate_sampled_region_shift(
 
     worker_count = min(len(tasks), max(1, int((os.cpu_count() or 2) - 1)))
     if worker_count <= 1:
-        results = [_sample_tile_registration_worker(*task) for task in tasks]
+        results = []
+        for task in tasks:
+            _check_cancel(cancel_cb)
+            results.append(_sample_tile_registration_worker(*task))
     else:
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            results = list(pool.map(lambda task: _sample_tile_registration_worker(*task), tasks))
+        pool = ThreadPoolExecutor(max_workers=worker_count)
+        futures: list[Future] = []
+        try:
+            futures = [pool.submit(_sample_tile_registration_worker, *task) for task in tasks]
+            results = [fut.result() for fut in _iter_completed_futures(futures, cancel_cb)]
+        except BaseException:
+            _cancel_futures(futures)
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True, cancel_futures=False)
 
     good = [r for r in results if r is not None]
     residuals = [(float(r[0]), float(r[1])) for r in good]
@@ -921,6 +957,7 @@ def _refine_region_transforms(
                 cell_size=max(128, int(fast_large_island_cell_size)),
                 sample_count=max(1, int(fast_large_island_sample_count)),
                 search_radius=int(search_radius),
+                cancel_cb=cancel_cb,
             )
             if sampled_shift is not None:
                 regions.append(
@@ -1691,11 +1728,13 @@ def _elastic_touchup_island(
     large_island_px: int,
     max_step_length: float = 1.0,
     executor=None,
+    cancel_cb: Callable[[], bool] | None = None,
     progress_event_cb=None,
     island_idx: int = 0,
     island_total: int = 0,
     cycle: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int]] | None:
+    _check_cancel(cancel_cb)
     n_fg = int(island_mask.sum())
     if n_fg < int(min_fg_pixels):
         if _debug_elastic_field:
@@ -1725,6 +1764,7 @@ def _elastic_touchup_island(
         return None
 
     if h * w < int(large_island_px):
+        _check_cancel(cancel_cb)
         result = _run_elastix_bspline(
             ref_crop, mov_crop, island_crop,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
@@ -1748,6 +1788,7 @@ def _elastic_touchup_island(
         return disp_y, disp_x, (y0, y1, x0, x1)
 
     # Tiled path: 50% stride, tent-weight blending
+    _check_cancel(cancel_cb)
     stride = max(1, int(tile_size) // 2)
     disp_y_acc = np.zeros((h, w), dtype=np.float32)
     disp_x_acc = np.zeros((h, w), dtype=np.float32)
@@ -1762,6 +1803,7 @@ def _elastic_touchup_island(
     _n_tiles_island_px = 0
     _n_tiles_corr_skipped = 0
     for _ty0 in ty_starts:
+        _check_cancel(cancel_cb)
         _ty1 = min(h, _ty0 + int(tile_size))
         _th = _ty1 - _ty0
         _tent_y = np.minimum(
@@ -1769,6 +1811,7 @@ def _elastic_touchup_island(
             np.arange(_th - 1, -1, -1, dtype=np.float32) + 1,
         ).clip(1e-6)
         for _tx0 in tx_starts:
+            _check_cancel(cancel_cb)
             _tx1 = min(w, _tx0 + int(tile_size))
             _tw = _tx1 - _tx0
             _tent_x = np.minimum(
@@ -1813,6 +1856,7 @@ def _elastic_touchup_island(
     _BAR_W = 20
 
     def _run_tile(_ty0, _ty1, _tx0, _tx1, _tent, _t_ref, _t_mov, _t_isl):
+        _check_cancel(cancel_cb)
         _tres = _run_elastix_bspline(
             _t_ref, _t_mov, _t_isl,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
@@ -1846,22 +1890,30 @@ def _elastic_touchup_island(
         return ('=' * _f + ('>' if _f < _BAR_W else '') + ' ' * max(0, _BAR_W - _f - 1))
 
     if executor is not None and len(_tile_tasks) > 1:
-        _tile_futs = [executor.submit(_run_tile, *_args) for _args in _tile_tasks]
+        _tile_futs: list[Future] = []
         _n_done = 0
-        for _fut in as_completed(_tile_futs):
-            _accumulate(_fut.result())
-            _n_done += 1
-            if _debug_elastic_field:
-                print(
-                    f"\r[elastic]   [{_bar(_n_done, _n_tiles_tried)}]"
-                    f" {_n_done}/{_n_tiles_tried}  ok={_n_tiles_ok}",
-                    end='', flush=True,
-                )
+        try:
+            for _args in _tile_tasks:
+                _check_cancel(cancel_cb)
+                _tile_futs.append(executor.submit(_run_tile, *_args))
+            for _fut in _iter_completed_futures(_tile_futs, cancel_cb):
+                _accumulate(_fut.result())
+                _n_done += 1
+                if _debug_elastic_field:
+                    print(
+                        f"\r[elastic]   [{_bar(_n_done, _n_tiles_tried)}]"
+                        f" {_n_done}/{_n_tiles_tried}  ok={_n_tiles_ok}",
+                        end='', flush=True,
+                    )
+        except BaseException:
+            _cancel_futures(_tile_futs)
+            raise
         if _debug_elastic_field:
             print(flush=True)
     else:
         _n_done = 0
         for _args in _tile_tasks:
+            _check_cancel(cancel_cb)
             _accumulate(_run_tile(*_args))
             _n_done += 1
             if _debug_elastic_field:
@@ -2137,6 +2189,7 @@ def merge_cycles_to_ome_tiff(
                 physical_pixel_sizes=ref_pixel_sizes,
                 chunk_yx=(int(pyramidal_tile_size), int(pyramidal_tile_size)),
                 write_workers=step1_workers,
+                cancel_cb=cancel_cb,
                 open_existing=open_existing_output,
             ))
         else:
@@ -2181,20 +2234,34 @@ def merge_cycles_to_ome_tiff(
             _fy, _fx = field_yx if field_yx is not None else (None, None)
             _w = target_writer if target_writer is not None else writer
 
-            def _compute_ch(ch: int) -> np.ndarray:
+            def _compute_ch(ch: int) -> tuple[int, np.ndarray]:
+                _check_cancel(cancel_cb)
                 _plane = load_single_channel_tiff_native(ci.path, int(ch))
+                _check_cancel(cancel_cb)
                 _plane = _pad_plane_to_canvas(_plane, canvas_yx, out_dtype=np.float32)
                 if _fy is not None:
                     _plane = _warp_plane_by_field(_plane, _fy, _fx, order=1)
-                return _cast_preserve_dtype(_plane, base_dtype)
+                _check_cancel(cancel_cb)
+                return int(ch), _cast_preserve_dtype(_plane, base_dtype)
 
             # map_coordinates (the warp) releases the GIL, so threads give real
             # parallelism here. Cap at 4 to bound peak in-flight plane memory.
             _n_workers = min(n_ch, 4)
-            with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+            _pool = ThreadPoolExecutor(max_workers=_n_workers)
+            _futures: list[Future] = []
+            try:
                 _futures = [_pool.submit(_compute_ch, ch) for ch in range(n_ch)]
-                for ch, _fut in enumerate(_futures):
-                    _w.write_channel(out_c0 + ch, _fut.result())
+                for _fut in _iter_completed_futures(_futures, cancel_cb):
+                    ch, _out = _fut.result()
+                    _check_cancel(cancel_cb)
+                    _w.write_channel(out_c0 + ch, _out)
+                    _check_cancel(cancel_cb)
+            except BaseException:
+                _cancel_futures(_futures)
+                _pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                _pool.shutdown(wait=True, cancel_futures=False)
 
         def _write_cycle_channels_strip(
             ci: CycleInput,
@@ -2319,27 +2386,41 @@ def merge_cycles_to_ome_tiff(
                 _sH_src = src_H
 
                 def _compute_strip_ch(ch: int) -> tuple[int, np.ndarray]:
+                    _check_cancel(cancel_cb)
                     _src = np.zeros((_sH_src, canvas_W), dtype=np.float32)
                     if _ocy0 < _ocy1:
                         _fy0 = in_y0 + (_ocy0 - canvas_pad_y0)
                         _fy1 = in_y0 + (_ocy1 - canvas_pad_y0)
                         _raw = load_channel_strip(ci.path, ch, _fy0, _fy1)
+                        _check_cancel(cancel_cb)
                         _dy0, _dy1 = _ocy0 - _scy0, _ocy1 - _scy0
                         _src[_dy0:_dy1, canvas_pad_x0:canvas_pad_x0 + xs] = (
                             _raw[:, in_x0:in_x0 + xs].astype(np.float32, copy=False)
                         )
                     if _fys is None:
                         _ry0, _ry1 = _oy0 - _scy0, (_oy0 + _sH) - _scy0
+                        _check_cancel(cancel_cb)
                         return ch, _cast_preserve_dtype(_src[_ry0:_ry1], base_dtype)
                     _w = _warp_strip_by_field(_src, _oy0, _sH, _scy0, _fys, _fxs, order=1)
+                    _check_cancel(cancel_cb)
                     return ch, _cast_preserve_dtype(_w, base_dtype)
 
                 _n_workers = min(n_ch, step1_workers)
-                with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+                _pool = ThreadPoolExecutor(max_workers=_n_workers)
+                _strip_futs: list[Future] = []
+                try:
                     _strip_futs = [_pool.submit(_compute_strip_ch, ch) for ch in range(n_ch)]
-                    for _sfut in _strip_futs:
+                    for _sfut in _iter_completed_futures(_strip_futs, cancel_cb):
                         _sch, _out = _sfut.result()
+                        _check_cancel(cancel_cb)
                         _w.write_channel_strip(out_c0 + _sch, _out, out_y0)
+                        _check_cancel(cancel_cb)
+                except BaseException:
+                    _cancel_futures(_strip_futs)
+                    _pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    _pool.shutdown(wait=True, cancel_futures=False)
 
         ref_info = next((item for item in infos if int(item[0].cycle) == int(reference_cycle)), None)
         if ref_info is None:
@@ -2622,8 +2703,10 @@ def merge_cycles_to_ome_tiff(
                     )
 
                 _n_et_regs = len(_et_regs)
-                with ThreadPoolExecutor(max_workers=_n_elastic_workers) as _et_pool:
+                _et_pool = ThreadPoolExecutor(max_workers=_n_elastic_workers)
+                try:
                     for _ereg_i, _ereg in enumerate(_et_regs, start=1):
+                        _check_cancel(cancel_cb)
                         _progress(
                             f"7. Registering Cycle {cycle}: elastic touch-up island {_ereg_i}/{_n_et_regs}...",
                             progress_cb=progress_cb,
@@ -2654,6 +2737,7 @@ def merge_cycles_to_ome_tiff(
                             large_island_px=_et_large_px,
                             max_step_length=float(elastic_touchup_max_step_length),
                             executor=_et_pool,
+                            cancel_cb=cancel_cb,
                             progress_event_cb=progress_event_cb,
                             island_idx=_ereg_i,
                             island_total=_n_et_regs,
@@ -2661,6 +2745,11 @@ def merge_cycles_to_ome_tiff(
                         )
                         if _eresult is not None:
                             _elastic_corrections.append(_eresult)
+                except BaseException:
+                    _et_pool.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    _et_pool.shutdown(wait=True, cancel_futures=False)
 
                 if _debug_elastic_field:
                     print(

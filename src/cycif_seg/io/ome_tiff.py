@@ -651,6 +651,7 @@ class IncrementalZarrRegisteredWriter:
         chunk_yx: tuple[int, int] = (512, 512),
         write_workers: int = 1,
         max_pending_writes: int | None = None,
+        cancel_cb: Callable[[], bool] | None = None,
         open_existing: bool = False,
     ):
         if zarr is None:
@@ -673,6 +674,7 @@ class IncrementalZarrRegisteredWriter:
         cx = max(1, min(x, int(chunk_yx[1])))
         self.chunks = (1, cy, cx)
         self.write_workers = max(1, int(write_workers))
+        self.cancel_cb = cancel_cb
         self.max_pending_writes = (
             max(1, int(max_pending_writes))
             if max_pending_writes is not None
@@ -731,7 +733,22 @@ class IncrementalZarrRegisteredWriter:
             raise ValueError(f"Plane shape mismatch. Expected {exp}, got {got}")
         self.write_channel_strip(idx, plane_yx, 0)
 
+    def _check_cancel(self) -> None:
+        try:
+            if self.cancel_cb is not None and bool(self.cancel_cb()):
+                raise RuntimeError("Cancelled")
+        except RuntimeError:
+            raise
+        except Exception:
+            return
+
+    @staticmethod
+    def _cancel_pending(pending: set[Future]) -> None:
+        for fut in list(pending):
+            fut.cancel()
+
     def write_channel_strip(self, channel_index: int, strip_yx: np.ndarray, row_offset: int) -> None:
+        self._check_cancel()
         idx = int(channel_index)
         if idx < 0 or idx >= int(self.shape_yxc[2]):
             raise IndexError(f"channel_index out of range: {channel_index}")
@@ -745,7 +762,9 @@ class IncrementalZarrRegisteredWriter:
             raise ValueError(f"Strip width mismatch. Expected {self.shape_yxc[1]}, got {strip_yx.shape[1]}")
         strip_cast = strip_yx.astype(self.dtype, copy=False)
         if self._executor is None:
+            self._check_cancel()
             self._arr[idx, r0:r1, :] = strip_cast
+            self._check_cancel()
             return
 
         pending: set[Future] = set()
@@ -754,21 +773,38 @@ class IncrementalZarrRegisteredWriter:
             nonlocal pending
             if not pending:
                 return
+            self._check_cancel()
             if wait_for_one:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                if not done:
+                    return
             else:
-                done, pending = wait(pending)
+                while pending:
+                    self._check_cancel()
+                    done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                    if not done:
+                        continue
+                    for fut in done:
+                        fut.result()
+                    self._check_cancel()
+                return
             for fut in done:
                 fut.result()
+            self._check_cancel()
 
-        for ay0, ay1, ax0, ax1 in self._iter_strip_chunk_windows(r0, r1):
-            ly0 = ay0 - r0
-            ly1 = ay1 - r0
-            chunk = np.asarray(strip_cast[ly0:ly1, ax0:ax1]).copy()
-            pending.add(self._executor.submit(self._write_chunk, idx, ay0, ay1, ax0, ax1, chunk))
-            if len(pending) >= self.max_pending_writes:
-                _drain(wait_for_one=True)
-        _drain(wait_for_one=False)
+        try:
+            for ay0, ay1, ax0, ax1 in self._iter_strip_chunk_windows(r0, r1):
+                self._check_cancel()
+                ly0 = ay0 - r0
+                ly1 = ay1 - r0
+                chunk = np.asarray(strip_cast[ly0:ly1, ax0:ax1]).copy()
+                pending.add(self._executor.submit(self._write_chunk, idx, ay0, ay1, ax0, ax1, chunk))
+                while len(pending) >= self.max_pending_writes:
+                    _drain(wait_for_one=True)
+            _drain(wait_for_one=False)
+        except BaseException:
+            self._cancel_pending(pending)
+            raise
 
     def _iter_strip_chunk_windows(self, row_start: int, row_stop: int):
         chunk_y = max(1, int(self.chunks[1]))
@@ -802,11 +838,21 @@ class IncrementalZarrRegisteredWriter:
             self._executor = None
         self.flush()
 
+    def abort(self) -> None:
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
+        self.flush()
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.close()
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.close()
         return False
 
 def save_ome_tiff_yxc(
