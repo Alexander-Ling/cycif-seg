@@ -147,10 +147,33 @@ def discover_cycles(
             # Count tiles
             tiles = discover_cycle_tiles(folder, tile_filename_regex=tile_regex)
             if not tiles:
-                errors.append(
-                    f"Cycle directory '{folder.name}' matches the C<N>_... pattern "
-                    f"but contains no tile files."
-                )
+                expected_stitched = folder / f"{folder.name}_{_STITCH_SUFFIX}.ome.tiff"
+                if not expected_stitched.exists():
+                    errors.append(
+                        f"Cycle directory '{folder.name}' matches the C<N>_... pattern "
+                        f"but contains no tile files."
+                    )
+                    continue
+                n_channels = _get_tile_channel_count(expected_stitched)
+                channel_markers, had_warning = _parse_channel_markers(suffix, n_channels)
+                if had_warning:
+                    print(
+                        f"  [WARNING] '{folder.name}': folder name has fewer tokens than "
+                        f"expected for {n_channels} channels. Missing channel names filled "
+                        f"with empty strings.",
+                        file=sys.stderr,
+                    )
+                cycle_infos.append({
+                    "folder": folder,
+                    "cycle_num": cycle_num,
+                    "cycle_int": cycle_int,
+                    "label": label,
+                    "name_suffix": suffix,
+                    "channel_markers": channel_markers,
+                    "n_channels": n_channels,
+                    "n_tiles": 0,
+                    "pre_stitched": True,
+                })
                 continue
 
             # Get channel count from one tile
@@ -244,6 +267,7 @@ def _run_registration(
     registration_algorithm: str,
     strip_height: int | None,
     pyramidal_output: bool,
+    elastic_touchup: bool = True,
     force: bool = False,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
@@ -280,6 +304,7 @@ def _run_registration(
             registration_algorithm=registration_algorithm,
             strip_height=strip_height,
             pyramidal_output=pyramidal_output,
+            elastic_touchup=elastic_touchup,
             progress_cb=lambda msg: print(f"  {msg}"),
         )
         print(f"  Done. Merged output: {output_path}")
@@ -349,6 +374,7 @@ def _run_registration(
         registration_algorithm=registration_algorithm,
         strip_height=strip_height,
         pyramidal_output=pyramidal_output,
+        elastic_touchup=elastic_touchup,
         resume_flat_output=bool(output_path.exists()),
         completed_cycles=completed_cycles,
         registration_progress_path=str(resume_state["manifest_path"]),
@@ -416,6 +442,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Registration algorithm (default: tiled_rigid)")
     reg_grp.add_argument("--strip-height", type=int, default=None, metavar="INT",
                           help="Process registration in horizontal strips of this height (reduces RAM)")
+    reg_grp.add_argument("--elastic-touchup", default=True, action=argparse.BooleanOptionalAction,
+                          help="Apply B-spline elastic touch-up after rigid registration (default: on)")
 
     misc_grp = p.add_argument_group("misc")
     misc_grp.add_argument("--no-pyramidal", action="store_true",
@@ -478,9 +506,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nFound {len(cycle_infos)} cycle(s):")
     for ci in cycle_infos:
+        tile_info = "pre-stitched" if ci.get("pre_stitched") else f"{ci['n_tiles']} tiles"
         print(
             f"  Cycle {ci['label']:>4}  {ci['folder'].name}"
-            f"  [{ci['n_tiles']} tiles, {ci['n_channels']} ch]"
+            f"  [{tile_info}, {ci['n_channels']} ch]"
             f"  channels: {', '.join(ci['channel_markers'])}"
         )
 
@@ -497,7 +526,18 @@ def main(argv: list[str] | None = None) -> int:
 
     for ci in cycle_infos:
         try:
-            if args.skip_stitch:
+            if ci.get("pre_stitched"):
+                path = str(ci["folder"] / f"{ci['folder'].name}_{_STITCH_SUFFIX}.ome.tiff")
+                if args.force_stitch:
+                    print(
+                        f"\n  [WARNING] --force-stitch ignored for cycle {ci['label']} "
+                        f"({ci['folder'].name}): no tile files. Using existing stitched file.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"\n--- Cycle {ci['label']}: {ci['folder'].name} ---")
+                    print(f"  [pre-stitched] Using existing: {ci['folder'].name}_{_STITCH_SUFFIX}.ome.tiff")
+            elif args.skip_stitch:
                 path = _find_stitched_file(ci)
                 print(f"  [skip-stitch] Using existing: {path}")
             else:
@@ -536,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
             registration_algorithm=args.registration_algorithm,
             strip_height=args.strip_height,
             pyramidal_output=pyramidal,
+            elastic_touchup=args.elastic_touchup,
             force=args.force_register,
         )
     except Exception as exc:
