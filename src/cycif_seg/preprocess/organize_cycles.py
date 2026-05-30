@@ -1968,10 +1968,10 @@ def merge_cycles_to_ome_tiff(
     low_mem: bool = False,
     strip_height: int | None = None,
     elastic_touchup: bool = False,
-    elastic_touchup_tile_size: int = 1024,
+    elastic_touchup_tile_size: int = 2048,
     elastic_touchup_skip_corr: float = 0.95,
     elastic_touchup_bspline_spacing: int = 50,
-    elastic_touchup_max_iterations: int = 100,
+    elastic_touchup_max_iterations: int = 10,
     elastic_touchup_large_island_px: int = 4_000_000,
     elastic_touchup_workers: int = 0,
     elastic_touchup_max_step_length: float = 1.0,
@@ -2245,8 +2245,8 @@ def merge_cycles_to_ome_tiff(
                 return int(ch), _cast_preserve_dtype(_plane, base_dtype)
 
             # map_coordinates (the warp) releases the GIL, so threads give real
-            # parallelism here. Cap at 4 to bound peak in-flight plane memory.
-            _n_workers = min(n_ch, 4)
+            # parallelism here.
+            _n_workers = min(n_ch, step1_workers)
             _pool = ThreadPoolExecutor(max_workers=_n_workers)
             _futures: list[Future] = []
             try:
@@ -2867,6 +2867,7 @@ def merge_cycles_to_ome_tiff(
                 out_chunk=max(1, int(pyramid_progress_chunk)),
                 progress_cb=_pyr_progress,
                 cancel_cb=cancel_cb,
+                build_workers=step1_workers,
             )
             os.replace(tmp_pyramid_path, out_path)
             try:
@@ -2883,6 +2884,7 @@ def merge_cycles_to_ome_tiff(
                 out_chunk=max(1, int(pyramid_progress_chunk)),
                 replace_source=True,
                 progress_cb=_pyr_progress,
+                build_workers=step1_workers,
             )
         tick += 1
 

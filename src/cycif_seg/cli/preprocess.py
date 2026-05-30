@@ -259,7 +259,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 ),
                 elastic_touchup_tile_size=max(64, int(
                     args.elastic_touchup_tile_size if args.elastic_touchup_tile_size is not None
-                    else (getattr(s, "elastic_touchup_tile_size", 1024) or 1024)
+                    else (getattr(s, "elastic_touchup_tile_size", 2048) or 2048)
                 )),
                 elastic_touchup_skip_corr=float(
                     args.elastic_touchup_skip_corr if args.elastic_touchup_skip_corr is not None
@@ -271,7 +271,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 )),
                 elastic_touchup_max_iterations=max(1, int(
                     args.elastic_touchup_max_iterations if args.elastic_touchup_max_iterations is not None
-                    else (getattr(s, "elastic_touchup_max_iterations", 100) or 100)
+                    else (getattr(s, "elastic_touchup_max_iterations", 10) or 10)
                 )),
                 elastic_touchup_large_island_px=max(1, int(getattr(s, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000)),
                 elastic_touchup_workers=max(0, int(
@@ -417,6 +417,7 @@ def _cmd_pyramid(args: argparse.Namespace) -> int:
             resume=not bool(args.no_resume),
             keep_work_dir=bool(args.keep_work_dir),
             progress_cb=_progress,
+            build_workers=max(1, int(args.workers)) if args.workers is not None else None,
         )
         final_info = inspect_tiff_pyramid(str(tmp_out))
         if not bool(final_info.get("is_pyramidal")):
@@ -512,10 +513,10 @@ def _sample_from_sample_dir(args: argparse.Namespace) -> BatchSample:
         low_mem=True,
         strip_height=int(args.strip_height) if args.strip_height and int(args.strip_height) > 0 else None,
         elastic_touchup=(bool(args.elastic_touchup) if args.elastic_touchup is not None else True),
-        elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", None) or 1024)),
+        elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", None) or 2048)),
         elastic_touchup_skip_corr=float(getattr(args, "elastic_touchup_skip_corr", None) or 0.95),
         elastic_touchup_bspline_spacing=max(4, int(getattr(args, "elastic_touchup_bspline_spacing", None) or 50)),
-        elastic_touchup_max_iterations=max(1, int(getattr(args, "elastic_touchup_max_iterations", None) or 100)),
+        elastic_touchup_max_iterations=max(1, int(getattr(args, "elastic_touchup_max_iterations", None) or 10)),
         elastic_touchup_large_island_px=max(1, int(getattr(args, "elastic_touchup_large_island_px", None) or 4_000_000)),
         elastic_touchup_workers=max(0, int(getattr(args, "elastic_touchup_workers", None) or 0)),
         elastic_touchup_max_step_length=max(0.01, float(getattr(args, "elastic_touchup_max_step_length", None) or 1.0)),
@@ -630,10 +631,10 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
                 bool(args.elastic_touchup) if args.elastic_touchup is not None
                 else bool(getattr(sample, "elastic_touchup", True))
             ),
-            elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", None) or getattr(sample, "elastic_touchup_tile_size", 1024) or 1024)),
+            elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", None) or getattr(sample, "elastic_touchup_tile_size", 2048) or 2048)),
             elastic_touchup_skip_corr=float(getattr(args, "elastic_touchup_skip_corr", None) or getattr(sample, "elastic_touchup_skip_corr", 0.95) or 0.95),
             elastic_touchup_bspline_spacing=max(4, int(getattr(args, "elastic_touchup_bspline_spacing", None) or getattr(sample, "elastic_touchup_bspline_spacing", 50) or 50)),
-            elastic_touchup_max_iterations=max(1, int(getattr(args, "elastic_touchup_max_iterations", None) or getattr(sample, "elastic_touchup_max_iterations", 100) or 100)),
+            elastic_touchup_max_iterations=max(1, int(getattr(args, "elastic_touchup_max_iterations", None) or getattr(sample, "elastic_touchup_max_iterations", 10) or 10)),
             elastic_touchup_large_island_px=max(1, int(getattr(sample, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000)),
             elastic_touchup_workers=max(0, int(getattr(args, "elastic_touchup_workers", None) or getattr(sample, "elastic_touchup_workers", 0) or 0)),
             elastic_touchup_max_step_length=max(0.01, float(getattr(args, "elastic_touchup_max_step_length", None) or getattr(sample, "elastic_touchup_max_step_length", 1.0) or 1.0)),
@@ -717,13 +718,13 @@ def main() -> None:
     p_run.add_argument("--elastic-touchup", default=None, action=argparse.BooleanOptionalAction,
                        help="Enable/disable elastic touch-up (default: on; overrides plan setting)")
     p_run.add_argument("--elastic-touchup-tile-size", type=int, default=None, metavar="N",
-                       help="Tile size (px) for large-island elastic tiling (overrides plan; default: 1024)")
+                       help="Tile size (px) for large-island elastic tiling (overrides plan; default: 2048)")
     p_run.add_argument("--elastic-touchup-skip-corr", type=float, default=None, metavar="F",
                        help="Skip elastic if masked correlation already exceeds this value (overrides plan; default: 0.95)")
     p_run.add_argument("--elastic-touchup-bspline-spacing", type=int, default=None, metavar="N",
                        help="B-spline grid spacing in pixels at full resolution (overrides plan; default: 50)")
     p_run.add_argument("--elastic-touchup-max-iterations", type=int, default=None, metavar="N",
-                       help="Maximum elastix iterations per resolution level (overrides plan; default: 100)")
+                       help="Maximum elastix iterations per resolution level (overrides plan; default: 10)")
     p_run.add_argument("--elastic-touchup-workers", type=int, default=None, metavar="N",
                        help="Worker threads for parallel tile processing (overrides plan; default: 0 = auto)")
     p_run.add_argument("--elastic-touchup-max-step-length", type=float, default=None, metavar="F",
@@ -762,6 +763,8 @@ def main() -> None:
                        help="Stop adding downsampled levels once Y or X is <= N (default: 128)")
     p_pyr.add_argument("--out-chunk", type=int, default=1024, metavar="N",
                        help="Chunk size while building pyramid levels (default: 1024)")
+    p_pyr.add_argument("--workers", type=int, default=None, metavar="N",
+                       help="Worker threads for parallel chunk downsampling (default: os.cpu_count()-1)")
     p_pyr.add_argument("--no-resume", action="store_true",
                        help="Do not search for reusable level_XX.dat files")
     p_pyr.add_argument("--keep-work-dir", action="store_true",
@@ -808,13 +811,13 @@ def main() -> None:
     p_res.add_argument("--elastic-touchup", default=None, action=argparse.BooleanOptionalAction,
                        help="Enable/disable elastic touch-up (default: on; overrides plan setting)")
     p_res.add_argument("--elastic-touchup-tile-size", type=int, default=None, metavar="N",
-                       help="Tile size (px) for large-island elastic tiling (overrides plan; default: 1024)")
+                       help="Tile size (px) for large-island elastic tiling (overrides plan; default: 2048)")
     p_res.add_argument("--elastic-touchup-skip-corr", type=float, default=None, metavar="F",
                        help="Skip elastic if masked correlation already exceeds this value (overrides plan; default: 0.95)")
     p_res.add_argument("--elastic-touchup-bspline-spacing", type=int, default=None, metavar="N",
                        help="B-spline grid spacing in pixels at full resolution (overrides plan; default: 50)")
     p_res.add_argument("--elastic-touchup-max-iterations", type=int, default=None, metavar="N",
-                       help="Maximum elastix iterations per resolution level (overrides plan; default: 100)")
+                       help="Maximum elastix iterations per resolution level (overrides plan; default: 10)")
     p_res.add_argument("--elastic-touchup-workers", type=int, default=None, metavar="N",
                        help="Worker threads for parallel tile processing (overrides plan; default: 0 = auto)")
     p_res.add_argument("--elastic-touchup-max-step-length", type=float, default=None, metavar="F",

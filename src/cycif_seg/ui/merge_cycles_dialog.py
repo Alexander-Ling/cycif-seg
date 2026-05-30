@@ -168,9 +168,9 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.spn_max_iterations = QtWidgets.QSpinBox()
         self.spn_max_iterations.setRange(1, 1000)
         self.spn_max_iterations.setSingleStep(10)
-        self.spn_max_iterations.setValue(100)
+        self.spn_max_iterations.setValue(10)
         self.spn_max_iterations.setToolTip(
-            "Maximum elastix optimizer iterations per resolution level (default: 100)."
+            "Maximum elastix optimizer iterations per resolution level (default: 10)."
         )
         self.spn_max_step_length = QtWidgets.QDoubleSpinBox()
         self.spn_max_step_length.setRange(0.01, 20.0)
@@ -185,11 +185,11 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.spn_elastic_tile_size = QtWidgets.QSpinBox()
         self.spn_elastic_tile_size.setRange(64, 10000)
         self.spn_elastic_tile_size.setSingleStep(256)
-        self.spn_elastic_tile_size.setValue(1024)
+        self.spn_elastic_tile_size.setValue(2048)
         self.spn_elastic_tile_size.setToolTip(
             "Tile size in pixels used for large-island elastic correction tiling.\n"
             "Smaller values allow finer local corrections at the cost of more tiles.\n"
-            "(default: 1024, min: 64)"
+            "(default: 2048, min: 64)"
         )
         elastic_form.addRow("B-spline grid spacing (px):", self.spn_bspline_spacing)
         elastic_form.addRow("Max iterations:", self.spn_max_iterations)

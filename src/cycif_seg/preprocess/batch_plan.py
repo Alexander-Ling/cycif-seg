@@ -92,10 +92,10 @@ class BatchSample:
     low_mem: bool = True
     strip_height: int | None = None  # None = auto (canvas_H // 10) when low_mem=True
     elastic_touchup: bool = True
-    elastic_touchup_tile_size: int = 1024
+    elastic_touchup_tile_size: int = 2048
     elastic_touchup_skip_corr: float = 0.95
     elastic_touchup_bspline_spacing: int = 50
-    elastic_touchup_max_iterations: int = 100
+    elastic_touchup_max_iterations: int = 10
     elastic_touchup_large_island_px: int = 4_000_000
     elastic_touchup_workers: int = 0
     elastic_touchup_max_step_length: float = 1.0
@@ -247,10 +247,10 @@ def plan_to_dict(
             "low_mem": bool(getattr(s, "low_mem", True)),
             "strip_height": int(getattr(s, "strip_height") or 0) if getattr(s, "strip_height", None) is not None else None,
             "elastic_touchup": bool(getattr(s, "elastic_touchup", False)),
-            "elastic_touchup_tile_size": int(getattr(s, "elastic_touchup_tile_size", 1024) or 1024),
+            "elastic_touchup_tile_size": int(getattr(s, "elastic_touchup_tile_size", 2048) or 2048),
             "elastic_touchup_skip_corr": float(getattr(s, "elastic_touchup_skip_corr", 0.95) or 0.95),
             "elastic_touchup_bspline_spacing": int(getattr(s, "elastic_touchup_bspline_spacing", 50) or 50),
-            "elastic_touchup_max_iterations": int(getattr(s, "elastic_touchup_max_iterations", 100) or 100),
+            "elastic_touchup_max_iterations": int(getattr(s, "elastic_touchup_max_iterations", 10) or 10),
             "elastic_touchup_large_island_px": int(getattr(s, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000),
             "elastic_touchup_workers": int(getattr(s, "elastic_touchup_workers", 0) or 0),
             "elastic_touchup_max_step_length": float(getattr(s, "elastic_touchup_max_step_length", 1.0) or 1.0),
@@ -308,10 +308,10 @@ def plan_from_dict(d: dict) -> dict[str, Any]:
         _sh = rec.get("strip_height", None)
         s.strip_height = int(_sh) if _sh is not None and int(_sh) > 0 else None
         s.elastic_touchup = bool(rec.get("elastic_touchup", defs.get("elastic_touchup", True)))
-        s.elastic_touchup_tile_size = max(64, int(rec.get("elastic_touchup_tile_size", defs.get("elastic_touchup_tile_size", 1024)) or 1024))
+        s.elastic_touchup_tile_size = max(64, int(rec.get("elastic_touchup_tile_size", defs.get("elastic_touchup_tile_size", 2048)) or 2048))
         s.elastic_touchup_skip_corr = float(rec.get("elastic_touchup_skip_corr", defs.get("elastic_touchup_skip_corr", 0.95)) or 0.95)
         s.elastic_touchup_bspline_spacing = max(4, int(rec.get("elastic_touchup_bspline_spacing", defs.get("elastic_touchup_bspline_spacing", 50)) or 50))
-        s.elastic_touchup_max_iterations = max(1, int(rec.get("elastic_touchup_max_iterations", defs.get("elastic_touchup_max_iterations", 100)) or 100))
+        s.elastic_touchup_max_iterations = max(1, int(rec.get("elastic_touchup_max_iterations", defs.get("elastic_touchup_max_iterations", 10)) or 10))
         s.elastic_touchup_large_island_px = max(1, int(rec.get("elastic_touchup_large_island_px", defs.get("elastic_touchup_large_island_px", 4_000_000)) or 4_000_000))
         s.elastic_touchup_workers = max(0, int(rec.get("elastic_touchup_workers", defs.get("elastic_touchup_workers", 0)) or 0))
         s.elastic_touchup_max_step_length = max(0.01, float(rec.get("elastic_touchup_max_step_length", defs.get("elastic_touchup_max_step_length", 1.0)) or 1.0))

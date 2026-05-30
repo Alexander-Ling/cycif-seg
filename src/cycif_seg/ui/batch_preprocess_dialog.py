@@ -563,9 +563,9 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "strip_height": getattr(s, 'strip_height', None),
                 "elastic_touchup": bool(getattr(s, 'elastic_touchup', False)),
                 "elastic_touchup_bspline_spacing": int(getattr(s, 'elastic_touchup_bspline_spacing', 50) or 50),
-                "elastic_touchup_max_iterations": int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100),
+                "elastic_touchup_max_iterations": int(getattr(s, 'elastic_touchup_max_iterations', 10) or 10),
                 "elastic_touchup_max_step_length": float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0),
-                "elastic_touchup_tile_size": int(getattr(s, 'elastic_touchup_tile_size', 1024) or 1024),
+                "elastic_touchup_tile_size": int(getattr(s, 'elastic_touchup_tile_size', 2048) or 2048),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -627,11 +627,11 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             if 'elastic_touchup_bspline_spacing' in cfg:
                 s.elastic_touchup_bspline_spacing = max(4, int(cfg.get('elastic_touchup_bspline_spacing') or 50))
             if 'elastic_touchup_max_iterations' in cfg:
-                s.elastic_touchup_max_iterations = max(1, int(cfg.get('elastic_touchup_max_iterations') or 100))
+                s.elastic_touchup_max_iterations = max(1, int(cfg.get('elastic_touchup_max_iterations') or 10))
             if 'elastic_touchup_max_step_length' in cfg:
                 s.elastic_touchup_max_step_length = max(0.01, float(cfg.get('elastic_touchup_max_step_length') or 1.0))
             if 'elastic_touchup_tile_size' in cfg:
-                s.elastic_touchup_tile_size = max(64, int(cfg.get('elastic_touchup_tile_size') or 1024))
+                s.elastic_touchup_tile_size = max(64, int(cfg.get('elastic_touchup_tile_size') or 2048))
         except Exception:
             pass
 
@@ -927,10 +927,10 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         fast_large_island_refinement=False,
                         fast_large_island_sample_count=max(1, int(getattr(s, 'fast_large_island_sample_count', default_fast_large_island_sample_count) or default_fast_large_island_sample_count)),
                         elastic_touchup=bool(getattr(s, 'elastic_touchup', False)),
-                        elastic_touchup_tile_size=max(64, int(getattr(s, 'elastic_touchup_tile_size', 1024) or 1024)),
+                        elastic_touchup_tile_size=max(64, int(getattr(s, 'elastic_touchup_tile_size', 2048) or 2048)),
                         elastic_touchup_skip_corr=float(getattr(s, 'elastic_touchup_skip_corr', 0.95) or 0.95),
                         elastic_touchup_bspline_spacing=max(4, int(getattr(s, 'elastic_touchup_bspline_spacing', 50) or 50)),
-                        elastic_touchup_max_iterations=max(1, int(getattr(s, 'elastic_touchup_max_iterations', 100) or 100)),
+                        elastic_touchup_max_iterations=max(1, int(getattr(s, 'elastic_touchup_max_iterations', 10) or 10)),
                         elastic_touchup_large_island_px=max(1, int(getattr(s, 'elastic_touchup_large_island_px', 4_000_000) or 4_000_000)),
                         elastic_touchup_workers=max(0, int(getattr(s, 'elastic_touchup_workers', 0) or 0)),
                         elastic_touchup_max_step_length=max(0.01, float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0)),
