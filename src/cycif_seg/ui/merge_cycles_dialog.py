@@ -1,11 +1,32 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
 
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
+
+_CYCLE_DIR_RE_UI = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
+
+
+def _detect_channel_markers_from_path(path: str, n_channels: int) -> list[str] | None:
+    try:
+        m = _CYCLE_DIR_RE_UI.match(Path(path).parent.name)
+        if not m:
+            return None
+        suffix = m.group(2)
+        if n_channels <= 1:
+            return ["DAPI"]
+        tokens = suffix.split("_")
+        needed = n_channels - 1
+        markers = tokens[-needed:] if len(tokens) >= needed else list(tokens)
+        while len(markers) < needed:
+            markers.append("")
+        return ["DAPI"] + markers
+    except Exception:
+        return None
 
 
 @dataclass
@@ -229,11 +250,28 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.tbl_registration = QtWidgets.QTableWidget()
         self.tbl_channels = QtWidgets.QTableWidget()
         self.tabs.addTab(self.tbl_registration, "Registration")
-        self.tabs.addTab(self.tbl_channels, "Channel names")
+
+        _ch_tab = QtWidgets.QWidget()
+        _ch_layout = QtWidgets.QVBoxLayout(_ch_tab)
+        _ch_layout.setContentsMargins(0, 4, 0, 0)
+        _ch_btn_row = QtWidgets.QHBoxLayout()
+        self.btn_autodetect_channels = QtWidgets.QPushButton("Auto-detect channel names")
+        self.btn_autodetect_help = QtWidgets.QToolButton()
+        self.btn_autodetect_help.setText("?")
+        self.btn_autodetect_help.setToolTip("How auto-detection works")
+        _ch_btn_row.addWidget(self.btn_autodetect_channels)
+        _ch_btn_row.addWidget(self.btn_autodetect_help)
+        _ch_btn_row.addStretch()
+        _ch_layout.addLayout(_ch_btn_row)
+        _ch_layout.addWidget(self.tbl_channels, 1)
+        self.tabs.addTab(_ch_tab, "Channel names")
+
         root.addWidget(self.tabs, 1)
 
         self._build_cycle_tables()
         self.tbl_registration.itemChanged.connect(self._on_registration_item_changed)
+        self.btn_autodetect_channels.clicked.connect(self._on_autodetect_channels)
+        self.btn_autodetect_help.clicked.connect(self._on_autodetect_help)
 
         # Output path
         out_row = QtWidgets.QHBoxLayout()
@@ -256,6 +294,53 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
 
     def set_default_output(self, path: str) -> None:
         self.txt_output.setText(str(path))
+
+    def _on_autodetect_channels(self) -> None:
+        tbl = self.tbl_channels
+        any_matched = False
+        for cycle_idx, cfg in enumerate(self._cycles):
+            detected = _detect_channel_markers_from_path(cfg.path, len(cfg.channel_names))
+            if detected is None:
+                continue
+            any_matched = True
+            for r in range(tbl.rowCount()):
+                cy_item = tbl.item(r, 0)
+                if cy_item is None or int(cy_item.data(QtCore.Qt.UserRole)) != cycle_idx:
+                    continue
+                ch_idx_item = tbl.item(r, 2)
+                if ch_idx_item is None:
+                    continue
+                ch_idx = int(ch_idx_item.text())
+                if ch_idx < len(detected):
+                    marker_item = tbl.item(r, 4)
+                    if marker_item is not None:
+                        marker_item.setText(detected[ch_idx])
+                    else:
+                        tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(detected[ch_idx]))
+        if not any_matched:
+            QtWidgets.QMessageBox.information(
+                self, "Auto-detect channel names",
+                "No cycle folders matched the expected naming convention.\n"
+                "Click ? for details on how to name your folders.",
+            )
+
+    def _on_autodetect_help(self) -> None:
+        QtWidgets.QMessageBox.information(
+            self,
+            "Auto-detect channel names — how it works",
+            "Channel names are inferred from the cycle folder name.\n\n"
+            "Expected folder naming convention:\n"
+            "  C<N>_<token1>_<token2>_..._<markerA>_<markerB>_<markerC>\n\n"
+            "Rules:\n"
+            "• The folder must start with C followed by a number, then an underscore.\n"
+            "• Channel 0 is always named DAPI.\n"
+            "• The remaining channel names come from the last (N−1) underscore-separated\n"
+            "  tokens in the folder name, where N is the number of channels in the file.\n\n"
+            "Example:\n"
+            "  Folder:   C1_BTC_MSK1_2_HSV1g_PDL1_CD8   (4-channel file)\n"
+            "  Channels: DAPI, HSV1g, PDL1, CD8\n\n"
+            "If a folder does not match this pattern, its channel names are left unchanged.",
+        )
 
     def _on_browse_out(self):
         start = str(Path(self.txt_output.text()).parent) if self.txt_output.text() else str(Path.cwd())
