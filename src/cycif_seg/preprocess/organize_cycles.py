@@ -2038,7 +2038,7 @@ def merge_cycles_to_ome_tiff(
     D = max(1, int(downsample_for_registration))
     _strip_h: int | None = strip_height
     if _strip_h is None and low_mem:
-        _strip_h = max(1000, canvas_yx[0] // 10)
+        _strip_h = max(1000, min(canvas_yx[0] // 10, 3700))
     _strip_mode = _strip_h is not None and _strip_h > 0
     # Downsampled canvas dimensions used during strip-mode registration
     _ds_canvas_yx = (max(1, canvas_yx[0] // D), max(1, canvas_yx[1] // D)) if _strip_mode else canvas_yx
