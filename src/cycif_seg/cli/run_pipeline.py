@@ -268,6 +268,7 @@ def _run_registration(
     strip_height: int | None,
     pyramidal_output: bool,
     elastic_touchup: bool = True,
+    n_workers: int = 1,
     force: bool = False,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
@@ -305,6 +306,7 @@ def _run_registration(
             strip_height=strip_height,
             pyramidal_output=pyramidal_output,
             elastic_touchup=elastic_touchup,
+            elastic_touchup_workers=n_workers,
             progress_cb=lambda msg: print(f"  {msg}"),
         )
         print(f"  Done. Merged output: {output_path}")
@@ -375,6 +377,7 @@ def _run_registration(
         strip_height=strip_height,
         pyramidal_output=pyramidal_output,
         elastic_touchup=elastic_touchup,
+        elastic_touchup_workers=n_workers,
         resume_flat_output=bool(output_path.exists()),
         completed_cycles=completed_cycles,
         registration_progress_path=str(resume_state["manifest_path"]),
@@ -577,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
             strip_height=args.strip_height,
             pyramidal_output=pyramidal,
             elastic_touchup=args.elastic_touchup,
+            n_workers=args.n_workers,
             force=args.force_register,
         )
     except Exception as exc:
