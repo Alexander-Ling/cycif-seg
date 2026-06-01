@@ -12,13 +12,14 @@ from typing import Callable, Iterable, Optional
 
 import numpy as np
 
-# Optional dependency: zarr + numcodecs
+# Optional dependency: zarr
 try:  # pragma: no cover
     import zarr  # type: ignore
-    from numcodecs import Blosc  # type: ignore
+    from zarr.codecs import BloscCodec as _BloscCodec, BytesCodec as _BytesCodec  # type: ignore
 except Exception:  # pragma: no cover
     zarr = None
-    Blosc = None
+    _BloscCodec = None
+    _BytesCodec = None
 
 from cycif_seg.features.multiscale import build_features, features_per_channel
 
@@ -363,7 +364,7 @@ class ZarrTileFeatureCache:
 
     @staticmethod
     def available() -> bool:
-        return zarr is not None and Blosc is not None
+        return zarr is not None and _BloscCodec is not None
 
     @staticmethod
     def compute_image_fingerprint(path: str | None, image_shape_yxc: tuple[int, int, int]) -> str:
@@ -474,7 +475,7 @@ class ZarrTileFeatureCache:
             shape=(self.H, self.W, self.Fch),
             chunks=(min(self.tile_size, self.H), min(self.tile_size, self.W), self.Fch),
             dtype="float16",
-            compressors=compressor,
+            codecs=compressor,
             overwrite=False,
         )
         zf.attrs.update(
@@ -498,7 +499,7 @@ class ZarrTileFeatureCache:
             shape=(self.n_ty, self.n_tx),
             chunks=(min(64, self.n_ty), min(64, self.n_tx)),
             dtype="uint8",
-            compressors=compressor,
+            codecs=compressor,
             overwrite=False,
         )
         zm.attrs.update(
@@ -544,7 +545,7 @@ class ZarrTileFeatureCache:
             ch_dir.mkdir(parents=True, exist_ok=True)
 
             # Use fast compression.
-            compressor = Blosc(cname="lz4", clevel=1, shuffle=Blosc.BITSHUFFLE)
+            compressor = [_BytesCodec(), _BloscCodec(cname="lz4", clevel=1, shuffle="bitshuffle")]
 
             feat_path = ch_dir / "features.zarr"
             mask_path = ch_dir / "mask.zarr"
@@ -560,7 +561,7 @@ class ZarrTileFeatureCache:
                     shape=(self.H, self.W, self.Fch),
                     chunks=(min(self.tile_size, self.H), min(self.tile_size, self.W), self.Fch),
                     dtype="float16",
-                    compressor=compressor,
+                    codecs=compressor,
                     overwrite=False,
                 )
                 # Only set attrs at creation time to avoid repeated metadata rewrites.
@@ -580,7 +581,7 @@ class ZarrTileFeatureCache:
                     shape=(self.n_ty, self.n_tx),
                     chunks=(min(64, self.n_ty), min(64, self.n_tx)),
                     dtype="uint8",
-                    compressor=compressor,
+                    codecs=compressor,
                     overwrite=False,
                 )
                 zm.attrs.update(

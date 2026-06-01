@@ -710,7 +710,7 @@ class IncrementalZarrRegisteredWriter:
             shape=self.shape_cyx,
             chunks=self.chunks,
             dtype=self.dtype,
-            compressors=None,
+            zarr_format=2,
         )
         self._arr.attrs["axes"] = "CYX"
         self._arr.attrs["shape_yxc"] = tuple(int(v) for v in self.shape_yxc)
