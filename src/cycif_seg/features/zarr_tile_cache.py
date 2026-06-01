@@ -469,12 +469,12 @@ class ZarrTileFeatureCache:
         except Exception as e:
             raise RuntimeError(f"Unable to reset feature cache for channel {c}: {e}")
 
-        zf.create_dataset(
+        zf.create_array(
             "data",
             shape=(self.H, self.W, self.Fch),
             chunks=(min(self.tile_size, self.H), min(self.tile_size, self.W), self.Fch),
             dtype="float16",
-            compressor=compressor,
+            compressors=compressor,
             overwrite=False,
         )
         zf.attrs.update(
@@ -493,12 +493,12 @@ class ZarrTileFeatureCache:
         except Exception as e:
             raise RuntimeError(f"Unable to reset mask cache for channel {c}: {e}")
 
-        zm.create_dataset(
+        zm.create_array(
             "mask",
             shape=(self.n_ty, self.n_tx),
             chunks=(min(64, self.n_ty), min(64, self.n_tx)),
             dtype="uint8",
-            compressor=compressor,
+            compressors=compressor,
             overwrite=False,
         )
         zm.attrs.update(
@@ -549,14 +549,13 @@ class ZarrTileFeatureCache:
             feat_path = ch_dir / "features.zarr"
             mask_path = ch_dir / "mask.zarr"
 
-            # Keep both stores in Zarr v2 for compatibility with numcodecs codecs.
-            zf = zarr.open_group(str(feat_path), mode="a", zarr_format=2)
-            zm = zarr.open_group(str(mask_path), mode="a", zarr_format=2)
+            zf = zarr.open_group(str(feat_path), mode="a")
+            zm = zarr.open_group(str(mask_path), mode="a")
 
             created_feat = False
             created_mask = False
             if "data" not in zf:
-                zf.create_dataset(
+                zf.create_array(
                     "data",
                     shape=(self.H, self.W, self.Fch),
                     chunks=(min(self.tile_size, self.H), min(self.tile_size, self.W), self.Fch),
@@ -576,7 +575,7 @@ class ZarrTileFeatureCache:
                 )
                 created_feat = True
             if "mask" not in zm:
-                zm.create_dataset(
+                zm.create_array(
                     "mask",
                     shape=(self.n_ty, self.n_tx),
                     chunks=(min(64, self.n_ty), min(64, self.n_tx)),

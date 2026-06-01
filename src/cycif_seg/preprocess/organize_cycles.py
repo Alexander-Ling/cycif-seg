@@ -37,6 +37,7 @@ from cycif_seg.io.ome_tiff import (
     load_channel_names_only,
     load_channel_downsampled,
     load_channel_strip,
+    load_channel_roi,
     load_physical_pixel_sizes,
     load_single_channel_tiff_native,
     convert_flat_ome_to_pyramidal,
@@ -1395,7 +1396,7 @@ def _registered_zarr_has_expected_layout(
     try:
         import zarr as _zarr  # type: ignore
 
-        arr = _zarr.open(str(store_path), mode="r")
+        arr = _zarr.open_array(str(store_path), mode="r")
         exp_cyx = (int(shape_yxc[2]), int(shape_yxc[0]), int(shape_yxc[1]))
         if tuple(int(v) for v in arr.shape) != exp_cyx:
             return False
@@ -1711,6 +1712,20 @@ def _run_elastix_bspline(
     field_y[~island] = 0.0
     field_x[~island] = 0.0
     return field_y, field_x
+
+
+def _load_elastic_touchup_crop(
+    path: str,
+    ch: int,
+    y0_fr: int, y1_fr: int,
+    x0_fr: int, x1_fr: int,
+) -> np.ndarray:
+    """Load float32 crop [y0_fr:y1_fr, x0_fr:x1_fr] for elastic touch-up.
+
+    Uses load_channel_roi so only the overlapping tiles are decoded, regardless
+    of whether the TIFF is uncompressed (memmap) or compressed pyramidal (zarr).
+    """
+    return load_channel_roi(path, ch, y0_fr, y1_fr, x0_fr, x1_fr)
 
 
 def _elastic_touchup_island(
@@ -2469,6 +2484,13 @@ def merge_cycles_to_ome_tiff(
                 print(f"[preprocess] reference cycle written + released{_rss_ref}", flush=True)
         tick += 1
 
+        # In strip mode, elastic touch-up loads per-island crops instead of full-canvas
+        # arrays.  Pre-compute the reference foreground mask at downsampled resolution
+        # once here (trivial from ref_reg already in memory) and reuse across all cycles.
+        _ref_fg_ds_for_elastic: np.ndarray | None = None
+        if _strip_mode and elastic_touchup:
+            _ref_fg_ds_for_elastic = _foreground_mask(ref_reg)
+
         for _i_moving, (ci, shp, _dt) in enumerate(moving_infos):
             _check_cancel(cancel_cb)
             cycle = int(ci.cycle)
@@ -2658,26 +2680,16 @@ def merge_cycles_to_ome_tiff(
                     cycle=cycle,
                 )
                 if _strip_mode:
-                    # ref_reg/mov_reg are downsampled (D=4); DAPI nuclei are ~2.5 px at
-                    # that scale — too small for reliable registration.  Load the
-                    # registration channel at full resolution from disk for this stage.
+                    # In strip mode we never load full-canvas arrays. Each island's
+                    # padded bbox is loaded lazily inside the loop below via
+                    # _load_elastic_touchup_crop (load_channel_strip + column slice).
+                    # The reference foreground mask was pre-computed at downsampled
+                    # resolution before this loop (_ref_fg_ds_for_elastic).
                     from scipy.ndimage import zoom as _sz  # type: ignore
-                    _ref_full_fr = _pad_plane_to_canvas(
-                        load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx)),
-                        canvas_yx, out_dtype=np.float32,
-                    )
-                    _mov_full_fr = _pad_plane_to_canvas(
-                        load_single_channel_tiff_native(ci.path, int(ch_idx)),
-                        canvas_yx, out_dtype=np.float32,
-                    )
-                    # Nearest-neighbour upsample preserves integer island labels.
-                    _islands_fr = _sz(islands, D, order=0).astype(islands.dtype)
-                    _ref_fg_fr  = _foreground_mask(_ref_full_fr)
-                    _et_ref     = _ref_full_fr
-                    _et_mov     = _mov_full_fr
-                    _et_islands = _islands_fr
-                    _et_fg      = _ref_fg_fr
-                    _et_regs    = regs_raw
+                    # Free the downsampled moving image; not used during elastic touch-up.
+                    mov_reg = None
+                    gc.collect()
+                    _et_regs     = regs_raw
                     # Island pixel counts are D² larger at full res; scale threshold.
                     _et_large_px = int(elastic_touchup_large_island_px) * D * D
                 else:
@@ -2726,9 +2738,69 @@ def merge_cycles_to_ome_tiff(
                                 f"label={_ereg.label} pixels={_ereg.pixels}",
                                 flush=True,
                             )
+                        if _strip_mode:
+                            # Load only this island's padded bbox at full resolution.
+                            # Never creates a full-canvas array — only island-sized crops.
+                            _bds = _ereg.bbox  # (y0_ds, y1_ds, x0_ds, x1_ds)
+                            _dy_fr, _dx_fr = _et_shift
+                            _pad_fr = int(max(4, math.ceil(max(abs(_dy_fr), abs(_dx_fr))) + 2))
+                            _y0_fr = max(0, _bds[0] * D - _pad_fr)
+                            _y1_fr = min(canvas_yx[0], _bds[1] * D + _pad_fr)
+                            _x0_fr = max(0, _bds[2] * D - _pad_fr)
+                            _x1_fr = min(canvas_yx[1], _bds[3] * D + _pad_fr)
+                            _h_fr = _y1_fr - _y0_fr
+                            _w_fr = _x1_fr - _x0_fr
+
+                            _ref_crop_fr = _load_elastic_touchup_crop(
+                                ref_ci.path, int(ref_ch_idx),
+                                _y0_fr, _y1_fr, _x0_fr, _x1_fr,
+                            )
+                            _mov_crop_fr = _load_elastic_touchup_crop(
+                                ci.path, int(ch_idx),
+                                _y0_fr, _y1_fr, _x0_fr, _x1_fr,
+                            )
+
+                            # Island mask: nearest-neighbour upsample of the ds bbox crop.
+                            _isl_ds_crop = (
+                                islands[_bds[0]:_bds[1], _bds[2]:_bds[3]] == _ereg.label
+                            )
+                            _isl_fr_crop = _sz(_isl_ds_crop.astype(np.float32), D, order=0) > 0.5
+                            _island_mask_local = np.zeros((_h_fr, _w_fr), dtype=bool)
+                            _isl_oy = _bds[0] * D - _y0_fr
+                            _isl_ox = _bds[2] * D - _x0_fr
+                            _isl_ey = min(_h_fr, _isl_oy + _isl_fr_crop.shape[0])
+                            _isl_ex = min(_w_fr, _isl_ox + _isl_fr_crop.shape[1])
+                            _island_mask_local[_isl_oy:_isl_ey, _isl_ox:_isl_ex] = (
+                                _isl_fr_crop[:_isl_ey - _isl_oy, :_isl_ex - _isl_ox]
+                            )
+
+                            # Fg mask: bilinear upsample of the cached ds ref fg mask crop.
+                            _fg_ds_crop = _ref_fg_ds_for_elastic[
+                                _bds[0]:_bds[1], _bds[2]:_bds[3]
+                            ]
+                            _fg_fr_crop = _sz(_fg_ds_crop.astype(np.float32), D, order=1) > 0.5
+                            _fg_mask_local = np.zeros((_h_fr, _w_fr), dtype=bool)
+                            _fg_oy = _bds[0] * D - _y0_fr
+                            _fg_ox = _bds[2] * D - _x0_fr
+                            _fg_ey = min(_h_fr, _fg_oy + _fg_fr_crop.shape[0])
+                            _fg_ex = min(_w_fr, _fg_ox + _fg_fr_crop.shape[1])
+                            _fg_mask_local[_fg_oy:_fg_ey, _fg_ox:_fg_ex] = (
+                                _fg_fr_crop[:_fg_ey - _fg_oy, :_fg_ex - _fg_ox]
+                            )
+
+                            _et_ref_arg = _ref_crop_fr
+                            _et_mov_arg = _mov_crop_fr
+                            _et_isl_arg = _island_mask_local
+                            _et_fg_arg  = _fg_mask_local
+                        else:
+                            _et_ref_arg = _et_ref
+                            _et_mov_arg = _et_mov
+                            _et_isl_arg = _et_islands == _ereg.label
+                            _et_fg_arg  = _et_fg
+
                         _eresult = _elastic_touchup_island(
-                            _et_ref, _et_mov, _et_islands == _ereg.label,
-                            _et_shift, _et_fg,
+                            _et_ref_arg, _et_mov_arg, _et_isl_arg,
+                            _et_shift, _et_fg_arg,
                             tile_size=int(elastic_touchup_tile_size),
                             skip_corr_threshold=float(elastic_touchup_skip_corr),
                             min_fg_pixels=32,
@@ -2743,6 +2815,14 @@ def merge_cycles_to_ome_tiff(
                             island_total=_n_et_regs,
                             cycle=cycle,
                         )
+                        # In strip mode the returned bbox is in local-crop coords; adjust
+                        # to global canvas coords by adding the crop origin.
+                        if _strip_mode and _eresult is not None:
+                            _edy, _edx, (_ly0, _ly1, _lx0, _lx1) = _eresult
+                            _eresult = (
+                                _edy, _edx,
+                                (_ly0 + _y0_fr, _ly1 + _y0_fr, _lx0 + _x0_fr, _lx1 + _x0_fr),
+                            )
                         if _eresult is not None:
                             _elastic_corrections.append(_eresult)
                 except BaseException:
@@ -2760,8 +2840,6 @@ def merge_cycles_to_ome_tiff(
 
                 if not _strip_mode:
                     del _et_fg
-                if _strip_mode and _ref_full_fr is not None:
-                    del _ref_full_fr, _mov_full_fr, _islands_fr, _ref_fg_fr
 
             if _i_moving == len(moving_infos) - 1:
                 del ref_reg

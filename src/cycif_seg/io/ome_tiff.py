@@ -686,7 +686,7 @@ class IncrementalZarrRegisteredWriter:
         )
 
         if bool(open_existing):
-            arr = zarr.open(self.path, mode="r+")
+            arr = zarr.open_array(self.path, mode="r+")
             if tuple(int(v) for v in arr.shape) != self.shape_cyx:
                 raise ValueError(f"Existing Zarr shape mismatch. Expected {self.shape_cyx}, got {arr.shape}")
             if np.dtype(arr.dtype) != self.dtype:
@@ -704,13 +704,13 @@ class IncrementalZarrRegisteredWriter:
             else:
                 p.unlink()
         p.parent.mkdir(parents=True, exist_ok=True)
-        self._arr = zarr.open(
+        self._arr = zarr.open_array(
             self.path,
             mode="w",
             shape=self.shape_cyx,
             chunks=self.chunks,
             dtype=self.dtype,
-            compressor=None,
+            compressors=None,
         )
         self._arr.attrs["axes"] = "CYX"
         self._arr.attrs["shape_yxc"] = tuple(int(v) for v in self.shape_yxc)
@@ -1546,7 +1546,7 @@ def convert_registered_zarr_to_pyramidal(
         if progress_step_cb:
             progress_step_cb(msg, phase)
 
-    src_cyx = zarr.open(str(source_path), mode='r')
+    src_cyx = zarr.open_array(str(source_path), mode='r')
     shape = tuple(int(v) for v in src_cyx.shape)
     if len(shape) != 3:
         raise ValueError(f'Expected 3D CYX Zarr array. Got shape={shape}')
@@ -2007,6 +2007,83 @@ def load_channel_strip(path: str, channel_index: int, y0: int, y1: int) -> np.nd
     # Fallback: load full channel and slice
     full = load_single_channel_tiff_native(path, idx)
     return np.asarray(full[y0:y1, :]).copy()
+
+
+def load_channel_roi(
+    path: str,
+    channel_index: int,
+    y0: int, y1: int,
+    x0: int, x1: int,
+) -> np.ndarray:
+    """Load a rectangular ROI [y0:y1, x0:x1] of one channel as float32.
+
+    For uncompressed TIFFs: uses tifffile.memmap (OS pages only the needed bytes).
+    For compressed/tiled TIFFs: seeks directly to each overlapping tile using
+    page.dataoffsets + page.decode — no full-channel load, no zarr dependency.
+    Returns a (y1-y0, x1-x0) float32 array, zero-padded for out-of-bounds regions.
+    """
+    info = inspect_tiff_yxc(path)
+    Y, X, C = info["shape_yxc"]
+    idx = int(channel_index)
+    y0c = max(0, int(y0)); y1c = min(int(Y), int(y1))
+    x0c = max(0, int(x0)); x1c = min(int(X), int(x1))
+    h_out = int(y1) - int(y0)
+    w_out = int(x1) - int(x0)
+    out = np.zeros((h_out, w_out), dtype=np.float32)
+    if y0c >= y1c or x0c >= x1c:
+        return out
+    h_in = y1c - y0c
+    w_in = x1c - x0c
+    oy = y0c - int(y0)
+    ox = x0c - int(x0)
+
+    axes = str(info.get("axes", "") or "")
+
+    # --- path 1: memmap (uncompressed TIFFs only) ---
+    try:
+        mm = tifffile.memmap(path, mode="r")
+        if mm.ndim == 3:
+            if axes.startswith("C") or (not axes and int(mm.shape[0]) == int(C)):
+                crop = np.asarray(mm[idx, y0c:y1c, x0c:x1c]).copy()
+            elif axes.endswith("C") or (not axes and int(mm.shape[2]) == int(C)):
+                crop = np.asarray(mm[y0c:y1c, x0c:x1c, idx]).copy()
+            else:
+                raise ValueError(f"Cannot infer channel axis: shape={mm.shape}")
+            _close_memmap(mm if isinstance(mm, np.memmap) else None)
+            del mm
+            out[oy : oy + h_in, ox : ox + w_in] = crop.astype(np.float32)
+            return out
+    except Exception:
+        pass
+
+    # --- path 2: zarr tile-slice (compressed/tiled TIFFs) ---
+    # tifffile.aszarr() + zarr.open() decodes only the tiles overlapping
+    # [y0:y1, x0:x1] — no full-channel load.  Requires zarr >= 3.
+    try:
+        import zarr as _zarr
+        with tifffile.TiffFile(path) as _tf:
+            store = _tf.aszarr(series=0, level=0)
+            z = _zarr.open(store, mode="r")
+            if z.ndim == 3:
+                if axes.startswith("C") or (not axes and int(z.shape[0]) == int(C)):
+                    crop = np.asarray(z[idx, y0c:y1c, x0c:x1c], dtype=np.float32)
+                elif axes.endswith("C") or (not axes and int(z.shape[2]) == int(C)):
+                    crop = np.asarray(z[y0c:y1c, x0c:x1c, idx], dtype=np.float32)
+                else:
+                    raise ValueError(f"Cannot infer channel axis for zarr: shape={z.shape}")
+            else:
+                raise ValueError(f"Unexpected zarr ndim: {z.ndim}")
+        out[oy : oy + h_in, ox : ox + w_in] = crop
+        return out
+    except Exception:
+        pass
+
+    # --- path 3: fallback — load full channel and slice ---
+    full = load_single_channel_tiff_native(path, idx)
+    out[oy : oy + h_in, ox : ox + w_in] = np.asarray(
+        full[y0c:y1c, x0c:x1c], dtype=np.float32
+    )
+    return out
 
 
 def load_channel_multiscale_lazy(path: str, channel_index: int) -> list | None:
