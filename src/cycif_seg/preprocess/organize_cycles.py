@@ -2622,37 +2622,53 @@ def merge_cycles_to_ome_tiff(
                 del _mov_padded
                 return _mov_crop
 
-            def _stream_island_corr(reg: _RegionTransform, dy_fr: float, dx_fr: float) -> float:
-                _y0, _y1, _x0, _x1 = _island_bbox_fr(reg)
-                _n = 0
-                _sum_a = _sum_b = _sum_aa = _sum_bb = _sum_ab = 0.0
-                for _gy0, _gy1, _gx0, _gx1 in _iter_tiles(_y0, _y1, _x0, _x1, overlap=False):
-                    _fg = _upsample_ds_mask_to_local(
-                        _ref_fg_ds_for_elastic, label=None,
-                        y0_fr=_gy0, y1_fr=_gy1, x0_fr=_gx0, x1_fr=_gx1,
-                        downsample=_ds,
-                    )
-                    if int(_fg.sum()) < 32:
-                        continue
-                    _ref = _canvas_channel_roi(ref_ci.path, int(ref_ch_idx), _ref_shape_yx, _gy0, _gy1, _gx0, _gx1)
-                    _mov = _translated_moving_tile(_gy0, _gy1, _gx0, _gx1, dy_fr, dx_fr)
-                    _use = _fg.astype(bool, copy=False)
-                    _a = _ref[_use].astype(np.float64, copy=False)
-                    _b = _mov[_use].astype(np.float64, copy=False)
-                    _n += int(_a.size)
-                    _sum_a += float(_a.sum())
-                    _sum_b += float(_b.sum())
-                    _sum_aa += float(np.sum(_a * _a))
-                    _sum_bb += float(np.sum(_b * _b))
-                    _sum_ab += float(np.sum(_a * _b))
-                    del _ref, _mov, _fg, _a, _b
-                if _n < 32:
+            def _corr_tile_stats(
+                gy0: int,
+                gy1: int,
+                gx0: int,
+                gx1: int,
+                dy_fr: float,
+                dx_fr: float,
+            ) -> tuple[int, float, float, float, float, float, float] | None:
+                _t0 = time.perf_counter()
+                _check_cancel(cancel_cb)
+                _fg = _upsample_ds_mask_to_local(
+                    _ref_fg_ds_for_elastic, label=None,
+                    y0_fr=gy0, y1_fr=gy1, x0_fr=gx0, x1_fr=gx1,
+                    downsample=_ds,
+                )
+                if int(_fg.sum()) < 32:
+                    return None
+                _ref = _canvas_channel_roi(ref_ci.path, int(ref_ch_idx), _ref_shape_yx, gy0, gy1, gx0, gx1)
+                _mov = _translated_moving_tile(gy0, gy1, gx0, gx1, dy_fr, dx_fr)
+                _use = _fg.astype(bool, copy=False)
+                _a = _ref[_use].astype(np.float64, copy=False)
+                _b = _mov[_use].astype(np.float64, copy=False)
+                return (
+                    int(_a.size),
+                    float(_a.sum()),
+                    float(_b.sum()),
+                    float(np.sum(_a * _a)),
+                    float(np.sum(_b * _b)),
+                    float(np.sum(_a * _b)),
+                    float(time.perf_counter() - _t0),
+                )
+
+            def _corr_from_stats(
+                n: int,
+                sum_a: float,
+                sum_b: float,
+                sum_aa: float,
+                sum_bb: float,
+                sum_ab: float,
+            ) -> float:
+                if n < 32:
                     return -1.0
-                _da = _sum_aa - (_sum_a * _sum_a / float(_n))
-                _db = _sum_bb - (_sum_b * _sum_b / float(_n))
+                _da = sum_aa - (sum_a * sum_a / float(n))
+                _db = sum_bb - (sum_b * sum_b / float(n))
                 if _da <= 1e-8 or _db <= 1e-8:
                     return -1.0
-                return float((_sum_ab - (_sum_a * _sum_b / float(_n))) / math.sqrt(_da * _db))
+                return float((sum_ab - (sum_a * sum_b / float(n))) / math.sqrt(_da * _db))
 
             def _tile_tent(h: int, w: int) -> np.ndarray:
                 _tent_y = np.minimum(
@@ -2692,33 +2708,89 @@ def merge_cycles_to_ome_tiff(
                 dy_fr: float,
                 dx_fr: float,
                 island_label: int,
-            ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int] | None:
+            ) -> tuple[str, dict[str, float], np.ndarray | None, np.ndarray | None, np.ndarray | None, int, int, int, int]:
+                _t_total = time.perf_counter()
                 _check_cancel(cancel_cb)
                 _th, _tw = int(gy1) - int(gy0), int(gx1) - int(gx0)
+                _t = time.perf_counter()
                 _island_tile = _upsample_ds_mask_to_local(
                     islands_ds, label=int(island_label),
                     y0_fr=gy0, y1_fr=gy1, x0_fr=gx0, x1_fr=gx1,
                     downsample=_ds,
                 )
+                _mask_s = time.perf_counter() - _t
                 if int(_island_tile.sum()) < _min_fg_px:
-                    return None
+                    return (
+                        "empty",
+                        {"total": time.perf_counter() - _t_total, "mask": _mask_s},
+                        None, None, None,
+                        int(gy0), int(gy1), int(gx0), int(gx1),
+                    )
+                _t = time.perf_counter()
                 _ref_crop = _canvas_channel_roi(ref_ci.path, int(ref_ch_idx), _ref_shape_yx, gy0, gy1, gx0, gx1)
+                _ref_s = time.perf_counter() - _t
+                _t = time.perf_counter()
                 _mov_crop = _translated_moving_tile(gy0, gy1, gx0, gx1, dy_fr, dx_fr)
+                _mov_s = time.perf_counter() - _t
+                _t = time.perf_counter()
                 _tile_corr = _masked_corr_score(_ref_crop, _mov_crop, _island_tile)
+                _tile_corr_s = time.perf_counter() - _t
                 if _tile_corr >= float(elastic_touchup_skip_corr):
-                    return None
+                    return (
+                        "skip_corr",
+                        {
+                            "total": time.perf_counter() - _t_total,
+                            "mask": _mask_s,
+                            "ref": _ref_s,
+                            "mov": _mov_s,
+                            "tile_corr": _tile_corr_s,
+                        },
+                        None, None, None,
+                        int(gy0), int(gy1), int(gx0), int(gx1),
+                    )
+                _t = time.perf_counter()
                 _res = _run_elastix_bspline(
                     _ref_crop, _mov_crop, _island_tile,
                     grid_spacing_px=int(elastic_touchup_bspline_spacing),
                     max_iterations=int(elastic_touchup_max_iterations),
                     max_step_length=float(elastic_touchup_max_step_length),
                 )
+                _elastix_s = time.perf_counter() - _t
                 if _res is None:
-                    return None
+                    return (
+                        "elastix_failed",
+                        {
+                            "total": time.perf_counter() - _t_total,
+                            "mask": _mask_s,
+                            "ref": _ref_s,
+                            "mov": _mov_s,
+                            "tile_corr": _tile_corr_s,
+                            "elastix": _elastix_s,
+                        },
+                        None, None, None,
+                        int(gy0), int(gy1), int(gx0), int(gx1),
+                    )
                 _edy, _edx = _res
+                _t = time.perf_counter()
                 _tent = _tile_tent(_th, _tw)
                 _tent *= _island_tile.astype(np.float32, copy=False)
-                return _edy * _tent, _edx * _tent, _tent, int(gy0), int(gy1), int(gx0), int(gx1)
+                _edy_w = _edy * _tent
+                _edx_w = _edx * _tent
+                _weight_s = time.perf_counter() - _t
+                return (
+                    "ok",
+                    {
+                        "total": time.perf_counter() - _t_total,
+                        "mask": _mask_s,
+                        "ref": _ref_s,
+                        "mov": _mov_s,
+                        "tile_corr": _tile_corr_s,
+                        "elastix": _elastix_s,
+                        "weight": _weight_s,
+                    },
+                    _edy_w, _edx_w, _tent,
+                    int(gy0), int(gy1), int(gx0), int(gx1),
+                )
 
             _n_islands_done = 0
             _n_tiles_submitted = 0
@@ -2729,6 +2801,16 @@ def merge_cycles_to_ome_tiff(
             _current_island_idx = 0
             _pending: set[Future] = set()
             _max_pending = max(_n_elastic_workers * 2, _n_elastic_workers + 4)
+            _timing_corr_wall_s = 0.0
+            _timing_corr_task_s = 0.0
+            _timing_tile_total_s = 0.0
+            _timing_tile_mask_s = 0.0
+            _timing_tile_ref_s = 0.0
+            _timing_tile_mov_s = 0.0
+            _timing_tile_corr_s = 0.0
+            _timing_tile_elastix_s = 0.0
+            _timing_tile_weight_s = 0.0
+            _timing_accum_s = 0.0
 
             def _emit_elastic_tile_progress(detail: str = "") -> None:
                 if progress_event_cb is None:
@@ -2752,6 +2834,9 @@ def merge_cycles_to_ome_tiff(
 
             def _drain_completed(*, wait_for_one: bool) -> None:
                 nonlocal _pending, _n_tiles_completed, _n_tiles_ok, _n_tiles_failed
+                nonlocal _timing_tile_total_s, _timing_tile_mask_s, _timing_tile_ref_s
+                nonlocal _timing_tile_mov_s, _timing_tile_corr_s, _timing_tile_elastix_s
+                nonlocal _timing_tile_weight_s, _timing_accum_s
                 if not _pending:
                     return
                 if wait_for_one:
@@ -2770,17 +2855,102 @@ def merge_cycles_to_ome_tiff(
                     _check_cancel(cancel_cb)
                     _res = _fut.result()
                     _n_tiles_completed += 1
-                    if _res is None:
+                    _status, _timings, _edy_w, _edx_w, _wt, _gy0, _gy1, _gx0, _gx1 = _res
+                    _timing_tile_total_s += float(_timings.get("total", 0.0))
+                    _timing_tile_mask_s += float(_timings.get("mask", 0.0))
+                    _timing_tile_ref_s += float(_timings.get("ref", 0.0))
+                    _timing_tile_mov_s += float(_timings.get("mov", 0.0))
+                    _timing_tile_corr_s += float(_timings.get("tile_corr", 0.0))
+                    _timing_tile_elastix_s += float(_timings.get("elastix", 0.0))
+                    _timing_tile_weight_s += float(_timings.get("weight", 0.0))
+                    if _status != "ok" or _edy_w is None or _edx_w is None or _wt is None:
                         _n_tiles_failed += 1
                         _emit_elastic_tile_progress()
                         continue
-                    _edy_w, _edx_w, _wt, _gy0, _gy1, _gx0, _gx1 = _res
+                    _t_accum = time.perf_counter()
                     _dy_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dy_sum[_gy0:_gy1, _gx0:_gx1]) + _edy_w
                     _dx_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dx_sum[_gy0:_gy1, _gx0:_gx1]) + _edx_w
                     _wt_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_wt_sum[_gy0:_gy1, _gx0:_gx1]) + _wt
+                    _timing_accum_s += float(time.perf_counter() - _t_accum)
                     _n_tiles_ok += 1
                     del _edy_w, _edx_w, _wt
                     _emit_elastic_tile_progress()
+
+            def _stream_island_corr_parallel(reg: _RegionTransform, dy_fr: float, dx_fr: float) -> float:
+                nonlocal _timing_corr_wall_s, _timing_corr_task_s
+                _t_corr_wall = time.perf_counter()
+                _y0, _y1, _x0, _x1 = _island_bbox_fr(reg)
+                _tiles_iter = iter(_iter_tiles(_y0, _y1, _x0, _x1, overlap=False))
+                _corr_pending: set[Future] = set()
+                _corr_max_pending = max(_n_elastic_workers * 2, _n_elastic_workers + 4)
+                _corr_submitted = 0
+                _corr_completed = 0
+                _n = 0
+                _sum_a = _sum_b = _sum_aa = _sum_bb = _sum_ab = 0.0
+
+                def _submit_until_full() -> None:
+                    nonlocal _corr_submitted
+                    while len(_corr_pending) < _corr_max_pending:
+                        try:
+                            _gy0, _gy1, _gx0, _gx1 = next(_tiles_iter)
+                        except StopIteration:
+                            return
+                        _corr_pending.add(_pool.submit(
+                            _corr_tile_stats,
+                            _gy0, _gy1, _gx0, _gx1,
+                            dy_fr, dx_fr,
+                        ))
+                        _corr_submitted += 1
+
+                _submit_until_full()
+                if _corr_submitted > 0:
+                    _emit_elastic_tile_progress(f"scanning island correlation tiles={_corr_submitted}")
+
+                try:
+                    while _corr_pending:
+                        _check_cancel(cancel_cb)
+                        _done, _ = wait(_corr_pending, timeout=0.25, return_when=FIRST_COMPLETED)
+                        if not _done:
+                            if _pending:
+                                _drain_completed(wait_for_one=False)
+                            _emit_elastic_tile_progress(
+                                f"scanning island correlation {_corr_completed}/{_corr_submitted}"
+                            )
+                            continue
+                        for _fut in _done:
+                            _corr_pending.discard(_fut)
+                            _res = _fut.result()
+                            _corr_completed += 1
+                            if _res is None:
+                                continue
+                            _tn, _ta, _tb, _taa, _tbb, _tab, _task_s = _res
+                            _n += int(_tn)
+                            _sum_a += float(_ta)
+                            _sum_b += float(_tb)
+                            _sum_aa += float(_taa)
+                            _sum_bb += float(_tbb)
+                            _sum_ab += float(_tab)
+                            _timing_corr_task_s += float(_task_s)
+                        _submit_until_full()
+                        _drain_completed(wait_for_one=False)
+                except BaseException:
+                    _cancel_futures(_corr_pending)
+                    raise
+
+                _emit_elastic_tile_progress(
+                    f"island correlation scanned {_corr_completed}/{_corr_submitted}"
+                )
+                _corr = _corr_from_stats(_n, _sum_a, _sum_b, _sum_aa, _sum_bb, _sum_ab)
+                _corr_wall_s = float(time.perf_counter() - _t_corr_wall)
+                _timing_corr_wall_s += _corr_wall_s
+                if _debug_elastic_field:
+                    print(
+                        f"[elastic]  island {_current_island_idx}/{len(regs_ds)} "
+                        f"correlation timing: wall={_corr_wall_s:.3f}s "
+                        f"tiles={_corr_completed}/{_corr_submitted} corr={_corr:.4f}",
+                        flush=True,
+                    )
+                return _corr
 
             _pool = ThreadPoolExecutor(max_workers=_n_elastic_workers)
             try:
@@ -2792,7 +2962,7 @@ def merge_cycles_to_ome_tiff(
                     _dx_fr = float(_ereg.shift_x) * float(_ds)
                     if not np.isfinite(_dy_fr) or not np.isfinite(_dx_fr):
                         _dy_fr, _dx_fr = _base_dy_fr, _base_dx_fr
-                    _corr = _stream_island_corr(_ereg, _dy_fr, _dx_fr)
+                    _corr = _stream_island_corr_parallel(_ereg, _dy_fr, _dx_fr)
                     _iy0, _iy1, _ix0, _ix1 = _island_bbox_fr(_ereg)
                     if _debug_elastic_field:
                         _verdict = "SKIP corr>threshold" if _corr > float(elastic_touchup_skip_corr) else "queueing tiles"
@@ -2835,10 +3005,39 @@ def merge_cycles_to_ome_tiff(
                 _pool.shutdown(wait=True, cancel_futures=False)
 
             if _debug_elastic_field:
+                _timing_tile_other_s = max(
+                    0.0,
+                    _timing_tile_total_s
+                    - _timing_tile_mask_s
+                    - _timing_tile_ref_s
+                    - _timing_tile_mov_s
+                    - _timing_tile_corr_s
+                    - _timing_tile_elastix_s
+                    - _timing_tile_weight_s,
+                )
                 print(
                     f"[elastic] cycle {cycle}: {_n_tiles_ok}/{_n_tiles_submitted} tile(s) "
                     f"produced island-scoped corrections "
                     f"({_n_tiles_failed} skipped/failed after submission)",
+                    flush=True,
+                )
+                print(
+                    f"[elastic] cycle {cycle}: timing wall-ish phases: "
+                    f"corr_scan_wall={_timing_corr_wall_s:.3f}s "
+                    f"accumulator_write={_timing_accum_s:.3f}s",
+                    flush=True,
+                )
+                print(
+                    f"[elastic] cycle {cycle}: timing summed worker phases: "
+                    f"corr_scan_worker={_timing_corr_task_s:.3f}s "
+                    f"tile_total={_timing_tile_total_s:.3f}s "
+                    f"mask={_timing_tile_mask_s:.3f}s "
+                    f"ref_roi={_timing_tile_ref_s:.3f}s "
+                    f"moving_roi_translate={_timing_tile_mov_s:.3f}s "
+                    f"tile_corr={_timing_tile_corr_s:.3f}s "
+                    f"elastix={_timing_tile_elastix_s:.3f}s "
+                    f"weight={_timing_tile_weight_s:.3f}s "
+                    f"other={_timing_tile_other_s:.3f}s",
                     flush=True,
                 )
 

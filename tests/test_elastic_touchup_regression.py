@@ -197,6 +197,10 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
                 )
 
         tile_events = [ev for ev in events_w3 if ev.get("phase") == "elastic_touchup_tile"]
+        corr_scan_events = [
+            ev for ev in tile_events
+            if "scanning island correlation" in str(ev.get("msg", ""))
+        ]
         submitted_events = [ev for ev in tile_events if "submitted tile" in str(ev.get("msg", ""))]
         completed_events = [
             ev for ev in tile_events
@@ -204,6 +208,7 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
         ]
 
         self.assertGreaterEqual(fixed.shape[0] // 96, 4)
+        self.assertGreaterEqual(len(corr_scan_events), 1)
         self.assertGreaterEqual(len(submitted_events), 6)
         self.assertGreaterEqual(len(completed_events), 1)
         self.assertGreater(corr_w1, pre_corr + 0.05)
