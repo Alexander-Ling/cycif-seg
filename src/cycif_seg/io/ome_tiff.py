@@ -1093,6 +1093,25 @@ def _raw_memmap(path: str, shape: tuple[int, ...], dtype: np.dtype, mode: str = 
     return np.memmap(path, dtype=np.dtype(dtype), mode=mode, shape=tuple(int(v) for v in shape))
 
 
+def _iter_cyx_tiles(
+    arr_cyx,
+    *,
+    tile_size: int,
+    cancel_cb: Callable[[], None] | None = None,
+):
+    """Yield one TIFF tile at a time from a CYX array-like source."""
+    c, y, x = (int(arr_cyx.shape[0]), int(arr_cyx.shape[1]), int(arr_cyx.shape[2]))
+    tile_size = max(1, int(tile_size))
+    for ci in range(c):
+        for y0 in range(0, y, tile_size):
+            y1 = min(y, y0 + tile_size)
+            for x0 in range(0, x, tile_size):
+                if cancel_cb is not None:
+                    cancel_cb()
+                x1 = min(x, x0 + tile_size)
+                yield np.asarray(arr_cyx[ci, y0:y1, x0:x1])
+
+
 def _expected_pyramid_level_shapes(shape_cyx: tuple[int, int, int], subifds: int) -> list[tuple[int, int, int]]:
     c, y, x = (int(shape_cyx[0]), int(shape_cyx[1]), int(shape_cyx[2]))
     shapes: list[tuple[int, int, int]] = []
@@ -1395,7 +1414,14 @@ def convert_flat_ome_to_pyramidal(
             if base_resolution is not None and base_resolutionunit is not None:
                 write_kwargs['resolution'] = base_resolution
                 write_kwargs['resolutionunit'] = base_resolutionunit
-            tif.write(src_cyx, subifds=int(subifds), metadata=metadata, **write_kwargs)
+            tif.write(
+                _iter_cyx_tiles(src_cyx, tile_size=int(tile_size), cancel_cb=_check_cancel),
+                shape=(int(c), int(y), int(x)),
+                dtype=dtype,
+                subifds=int(subifds),
+                metadata=metadata,
+                **write_kwargs,
+            )
             for level, lvl in enumerate(level_arrays, start=1):
                 _check_cancel()
                 _step(f'Writing pyramid level {level}/{subifds}', 'pyramid_write_level')
@@ -1708,7 +1734,14 @@ def convert_registered_zarr_to_pyramidal(
             if base_resolution is not None and base_resolutionunit is not None:
                 write_kwargs['resolution'] = base_resolution
                 write_kwargs['resolutionunit'] = base_resolutionunit
-            tif.write(src_cyx, subifds=int(subifds), metadata=metadata, **write_kwargs)
+            tif.write(
+                _iter_cyx_tiles(src_cyx, tile_size=int(tile_size), cancel_cb=_check_cancel),
+                shape=(int(c), int(y), int(x)),
+                dtype=dtype,
+                subifds=int(subifds),
+                metadata=metadata,
+                **write_kwargs,
+            )
             for level, lvl in enumerate(level_arrays, start=1):
                 _check_cancel()
                 _step(f'Writing pyramid level {level}/{subifds}', 'pyramid_write_level')

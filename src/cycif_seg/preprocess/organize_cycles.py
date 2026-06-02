@@ -2721,67 +2721,124 @@ def merge_cycles_to_ome_tiff(
                 return _edy * _tent, _edx * _tent, _tent, int(gy0), int(gy1), int(gx0), int(gx1)
 
             _n_islands_done = 0
+            _n_tiles_submitted = 0
+            _n_tiles_completed = 0
             _n_tiles_ok = 0
-            _n_tiles_tried = 0
-            for _ereg in regs_ds:
-                _check_cancel(cancel_cb)
-                _dy_fr = float(_ereg.shift_y) * float(_ds)
-                _dx_fr = float(_ereg.shift_x) * float(_ds)
-                if not np.isfinite(_dy_fr) or not np.isfinite(_dx_fr):
-                    _dy_fr, _dx_fr = _base_dy_fr, _base_dx_fr
-                _corr = _stream_island_corr(_ereg, _dy_fr, _dx_fr)
-                _iy0, _iy1, _ix0, _ix1 = _island_bbox_fr(_ereg)
-                if _debug_elastic_field:
-                    _verdict = "SKIP corr>threshold" if _corr > float(elastic_touchup_skip_corr) else "processing"
-                    print(
-                        f"[elastic]  island {_n_islands_done + 1}/{len(regs_ds)} "
-                        f"label={int(_ereg.label)} bbox=({_iy0},{_iy1},{_ix0},{_ix1}) "
-                        f"corr={_corr:.4f} shift=({_dy_fr:.1f},{_dx_fr:.1f}) -> {_verdict}",
-                        flush=True,
-                    )
-                if _corr > float(elastic_touchup_skip_corr):
-                    _n_islands_done += 1
-                    continue
-                _tiles = list(_iter_tiles(_iy0, _iy1, _ix0, _ix1, overlap=True))
-                _n_tiles_tried += len(_tiles)
-                _futs: list[Future] = []
-                _pool = ThreadPoolExecutor(max_workers=_n_elastic_workers)
-                try:
-                    _futs = [
-                        _pool.submit(_run_elastic_tile, _gy0, _gy1, _gx0, _gx1, _dy_fr, _dx_fr, int(_ereg.label))
-                        for _gy0, _gy1, _gx0, _gx1 in _tiles
-                    ]
-                    for _fut in _iter_completed_futures(_futs, cancel_cb):
+            _n_tiles_failed = 0
+            _elastic_progress_started = time.monotonic()
+            _current_island_idx = 0
+            _pending: set[Future] = set()
+            _max_pending = max(_n_elastic_workers * 2, _n_elastic_workers + 4)
+
+            def _emit_elastic_tile_progress(detail: str = "") -> None:
+                if progress_event_cb is None:
+                    return
+                _running = len(_pending)
+                _elapsed = int(max(0.0, time.monotonic() - _elastic_progress_started))
+                _detail = f"  {detail}" if detail else ""
+                progress_event_cb({
+                    "msg": (
+                        f"7. elastic touch-up Cycle {cycle}: "
+                        f"island {_current_island_idx}/{len(regs_ds)}  "
+                        f"tiles completed={_n_tiles_completed}/{_n_tiles_submitted}  "
+                        f"ok={_n_tiles_ok}  skipped/failed={_n_tiles_failed}  "
+                        f"running={_running}  elapsed={_elapsed}s{_detail}"
+                    ),
+                    "phase": "elastic_touchup_tile",
+                    "idx": int(_n_tiles_completed),
+                    "n": int(max(1, _n_tiles_submitted)),
+                    "cycle": int(cycle),
+                })
+
+            def _drain_completed(*, wait_for_one: bool) -> None:
+                nonlocal _pending, _n_tiles_completed, _n_tiles_ok, _n_tiles_failed
+                if not _pending:
+                    return
+                if wait_for_one:
+                    while True:
                         _check_cancel(cancel_cb)
-                        _res = _fut.result()
-                        if _res is None:
-                            continue
-                        _edy_w, _edx_w, _wt, _gy0, _gy1, _gx0, _gx1 = _res
-                        _dy_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dy_sum[_gy0:_gy1, _gx0:_gx1]) + _edy_w
-                        _dx_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dx_sum[_gy0:_gy1, _gx0:_gx1]) + _edx_w
-                        _wt_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_wt_sum[_gy0:_gy1, _gx0:_gx1]) + _wt
-                        _n_tiles_ok += 1
-                        del _edy_w, _edx_w, _wt
-                except BaseException:
-                    _cancel_futures(_futs)
-                    _pool.shutdown(wait=False, cancel_futures=True)
-                    raise
+                        _done, _ = wait(_pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                        if _done:
+                            break
+                        _emit_elastic_tile_progress("waiting for running tiles")
                 else:
-                    _pool.shutdown(wait=True, cancel_futures=False)
-                _n_islands_done += 1
-                if progress_event_cb is not None:
-                    progress_event_cb({
-                        "msg": (
-                            f"7. elastic touch-up Cycle {cycle}: "
-                            f"island {_n_islands_done}/{len(regs_ds)}  tiles_ok={_n_tiles_ok}"
-                        ),
-                        "phase": "elastic_touchup_island",
-                    })
+                    _done = {_f for _f in list(_pending) if _f.done()}
+                    if not _done:
+                        return
+                for _fut in _done:
+                    _pending.discard(_fut)
+                    _check_cancel(cancel_cb)
+                    _res = _fut.result()
+                    _n_tiles_completed += 1
+                    if _res is None:
+                        _n_tiles_failed += 1
+                        _emit_elastic_tile_progress()
+                        continue
+                    _edy_w, _edx_w, _wt, _gy0, _gy1, _gx0, _gx1 = _res
+                    _dy_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dy_sum[_gy0:_gy1, _gx0:_gx1]) + _edy_w
+                    _dx_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dx_sum[_gy0:_gy1, _gx0:_gx1]) + _edx_w
+                    _wt_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_wt_sum[_gy0:_gy1, _gx0:_gx1]) + _wt
+                    _n_tiles_ok += 1
+                    del _edy_w, _edx_w, _wt
+                    _emit_elastic_tile_progress()
+
+            _pool = ThreadPoolExecutor(max_workers=_n_elastic_workers)
+            try:
+                for _ereg in regs_ds:
+                    _check_cancel(cancel_cb)
+                    _drain_completed(wait_for_one=False)
+                    _current_island_idx = _n_islands_done + 1
+                    _dy_fr = float(_ereg.shift_y) * float(_ds)
+                    _dx_fr = float(_ereg.shift_x) * float(_ds)
+                    if not np.isfinite(_dy_fr) or not np.isfinite(_dx_fr):
+                        _dy_fr, _dx_fr = _base_dy_fr, _base_dx_fr
+                    _corr = _stream_island_corr(_ereg, _dy_fr, _dx_fr)
+                    _iy0, _iy1, _ix0, _ix1 = _island_bbox_fr(_ereg)
+                    if _debug_elastic_field:
+                        _verdict = "SKIP corr>threshold" if _corr > float(elastic_touchup_skip_corr) else "queueing tiles"
+                        print(
+                            f"[elastic]  island {_n_islands_done + 1}/{len(regs_ds)} "
+                            f"label={int(_ereg.label)} bbox=({_iy0},{_iy1},{_ix0},{_ix1}) "
+                            f"corr={_corr:.4f} shift=({_dy_fr:.1f},{_dx_fr:.1f}) -> {_verdict}",
+                            flush=True,
+                        )
+                    if _corr > float(elastic_touchup_skip_corr):
+                        _n_islands_done += 1
+                        _emit_elastic_tile_progress("island skipped by correlation")
+                        continue
+                    for _gy0, _gy1, _gx0, _gx1 in _iter_tiles(_iy0, _iy1, _ix0, _ix1, overlap=True):
+                        _check_cancel(cancel_cb)
+                        _pending.add(_pool.submit(
+                            _run_elastic_tile,
+                            _gy0, _gy1, _gx0, _gx1,
+                            _dy_fr, _dx_fr,
+                            int(_ereg.label),
+                        ))
+                        _n_tiles_submitted += 1
+                        _emit_elastic_tile_progress("submitted tile")
+                        if len(_pending) >= _max_pending:
+                            _drain_completed(wait_for_one=True)
+                    _n_islands_done += 1
+                    _drain_completed(wait_for_one=False)
+                    _emit_elastic_tile_progress("island queued")
+                while _pending:
+                    _check_cancel(cancel_cb)
+                    _drain_completed(wait_for_one=True)
+                    _emit_elastic_tile_progress("draining queued tiles")
+                _current_island_idx = len(regs_ds)
+                _emit_elastic_tile_progress("complete")
+            except BaseException:
+                _cancel_futures(_pending)
+                _pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                _pool.shutdown(wait=True, cancel_futures=False)
 
             if _debug_elastic_field:
                 print(
-                    f"[elastic] cycle {cycle}: {_n_tiles_ok}/{_n_tiles_tried} tile(s) "
-                    f"produced island-scoped corrections",
+                    f"[elastic] cycle {cycle}: {_n_tiles_ok}/{_n_tiles_submitted} tile(s) "
+                    f"produced island-scoped corrections "
+                    f"({_n_tiles_failed} skipped/failed after submission)",
                     flush=True,
                 )
 

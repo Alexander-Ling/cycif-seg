@@ -870,9 +870,14 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         "identify_islands": f"registering {cycle_txt}: foreground islands",
                         "foreground_island_refine": f"registering {cycle_txt}: island refinement",
                         "elastic_touchup_island": f"elastic touch-up {cycle_txt}",
+                        "elastic_touchup_tile": f"elastic touch-up {cycle_txt}",
                         "write_cycle": f"writing {cycle_txt}",
                         "pyramid": "building pyramid",
                     }
+                    if phase == "elastic_touchup_tile":
+                        msg = str(ev.get("msg") or "")
+                        if msg:
+                            return f"Current sample: {s.name} - {msg}"
                     action = action_by_phase.get(phase, "working")
                     return f"Current sample: {s.name} - {action} ({max(0, min(int(idx), int(n)))}/{int(n)})"
 
@@ -900,7 +905,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                     if n > 0 and phase in top_level_phases:
                         self.sig_set_cycle_progress.emit(int(idx), int(n))
                         self.sig_set_cycle_label.emit(_progress_label(ev, idx, n))
-                    elif phase == "elastic_touchup_island":
+                    elif phase in {"elastic_touchup_island", "elastic_touchup_tile"}:
                         self.sig_set_cycle_label.emit(_progress_label(ev, idx, n))
 
                 # Run merge

@@ -269,6 +269,7 @@ def _run_registration(
     pyramidal_output: bool,
     elastic_touchup: bool = True,
     n_workers: int = 1,
+    elastic_touchup_workers: int | None = None,
     force: bool = False,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
@@ -307,7 +308,7 @@ def _run_registration(
             strip_height=strip_height,
             pyramidal_output=pyramidal_output,
             elastic_touchup=elastic_touchup,
-            elastic_touchup_workers=n_workers,
+            elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
             progress_cb=lambda msg: print(f"  {msg}"),
         )
         print(f"  Done. Merged output: {output_path}")
@@ -379,7 +380,7 @@ def _run_registration(
         strip_height=strip_height,
         pyramidal_output=pyramidal_output,
         elastic_touchup=elastic_touchup,
-        elastic_touchup_workers=n_workers,
+        elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
         resume_flat_output=bool(output_path.exists()),
         completed_cycles=completed_cycles,
         registration_progress_path=str(resume_state["manifest_path"]),
@@ -435,7 +436,7 @@ def _build_parser() -> argparse.ArgumentParser:
     stitch_grp.add_argument("--stitch-channel", type=int, default=0, metavar="INT",
                              help="Channel index used for tile alignment (default: 0 = DAPI)")
     stitch_grp.add_argument("--n-workers", type=int, default=1, metavar="INT",
-                             help="Parallel worker threads for stitching (default: 1)")
+                             help="Parallel workers for stitching, registration writes, pyramid build, and elastic touch-up (default: 1)")
     stitch_grp.add_argument("--tile-regex", default=None, metavar="REGEX",
                              help="Override default tile filename regex pattern")
 
@@ -449,6 +450,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Process registration in horizontal strips of this height (reduces RAM)")
     reg_grp.add_argument("--elastic-touchup", default=True, action=argparse.BooleanOptionalAction,
                           help="Apply B-spline elastic touch-up after rigid registration (default: on)")
+    reg_grp.add_argument("--elastic-touchup-workers", type=int, default=None, metavar="INT",
+                          help="Override worker count for elastic touch-up only (default: --n-workers)")
 
     misc_grp = p.add_argument_group("misc")
     misc_grp.add_argument("--no-pyramidal", action="store_true",
@@ -583,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
             pyramidal_output=pyramidal,
             elastic_touchup=args.elastic_touchup,
             n_workers=args.n_workers,
+            elastic_touchup_workers=args.elastic_touchup_workers,
             force=args.force_register,
         )
     except Exception as exc:
