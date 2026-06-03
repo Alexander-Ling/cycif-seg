@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(Get-Item \"C:\\\\Users\\\\Alex\\\\source\\\\repos\\\\Alexander-Ling\\\\cycif-seg\\\\src\\\\cycif_seg\\\\io\\\\ome_tiff.py\")",
-      "Bash(Select-Object -ExpandProperty Length)",
-      "PowerShell(Get-Content *)"
-    ]
-  }
-}
