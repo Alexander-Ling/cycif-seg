@@ -2588,6 +2588,26 @@ def merge_cycles_to_ome_tiff(
                         if _gx1 > _gx0:
                             yield _gy0, _gy1, _gx0, _gx1
 
+            def _iter_tiles_by_start(
+                y_start0: int,
+                y_start1: int,
+                y_clip1: int,
+                x0: int,
+                x1: int,
+                *,
+                overlap: bool,
+            ) -> Iterable[tuple[int, int, int, int]]:
+                _step_y = _stride_h if overlap else _et_tile_h
+                _step_x = _stride_w if overlap else _et_tile_w
+                for _gy0 in range(int(y_start0), int(y_start1), max(1, _step_y)):
+                    _gy1 = min(int(y_clip1), _gy0 + _et_tile_h)
+                    if _gy1 <= _gy0:
+                        continue
+                    for _gx0 in range(int(x0), int(x1), max(1, _step_x)):
+                        _gx1 = min(int(x1), _gx0 + _et_tile_w)
+                        if _gx1 > _gx0:
+                            yield _gy0, _gy1, _gx0, _gx1
+
             def _island_bbox_fr(reg: _RegionTransform) -> tuple[int, int, int, int]:
                 _y0 = max(0, int(reg.bbox[0]) * _ds)
                 _y1 = min(_canvas_h, int(reg.bbox[1]) * _ds)
@@ -2811,6 +2831,8 @@ def merge_cycles_to_ome_tiff(
             _timing_tile_elastix_s = 0.0
             _timing_tile_weight_s = 0.0
             _timing_accum_s = 0.0
+            _timing_field_write_s = 0.0
+            _timing_provider_read_s = 0.0
 
             def _emit_elastic_tile_progress(detail: str = "") -> None:
                 if progress_event_cb is None:
@@ -2832,7 +2854,14 @@ def merge_cycles_to_ome_tiff(
                     "cycle": int(cycle),
                 })
 
-            def _drain_completed(*, wait_for_one: bool) -> None:
+            def _drain_completed(
+                *,
+                wait_for_one: bool,
+                acc_y0: int,
+                dy_sum_ram: np.ndarray,
+                dx_sum_ram: np.ndarray,
+                wt_sum_ram: np.ndarray,
+            ) -> None:
                 nonlocal _pending, _n_tiles_completed, _n_tiles_ok, _n_tiles_failed
                 nonlocal _timing_tile_total_s, _timing_tile_mask_s, _timing_tile_ref_s
                 nonlocal _timing_tile_mov_s, _timing_tile_corr_s, _timing_tile_elastix_s
@@ -2868,13 +2897,38 @@ def merge_cycles_to_ome_tiff(
                         _emit_elastic_tile_progress()
                         continue
                     _t_accum = time.perf_counter()
-                    _dy_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dy_sum[_gy0:_gy1, _gx0:_gx1]) + _edy_w
-                    _dx_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_dx_sum[_gy0:_gy1, _gx0:_gx1]) + _edx_w
-                    _wt_sum[_gy0:_gy1, _gx0:_gx1] = np.asarray(_wt_sum[_gy0:_gy1, _gx0:_gx1]) + _wt
+                    _ry0 = int(_gy0) - int(acc_y0)
+                    _ry1 = int(_gy1) - int(acc_y0)
+                    if _ry0 < 0 or _ry1 > dy_sum_ram.shape[0]:
+                        raise RuntimeError(
+                            "Elastic tile result fell outside the active strip accumulator window. "
+                            f"tile=({_gy0},{_gy1},{_gx0},{_gx1}) window_y=({acc_y0},{acc_y0 + dy_sum_ram.shape[0]})"
+                        )
+                    dy_sum_ram[_ry0:_ry1, _gx0:_gx1] += _edy_w
+                    dx_sum_ram[_ry0:_ry1, _gx0:_gx1] += _edx_w
+                    wt_sum_ram[_ry0:_ry1, _gx0:_gx1] += _wt
                     _timing_accum_s += float(time.perf_counter() - _t_accum)
                     _n_tiles_ok += 1
                     del _edy_w, _edx_w, _wt
                     _emit_elastic_tile_progress()
+
+            def _flush_accumulator_window(
+                acc_y0: int,
+                dy_sum_ram: np.ndarray,
+                dx_sum_ram: np.ndarray,
+                wt_sum_ram: np.ndarray,
+            ) -> None:
+                nonlocal _timing_field_write_s
+                _check_cancel(cancel_cb)
+                if dy_sum_ram.size == 0 or not np.any(wt_sum_ram > 0):
+                    return
+                _t_write = time.perf_counter()
+                _ay0 = int(acc_y0)
+                _ay1 = _ay0 + int(dy_sum_ram.shape[0])
+                _dy_sum[_ay0:_ay1, :] = np.asarray(_dy_sum[_ay0:_ay1, :], dtype=np.float32) + dy_sum_ram
+                _dx_sum[_ay0:_ay1, :] = np.asarray(_dx_sum[_ay0:_ay1, :], dtype=np.float32) + dx_sum_ram
+                _wt_sum[_ay0:_ay1, :] = np.asarray(_wt_sum[_ay0:_ay1, :], dtype=np.float32) + wt_sum_ram
+                _timing_field_write_s += float(time.perf_counter() - _t_write)
 
             def _stream_island_corr_parallel(reg: _RegionTransform, dy_fr: float, dx_fr: float) -> float:
                 nonlocal _timing_corr_wall_s, _timing_corr_task_s
@@ -2911,8 +2965,6 @@ def merge_cycles_to_ome_tiff(
                         _check_cancel(cancel_cb)
                         _done, _ = wait(_corr_pending, timeout=0.25, return_when=FIRST_COMPLETED)
                         if not _done:
-                            if _pending:
-                                _drain_completed(wait_for_one=False)
                             _emit_elastic_tile_progress(
                                 f"scanning island correlation {_corr_completed}/{_corr_submitted}"
                             )
@@ -2932,7 +2984,6 @@ def merge_cycles_to_ome_tiff(
                             _sum_ab += float(_tab)
                             _timing_corr_task_s += float(_task_s)
                         _submit_until_full()
-                        _drain_completed(wait_for_one=False)
                 except BaseException:
                     _cancel_futures(_corr_pending)
                     raise
@@ -2956,7 +3007,6 @@ def merge_cycles_to_ome_tiff(
             try:
                 for _ereg in regs_ds:
                     _check_cancel(cancel_cb)
-                    _drain_completed(wait_for_one=False)
                     _current_island_idx = _n_islands_done + 1
                     _dy_fr = float(_ereg.shift_y) * float(_ds)
                     _dx_fr = float(_ereg.shift_x) * float(_ds)
@@ -2976,25 +3026,49 @@ def merge_cycles_to_ome_tiff(
                         _n_islands_done += 1
                         _emit_elastic_tile_progress("island skipped by correlation")
                         continue
-                    for _gy0, _gy1, _gx0, _gx1 in _iter_tiles(_iy0, _iy1, _ix0, _ix1, overlap=True):
+                    for _win_y0 in range(_iy0, _iy1, _chunk_y):
                         _check_cancel(cancel_cb)
-                        _pending.add(_pool.submit(
-                            _run_elastic_tile,
-                            _gy0, _gy1, _gx0, _gx1,
-                            _dy_fr, _dx_fr,
-                            int(_ereg.label),
-                        ))
-                        _n_tiles_submitted += 1
-                        _emit_elastic_tile_progress("submitted tile")
-                        if len(_pending) >= _max_pending:
-                            _drain_completed(wait_for_one=True)
+                        _win_y1 = min(_iy1, _win_y0 + _chunk_y)
+                        _acc_y1 = min(_iy1, _win_y1 + _et_tile_h)
+                        _acc_h = max(0, int(_acc_y1) - int(_win_y0))
+                        if _acc_h <= 0:
+                            continue
+                        _dy_sum_ram = np.zeros((_acc_h, _canvas_w), dtype=np.float32)
+                        _dx_sum_ram = np.zeros((_acc_h, _canvas_w), dtype=np.float32)
+                        _wt_sum_ram = np.zeros((_acc_h, _canvas_w), dtype=np.float32)
+                        for _gy0, _gy1, _gx0, _gx1 in _iter_tiles_by_start(
+                            _win_y0, _win_y1, _iy1, _ix0, _ix1, overlap=True
+                        ):
+                            _check_cancel(cancel_cb)
+                            _pending.add(_pool.submit(
+                                _run_elastic_tile,
+                                _gy0, _gy1, _gx0, _gx1,
+                                _dy_fr, _dx_fr,
+                                int(_ereg.label),
+                            ))
+                            _n_tiles_submitted += 1
+                            _emit_elastic_tile_progress("submitted tile")
+                            if len(_pending) >= _max_pending:
+                                _drain_completed(
+                                    wait_for_one=True,
+                                    acc_y0=_win_y0,
+                                    dy_sum_ram=_dy_sum_ram,
+                                    dx_sum_ram=_dx_sum_ram,
+                                    wt_sum_ram=_wt_sum_ram,
+                                )
+                        while _pending:
+                            _check_cancel(cancel_cb)
+                            _drain_completed(
+                                wait_for_one=True,
+                                acc_y0=_win_y0,
+                                dy_sum_ram=_dy_sum_ram,
+                                dx_sum_ram=_dx_sum_ram,
+                                wt_sum_ram=_wt_sum_ram,
+                            )
+                        _flush_accumulator_window(_win_y0, _dy_sum_ram, _dx_sum_ram, _wt_sum_ram)
+                        del _dy_sum_ram, _dx_sum_ram, _wt_sum_ram
                     _n_islands_done += 1
-                    _drain_completed(wait_for_one=False)
                     _emit_elastic_tile_progress("island queued")
-                while _pending:
-                    _check_cancel(cancel_cb)
-                    _drain_completed(wait_for_one=True)
-                    _emit_elastic_tile_progress("draining queued tiles")
                 _current_island_idx = len(regs_ds)
                 _emit_elastic_tile_progress("complete")
             except BaseException:
@@ -3024,7 +3098,8 @@ def merge_cycles_to_ome_tiff(
                 print(
                     f"[elastic] cycle {cycle}: timing wall-ish phases: "
                     f"corr_scan_wall={_timing_corr_wall_s:.3f}s "
-                    f"accumulator_write={_timing_accum_s:.3f}s",
+                    f"accumulator_ram={_timing_accum_s:.3f}s "
+                    f"accumulator_zarr={_timing_field_write_s:.3f}s",
                     flush=True,
                 )
                 print(
@@ -3042,17 +3117,21 @@ def merge_cycles_to_ome_tiff(
                 )
 
             def _provider(out_y0: int, out_y1: int) -> tuple[np.ndarray, np.ndarray] | None:
+                nonlocal _timing_provider_read_s
                 _out_y0, _out_y1 = int(out_y0), int(out_y1)
                 if _out_y1 <= _out_y0:
                     return None
+                _t_read = time.perf_counter()
                 _wt_sl = np.asarray(_wt_sum[_out_y0:_out_y1, :], dtype=np.float32)
                 _nz = _wt_sl > 0
                 if not _nz.any():
+                    _timing_provider_read_s += float(time.perf_counter() - _t_read)
                     return None
                 _dy = np.asarray(_dy_sum[_out_y0:_out_y1, :], dtype=np.float32)
                 _dx = np.asarray(_dx_sum[_out_y0:_out_y1, :], dtype=np.float32)
                 _dy[_nz] /= _wt_sl[_nz]
                 _dx[_nz] /= _wt_sl[_nz]
+                _timing_provider_read_s += float(time.perf_counter() - _t_read)
                 return _dy, _dx
 
             setattr(_provider, "cleanup", _cleanup)
