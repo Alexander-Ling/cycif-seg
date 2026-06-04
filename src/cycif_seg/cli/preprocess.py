@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import builtins
 import json
+import re
 import sys
 import time
 import traceback
@@ -42,6 +43,42 @@ from cycif_seg.preprocess.organize_cycles import (
 def print(*args, **kwargs):  # type: ignore[override]
     kwargs.setdefault("flush", True)
     return builtins.print(*args, **kwargs)
+
+
+def _cycle_display_name(sample: BatchSample, path: str | Path, cycle: int) -> str:
+    p = Path(path)
+    sample_dir = Path(sample.input_dir).expanduser()
+    try:
+        sample_dir = sample_dir.resolve()
+        parent_path = p.parent.resolve()
+    except Exception:
+        parent_path = p.parent
+    parent = p.parent.name
+    if parent and parent_path != sample_dir:
+        return parent
+    return p.stem or str(int(cycle))
+
+
+def _cycle_display_map(sample: BatchSample, cycles_in: list[CycleInput]) -> dict[int, str]:
+    return {
+        int(ci.cycle): _cycle_display_name(sample, ci.path, int(ci.cycle))
+        for ci in cycles_in
+    }
+
+
+def _format_cycle_display(cycle: object, cycle_names: dict[int, str]) -> str:
+    cy = int(cycle)
+    return cycle_names.get(cy) or str(cy)
+
+
+def _rewrite_cycle_names(msg: str, cycle_names: dict[int, str]) -> str:
+    out = str(msg)
+    for cy, display in sorted(cycle_names.items(), key=lambda item: len(str(item[0])), reverse=True):
+        if display == str(cy):
+            continue
+        pat = re.compile(rf"\b(Cycle|cycle)\s+{re.escape(str(cy))}\b")
+        out = pat.sub(lambda m: f"{m.group(1)} {display}", out)
+    return out
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -221,12 +258,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "global_registration": "global translation",
             "foreground_mask": "foreground mask",
             "identify_islands": "foreground islands",
+            "region_refine": "region refinement",
+            "bad_region_refine": "bad region refinement",
             "foreground_island_refine": "island refinement",
             "elastic_touchup": "elastic touch-up",
             "elastic_touchup_island": "elastic touch-up (island)",
             "write_cycle": "writing",
             "pyramid": "building pyramid",
         }
+        cycle_names = _cycle_display_map(s, cycles_in)
 
         def _ev(ev: dict) -> None:
             phase = str(ev.get("phase") or "")
@@ -236,7 +276,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             n = int(ev.get("n") or 0)
             idx = int(ev.get("idx") or 0)
             label = _phase_labels.get(phase, phase)
-            cycle_txt = f" cycle {int(cycle)}" if cycle is not None else ""
+            cycle_txt = f" cycle {_format_cycle_display(cycle, cycle_names)}" if cycle is not None else ""
             progress_txt = f" ({idx}/{n})" if n > 0 else ""
             print(f"  {label}{cycle_txt}{progress_txt}", flush=True)
 
@@ -559,6 +599,7 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
     if not cycles_in:
         print("Error: no enabled cycles to register.", file=sys.stderr)
         return 1
+    cycle_names = _cycle_display_map(sample, cycles_in)
 
     out_path = Path(sample.output_path).expanduser().resolve()
     strip_height = (
@@ -613,7 +654,7 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
     start = time.monotonic()
 
     def _progress(msg: str) -> None:
-        print(f"  {msg}", flush=True)
+        print(f"  {_rewrite_cycle_names(msg, cycle_names)}", flush=True)
 
     try:
         rep = merge_cycles_to_ome_tiff(
