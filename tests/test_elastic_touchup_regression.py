@@ -10,7 +10,12 @@ import numpy as np
 import tifffile
 
 from cycif_seg.io.ome_tiff import load_single_channel_tiff_native
-from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
+from cycif_seg.preprocess.organize_cycles import (
+    CycleInput,
+    _elastic_tile_trust_weight,
+    _strip_source_row_bounds_for_field,
+    merge_cycles_to_ome_tiff,
+)
 
 
 VISUAL_OUTPUT_DIR = Path(__file__).resolve().parent / "elastic_touchup_visuals"
@@ -166,6 +171,56 @@ def _save_visual_artifacts(
 
 
 class ElasticTouchupRegressionTest(unittest.TestCase):
+    def test_elastic_tile_trust_weight_suppresses_only_artificial_edges(self) -> None:
+        weight = _elastic_tile_trust_weight(
+            32,
+            40,
+            border=5,
+            trim_top=True,
+            trim_bottom=False,
+            trim_left=True,
+            trim_right=False,
+        )
+
+        self.assertEqual(weight.shape, (32, 40))
+        self.assertTrue(np.all(weight[:5, :] == 0.0))
+        self.assertTrue(np.all(weight[:, :5] == 0.0))
+        self.assertTrue(np.any(weight[-5:, 8:] > 0.0))
+        self.assertTrue(np.any(weight[8:, -5:] > 0.0))
+        self.assertGreater(float(weight[16, 20]), 0.0)
+
+    def test_elastic_tile_trust_weight_keeps_true_boundary_sides(self) -> None:
+        weight = _elastic_tile_trust_weight(
+            32,
+            40,
+            border=5,
+            trim_top=False,
+            trim_bottom=False,
+            trim_left=False,
+            trim_right=False,
+        )
+
+        self.assertGreater(float(weight[0, 20]), 0.0)
+        self.assertGreater(float(weight[-1, 20]), 0.0)
+        self.assertGreater(float(weight[16, 0]), 0.0)
+        self.assertGreater(float(weight[16, -1]), 0.0)
+
+    def test_strip_source_bounds_include_elastic_displacement(self) -> None:
+        field_y = np.full((64, 48), 3.0, dtype=np.float32)
+        field_y[:4, :] = 19.0
+
+        src_y0, src_y1 = _strip_source_row_bounds_for_field(
+            96,
+            160,
+            256,
+            field_y,
+            fallback_pad=7,
+            safety_pad=4,
+        )
+
+        self.assertLessEqual(src_y0, 96 - 19 - 4)
+        self.assertGreaterEqual(src_y1, 160 - 3 + 4)
+
     def test_low_mem_tiled_elastic_registration_preserves_correlation(self) -> None:
         fixed = _synthetic_two_island_image()
         moving = _distort_moving_from_fixed(fixed)

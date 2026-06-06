@@ -75,6 +75,43 @@ def is_debug_elastic_touchup() -> bool:
     return _debug_elastic_touchup_global
 
 
+def _elastic_tile_trust_weight(
+    h: int,
+    w: int,
+    *,
+    border: int,
+    trim_top: bool,
+    trim_bottom: bool,
+    trim_left: bool,
+    trim_right: bool,
+) -> np.ndarray:
+    """Return tent weights with artificial elastic tile borders suppressed."""
+    hh, ww = int(h), int(w)
+    if hh <= 0 or ww <= 0:
+        return np.zeros((max(0, hh), max(0, ww)), dtype=np.float32)
+    tent_y = np.minimum(
+        np.arange(hh, dtype=np.float32) + 1,
+        np.arange(hh - 1, -1, -1, dtype=np.float32) + 1,
+    ).clip(1e-6)
+    tent_x = np.minimum(
+        np.arange(ww, dtype=np.float32) + 1,
+        np.arange(ww - 1, -1, -1, dtype=np.float32) + 1,
+    ).clip(1e-6)
+    weight = (tent_y[:, np.newaxis] * tent_x[np.newaxis, :]).astype(np.float32)
+    b = max(0, min(int(border), max(0, hh - 1), max(0, ww - 1)))
+    if b <= 0:
+        return weight
+    if trim_top:
+        weight[:min(b, hh), :] = 0.0
+    if trim_bottom:
+        weight[max(0, hh - b):hh, :] = 0.0
+    if trim_left:
+        weight[:, :min(b, ww)] = 0.0
+    if trim_right:
+        weight[:, max(0, ww - b):ww] = 0.0
+    return weight
+
+
 def set_debug_elastic_field(enabled: bool) -> None:
     """Enable or disable per-island elastic field statistics output."""
     global _debug_elastic_field
@@ -1162,6 +1199,41 @@ def _warp_strip_by_field(
             arr, [src_y, src_x], order=order, mode='constant', cval=0.0, prefilter=(order > 1)
         ).reshape(j1 - j0, X)
     return out
+
+
+def _strip_source_row_bounds_for_field(
+    out_y0: int,
+    out_y1: int,
+    canvas_h: int,
+    field_y: np.ndarray | None,
+    *,
+    fallback_pad: int,
+    safety_pad: int = 4,
+) -> tuple[int, int]:
+    if field_y is None or field_y.size == 0:
+        return (
+            max(0, int(out_y0) - int(fallback_pad)),
+            min(int(canvas_h), int(out_y1) + int(fallback_pad)),
+        )
+    fy = np.asarray(field_y, dtype=np.float32)
+    rows = np.arange(int(out_y0), int(out_y1), dtype=np.float32)
+    if rows.size != fy.shape[0]:
+        raise ValueError(f"field_y row count mismatch. Expected {rows.size}, got {fy.shape[0]}")
+    finite = np.isfinite(fy)
+    if not bool(finite.any()):
+        return (
+            max(0, int(out_y0) - int(fallback_pad)),
+            min(int(canvas_h), int(out_y1) + int(fallback_pad)),
+        )
+    fy_min = np.min(np.where(finite, fy, np.inf), axis=1)
+    fy_max = np.max(np.where(finite, fy, -np.inf), axis=1)
+    src_min = float(np.min(rows - fy_max))
+    src_max = float(np.max(rows - fy_min))
+    pad = max(0, int(safety_pad))
+    return (
+        max(0, int(math.floor(src_min)) - pad),
+        min(int(canvas_h), int(math.ceil(src_max)) + 1 + pad),
+    )
 
 
 def _scale_region_transform(r: _RegionTransform, D: int) -> _RegionTransform:
@@ -2496,6 +2568,12 @@ def merge_cycles_to_ome_tiff(
             _et_tile_w = max(1, int(elastic_touchup_tile_size))
             _stride_h = max(1, _et_tile_h // 2)
             _stride_w = max(1, _et_tile_w // 2)
+            _edge_exclusion_px = max(4, min(_et_tile_h, _et_tile_w) // 16)
+            _edge_exclusion_px = min(
+                _edge_exclusion_px,
+                max(0, min(_stride_h, _stride_w) // 2 - 1),
+            )
+            _weight_eps = 1e-5
             _min_fg_px = 200
             _base_dy_fr = float(base_shift_ds[0]) * float(_ds)
             _base_dx_fr = float(base_shift_ds[1]) * float(_ds)
@@ -2690,23 +2768,12 @@ def merge_cycles_to_ome_tiff(
                     return -1.0
                 return float((sum_ab - (sum_a * sum_b / float(n))) / math.sqrt(_da * _db))
 
-            def _tile_tent(h: int, w: int) -> np.ndarray:
-                _tent_y = np.minimum(
-                    np.arange(int(h), dtype=np.float32) + 1,
-                    np.arange(int(h) - 1, -1, -1, dtype=np.float32) + 1,
-                ).clip(1e-6)
-                _tent_x = np.minimum(
-                    np.arange(int(w), dtype=np.float32) + 1,
-                    np.arange(int(w) - 1, -1, -1, dtype=np.float32) + 1,
-                ).clip(1e-6)
-                return (_tent_y[:, np.newaxis] * _tent_x[np.newaxis, :]).astype(np.float32)
-
             if _debug_elastic_field:
                 print(
                     f"[elastic] cycle {cycle}: island-scoped elastic touch-up  "
                     f"islands={len(regs_ds)} tile={_et_tile_h}x{_et_tile_w}  "
                     f"stride={_stride_h}x{_stride_w} workers={_n_elastic_workers}  "
-                    f"accumulator={_acc_path}",
+                    f"edge_exclusion={_edge_exclusion_px}px accumulator={_acc_path}",
                     flush=True,
                 )
 
@@ -2728,6 +2795,10 @@ def merge_cycles_to_ome_tiff(
                 dy_fr: float,
                 dx_fr: float,
                 island_label: int,
+                island_y0: int,
+                island_y1: int,
+                island_x0: int,
+                island_x1: int,
             ) -> tuple[str, dict[str, float], np.ndarray | None, np.ndarray | None, np.ndarray | None, int, int, int, int]:
                 _t_total = time.perf_counter()
                 _check_cancel(cancel_cb)
@@ -2792,7 +2863,15 @@ def merge_cycles_to_ome_tiff(
                     )
                 _edy, _edx = _res
                 _t = time.perf_counter()
-                _tent = _tile_tent(_th, _tw)
+                _tent = _elastic_tile_trust_weight(
+                    _th,
+                    _tw,
+                    border=_edge_exclusion_px,
+                    trim_top=(int(gy0) > int(island_y0) and int(gy0) > 0),
+                    trim_bottom=(int(gy1) < int(island_y1) and int(gy1) < _canvas_h),
+                    trim_left=(int(gx0) > int(island_x0) and int(gx0) > 0),
+                    trim_right=(int(gx1) < int(island_x1) and int(gx1) < _canvas_w),
+                )
                 _tent *= _island_tile.astype(np.float32, copy=False)
                 _edy_w = _edy * _tent
                 _edx_w = _edx * _tent
@@ -3045,6 +3124,7 @@ def merge_cycles_to_ome_tiff(
                                 _gy0, _gy1, _gx0, _gx1,
                                 _dy_fr, _dx_fr,
                                 int(_ereg.label),
+                                _iy0, _iy1, _ix0, _ix1,
                             ))
                             _n_tiles_submitted += 1
                             _emit_elastic_tile_progress("submitted tile")
@@ -3123,7 +3203,7 @@ def merge_cycles_to_ome_tiff(
                     return None
                 _t_read = time.perf_counter()
                 _wt_sl = np.asarray(_wt_sum[_out_y0:_out_y1, :], dtype=np.float32)
-                _nz = _wt_sl > 0
+                _nz = _wt_sl > float(_weight_eps)
                 if not _nz.any():
                     _timing_provider_read_s += float(time.perf_counter() - _t_read)
                     return None
@@ -3302,9 +3382,17 @@ def merge_cycles_to_ome_tiff(
                         field_x_s += _edx_s
                         del _edy_s, _edx_s
 
-                # Source canvas rows needed (with shift padding)
-                src_cy0 = max(0, out_y0 - shift_pad)
-                src_cy1 = min(canvas_H, out_y1 + shift_pad)
+                # Source canvas rows needed by the final strip field.  Elastic
+                # corrections can exceed the rigid shift padding, so derive the
+                # bounds after elastic has been added.
+                src_cy0, src_cy1 = _strip_source_row_bounds_for_field(
+                    out_y0,
+                    out_y1,
+                    canvas_H,
+                    field_y_s,
+                    fallback_pad=shift_pad,
+                    safety_pad=4,
+                )
                 src_H = src_cy1 - src_cy0
 
                 # Source file rows that overlap with canvas rows [src_cy0:src_cy1]
