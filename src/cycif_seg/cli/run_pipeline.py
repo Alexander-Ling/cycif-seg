@@ -381,7 +381,10 @@ def _run_registration(
         pyramidal_output=pyramidal_output,
         elastic_touchup=elastic_touchup,
         elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
-        resume_flat_output=bool(output_path.exists()),
+        # In pyramidal mode the registration step resumes from the intermediate
+        # Zarr store, not `output_path` — let merge_cycles_to_ome_tiff's own
+        # open_existing_output check (which looks at the right path) decide.
+        resume_flat_output=True,
         completed_cycles=completed_cycles,
         registration_progress_path=str(resume_state["manifest_path"]),
         registration_fingerprint=resume_state["fingerprint"],
