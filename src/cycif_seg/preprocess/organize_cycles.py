@@ -2701,21 +2701,31 @@ def merge_cycles_to_ome_tiff(
                 dy_fr: float,
                 dx_fr: float,
             ) -> np.ndarray:
-                _pad_fr = int(max(4, math.ceil(max(abs(dy_fr), abs(dx_fr))) + 2))
-                _my0 = max(0, int(gy0) - _pad_fr)
-                _my1 = min(_canvas_h, int(gy1) + _pad_fr)
-                _mx0 = max(0, int(gx0) - _pad_fr)
-                _mx1 = min(_canvas_w, int(gx1) + _pad_fr)
+                # Split the shift into an integer part (relocates the read window --
+                # free, independent of magnitude) and a sub-pixel remainder (always
+                # < 1px, so the interpolation padding stays small and constant).
+                # Padding the read window by the *full* shift magnitude instead --
+                # as before -- made the window grow with the shift itself, which
+                # blew up to multi-GB reads for cycles with large global offsets.
+                _iy = int(round(float(dy_fr)))
+                _ix = int(round(float(dx_fr)))
+                _fy = float(dy_fr) - _iy
+                _fx = float(dx_fr) - _ix
+                _th = int(gy1) - int(gy0)
+                _tw = int(gx1) - int(gx0)
+                _pad_fr = int(max(4, math.ceil(max(abs(_fy), abs(_fx))) + 2))
+                _wy0 = int(gy0) - _iy - _pad_fr
+                _wy1 = int(gy1) - _iy + _pad_fr
+                _wx0 = int(gx0) - _ix - _pad_fr
+                _wx1 = int(gx1) - _ix + _pad_fr
                 _mov_padded = _canvas_channel_roi(
                     ci.path, int(registration_channel), _moving_shape_yx,
-                    _my0, _my1, _mx0, _mx1,
+                    _wy0, _wy1, _wx0, _wx1,
                 )
-                _loc_y0 = int(gy0) - _my0
-                _loc_x0 = int(gx0) - _mx0
                 _mov_crop = _extract_translated_crop(
                     _mov_padded,
-                    (_loc_y0, _loc_y0 + (int(gy1) - int(gy0)), _loc_x0, _loc_x0 + (int(gx1) - int(gx0))),
-                    dy_fr, dx_fr,
+                    (_pad_fr, _pad_fr + _th, _pad_fr, _pad_fr + _tw),
+                    _fy, _fx,
                 )
                 del _mov_padded
                 return _mov_crop

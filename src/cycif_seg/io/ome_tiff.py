@@ -711,6 +711,11 @@ class IncrementalZarrRegisteredWriter:
             chunks=self.chunks,
             dtype=self.dtype,
             zarr_format=2,
+            # Nest chunk files under per-axis subdirectories instead of the v2
+            # default ('.'), which would dump every chunk as a flat file in one
+            # directory — large canvases produce millions of chunks and that hits
+            # directory entry/link-count limits on cluster filesystems (EMLINK).
+            dimension_separator="/",
         )
         self._arr.attrs["axes"] = "CYX"
         self._arr.attrs["shape_yxc"] = tuple(int(v) for v in self.shape_yxc)

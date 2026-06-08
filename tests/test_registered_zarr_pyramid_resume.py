@@ -98,8 +98,13 @@ class RegistrationResumeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             shape_yx = (48, 64)
-            cyc1_planes = np.stack([_synthetic_plane(shape_yx, 0), _synthetic_plane(shape_yx, 1)])
-            cyc2_planes = np.stack([_synthetic_plane(shape_yx, 2), _synthetic_plane(shape_yx, 3)])
+            # Both cycles share an identical DAPI (registration-marker) plane so
+            # registration converges on a trivial zero shift -- keeping the run
+            # small, fast, and deterministic -- while each cycle's second
+            # channel carries distinct content to merge into the output.
+            shared_dapi = _synthetic_plane(shape_yx, 0)
+            cyc1_planes = np.stack([shared_dapi, _synthetic_plane(shape_yx, 1)])
+            cyc2_planes = np.stack([shared_dapi, _synthetic_plane(shape_yx, 2)])
 
             cyc1_path = tmp / "cycle1.ome.tiff"
             cyc2_path = tmp / "cycle2.ome.tiff"

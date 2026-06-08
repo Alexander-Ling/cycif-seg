@@ -31,7 +31,9 @@ class SettingsPanel(QtWidgets.QWidget):
             "Print verbose console output during batch preprocessing (Step 1).\n"
             "Shows strip mode configuration, per-strip progress, RAM usage,\n"
             "registration channel sizes, and computed shifts per cycle.\n"
-            "Useful for verifying that RAM-efficient strip processing is active."
+            "Useful for verifying that RAM-efficient strip processing is active.\n"
+            "Also prints the full stack traceback to the console for any\n"
+            "sample that fails, to help diagnose the underlying error."
         )
         debug_layout.addWidget(self.chk_debug_preprocess)
 

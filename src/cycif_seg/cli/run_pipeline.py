@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 import time
+import traceback
 from pathlib import Path
 from string import ascii_lowercase
 
@@ -459,6 +460,11 @@ def _build_parser() -> argparse.ArgumentParser:
     misc_grp = p.add_argument_group("misc")
     misc_grp.add_argument("--no-pyramidal", action="store_true",
                            help="Write flat OME-TIFF instead of pyramidal")
+    misc_grp.add_argument("--debug", action="store_true",
+                           help=(
+                               "Print verbose preprocessing debug messages, and full "
+                               "stack tracebacks for stitching/registration failures"
+                           ))
 
     mode_grp = p.add_mutually_exclusive_group()
     mode_grp.add_argument("--stitch-only", action="store_true",
@@ -481,6 +487,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.debug:
+        from cycif_seg.preprocess.organize_cycles import set_preprocess_debug
+        set_preprocess_debug(True)
 
     sample_dir = Path(args.sample_dir).expanduser().resolve()
     if not sample_dir.is_dir():
@@ -564,6 +574,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n[ERROR] {exc}", file=sys.stderr)
             return 1
         except Exception as exc:
+            if args.debug:
+                print(traceback.format_exc(), file=sys.stderr)
             print(
                 f"\n[ERROR] Stitching failed for cycle {ci['label']} "
                 f"({ci['folder'].name}): {exc}",
@@ -593,6 +605,8 @@ def main(argv: list[str] | None = None) -> int:
             force=args.force_register,
         )
     except Exception as exc:
+        if args.debug:
+            print(traceback.format_exc(), file=sys.stderr)
         print(
             f"\n[ERROR] Registration failed: {exc}\n"
             f"Stitched files are preserved in their cycle directories.",

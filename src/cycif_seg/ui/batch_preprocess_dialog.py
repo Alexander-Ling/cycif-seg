@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import gc
+import traceback
 from pathlib import Path
 
 from qtpy import QtCore, QtWidgets
@@ -972,6 +973,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 except Exception as e:
                     if self._cancel_requested:
                         return {"reports": reports, "failures": failures, "cancelled": True}
+                    if is_preprocess_debug():
+                        print(f"[batch preprocess] '{s.name}' failed:\n{traceback.format_exc()}", flush=True)
                     failures.append({"sample_name": str(s.name), "error": str(e)})
                     self.sig_set_status.emit(f"[{si}/{n_samp}] {s.name}: failed: {e}")
                 finally:
