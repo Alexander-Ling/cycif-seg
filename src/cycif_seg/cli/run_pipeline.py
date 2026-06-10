@@ -271,6 +271,7 @@ def _run_registration(
     elastic_touchup: bool = True,
     n_workers: int = 1,
     elastic_touchup_workers: int | None = None,
+    pyramid_chunk_size: int = 512,
     force: bool = False,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
@@ -310,6 +311,7 @@ def _run_registration(
             pyramidal_output=pyramidal_output,
             elastic_touchup=elastic_touchup,
             elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
+            pyramid_progress_chunk=pyramid_chunk_size,
             progress_cb=lambda msg: print(f"  {msg}"),
         )
         print(f"  Done. Merged output: {output_path}")
@@ -382,6 +384,7 @@ def _run_registration(
         pyramidal_output=pyramidal_output,
         elastic_touchup=elastic_touchup,
         elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
+        pyramid_progress_chunk=pyramid_chunk_size,
         # In pyramidal mode the registration step resumes from the intermediate
         # Zarr store, not `output_path` — let merge_cycles_to_ome_tiff's own
         # open_existing_output check (which looks at the right path) decide.
@@ -443,6 +446,8 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Parallel workers for stitching, registration writes, pyramid build, and elastic touch-up (default: 1)")
     stitch_grp.add_argument("--tile-regex", default=None, metavar="REGEX",
                              help="Override default tile filename regex pattern")
+    stitch_grp.add_argument("--pyramid-chunk-size", type=int, default=512, metavar="INT",
+                             help="Edge length (px) of chunks used to build pyramid levels; lower to reduce peak RAM (default: 512)")
 
     reg_grp = p.add_argument_group("registration")
     reg_grp.add_argument("--registration-marker", default="DAPI", metavar="STR",
@@ -602,6 +607,7 @@ def main(argv: list[str] | None = None) -> int:
             elastic_touchup=args.elastic_touchup,
             n_workers=args.n_workers,
             elastic_touchup_workers=args.elastic_touchup_workers,
+            pyramid_chunk_size=args.pyramid_chunk_size,
             force=args.force_register,
         )
     except Exception as exc:

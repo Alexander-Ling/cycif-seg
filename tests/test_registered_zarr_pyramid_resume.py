@@ -10,6 +10,8 @@ import tifffile
 
 from cycif_seg.io.ome_tiff import (
     IncrementalZarrRegisteredWriter,
+    _block_average_2x2_cyx,
+    convert_flat_ome_to_pyramidal,
     convert_registered_zarr_to_pyramidal,
     inspect_tiff_pyramid,
     load_single_channel_tiff_native,
@@ -91,6 +93,219 @@ class RegisteredZarrPyramidConversionTest(unittest.TestCase):
                 np.testing.assert_array_equal(
                     load_single_channel_tiff_native(str(out_path), ch), expected
                 )
+
+    def test_multi_chunk_multi_worker_pyramid_matches_reference(self) -> None:
+        # out_chunk=32 with build_workers=3 gives a max_pending of 6, while
+        # level 1 (128x160 -> 4x5 chunks of 32px) has 20 chunks -- exercising
+        # the bounded-pending refill/drain loop across multiple rounds.
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            zarr_path = td_path / "registered.zarr"
+            out_path = td_path / "registered.ome.tif"
+            shape_yx = (256, 320)
+            planes = [_synthetic_plane(shape_yx, 0), _synthetic_plane(shape_yx, 1)]
+
+            writer = IncrementalZarrRegisteredWriter(
+                str(zarr_path),
+                (shape_yx[0], shape_yx[1], 2),
+                np.dtype("uint16"),
+                ["MarkerA", "MarkerB"],
+                chunk_yx=(64, 64),
+            )
+            try:
+                for ch, plane in enumerate(planes):
+                    writer.write_channel(ch, plane)
+            finally:
+                writer.close()
+
+            convert_registered_zarr_to_pyramidal(
+                str(zarr_path),
+                str(out_path),
+                tile_size=64,
+                min_level_size=8,
+                out_chunk=32,
+                build_workers=3,
+            )
+
+            stack = np.stack(planes).astype(np.uint16)
+            expected_level1 = _block_average_2x2_cyx(stack, np.dtype("uint16"))
+            expected_level2 = _block_average_2x2_cyx(expected_level1, np.dtype("uint16"))
+
+            level1 = tifffile.imread(str(out_path), series=0, level=1)
+            level2 = tifffile.imread(str(out_path), series=0, level=2)
+            np.testing.assert_array_equal(level1, expected_level1)
+            np.testing.assert_array_equal(level2, expected_level2)
+
+    def test_resume_rebuilds_level_left_partially_built_by_interrupted_run(self) -> None:
+        # np.memmap(mode='w+') pre-allocates a level's .dat file at full size
+        # *before* any chunk is written, so an interrupted run (e.g. an OOM
+        # kill mid-level) can leave a full-size but mostly-empty level_01.dat
+        # with no ".done" marker. Resume must detect the missing marker and
+        # rebuild the level rather than silently reusing the corrupted data.
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            zarr_path = td_path / "registered.zarr"
+            out_path = td_path / "registered.ome.tif"
+            work_dir = td_path / "cycif_pyramid_work_test"
+            shape_yx = (256, 320)
+            planes = [_synthetic_plane(shape_yx, 0), _synthetic_plane(shape_yx, 1)]
+
+            writer = IncrementalZarrRegisteredWriter(
+                str(zarr_path),
+                (shape_yx[0], shape_yx[1], 2),
+                np.dtype("uint16"),
+                ["MarkerA", "MarkerB"],
+                chunk_yx=(64, 64),
+            )
+            try:
+                for ch, plane in enumerate(planes):
+                    writer.write_channel(ch, plane)
+            finally:
+                writer.close()
+
+            convert_registered_zarr_to_pyramidal(
+                str(zarr_path),
+                str(out_path),
+                tile_size=64,
+                min_level_size=8,
+                out_chunk=32,
+                build_workers=2,
+                work_dir=str(work_dir),
+                keep_work_dir=True,
+            )
+
+            stack = np.stack(planes).astype(np.uint16)
+            expected_level1 = _block_average_2x2_cyx(stack, np.dtype("uint16"))
+
+            level1_path = work_dir / "levels" / "level_01.dat"
+            marker_path = level1_path.with_name(level1_path.name + ".done")
+            self.assertTrue(level1_path.is_file())
+            self.assertTrue(marker_path.is_file())
+
+            # Simulate the interrupted-run state: file at full size, content
+            # zeroed out, completion marker absent.
+            lvl1_shape = (2,) + tuple(int(v) for v in expected_level1.shape[1:])
+            lvl1 = np.memmap(str(level1_path), dtype=np.uint16, mode="r+", shape=lvl1_shape)
+            lvl1[:] = 0
+            lvl1.flush()
+            del lvl1
+            marker_path.unlink()
+
+            messages: list[str] = []
+            convert_registered_zarr_to_pyramidal(
+                str(zarr_path),
+                str(out_path),
+                tile_size=64,
+                min_level_size=8,
+                out_chunk=32,
+                build_workers=2,
+                work_dir=str(work_dir),
+                keep_work_dir=True,
+                progress_step_cb=lambda msg, phase: messages.append(msg),
+            )
+
+            self.assertTrue(any("Building pyramid level 1/" in m for m in messages))
+            self.assertFalse(any("Reusing pyramid level 1/" in m for m in messages))
+
+            level1 = tifffile.imread(str(out_path), series=0, level=1)
+            np.testing.assert_array_equal(level1, expected_level1)
+
+            # A subsequent resume with intact markers should reuse every
+            # level instead of rebuilding it.
+            messages.clear()
+            convert_registered_zarr_to_pyramidal(
+                str(zarr_path),
+                str(out_path),
+                tile_size=64,
+                min_level_size=8,
+                out_chunk=32,
+                build_workers=2,
+                work_dir=str(work_dir),
+                progress_step_cb=lambda msg, phase: messages.append(msg),
+            )
+            self.assertFalse(any("Building pyramid level" in m for m in messages))
+            self.assertTrue(any("Reusing pyramid level 1/" in m for m in messages))
+
+    def test_cancellation_during_pyramid_build_propagates_and_stops_pool(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            zarr_path = td_path / "registered.zarr"
+            out_path = td_path / "registered.ome.tif"
+            shape_yx = (256, 320)
+            planes = [_synthetic_plane(shape_yx, 0), _synthetic_plane(shape_yx, 1)]
+
+            writer = IncrementalZarrRegisteredWriter(
+                str(zarr_path),
+                (shape_yx[0], shape_yx[1], 2),
+                np.dtype("uint16"),
+                ["MarkerA", "MarkerB"],
+                chunk_yx=(64, 64),
+            )
+            try:
+                for ch, plane in enumerate(planes):
+                    writer.write_channel(ch, plane)
+            finally:
+                writer.close()
+
+            calls = {"n": 0}
+
+            def _cancel_after_a_few_chunks() -> bool:
+                # Level 1 has 20 chunks with max_pending=6 -- letting a handful
+                # of cancel checks pass through ensures we cancel mid-level,
+                # with chunks still pending in the pool.
+                calls["n"] += 1
+                return calls["n"] > 5
+
+            with self.assertRaisesRegex(RuntimeError, "Cancelled"):
+                convert_registered_zarr_to_pyramidal(
+                    str(zarr_path),
+                    str(out_path),
+                    tile_size=64,
+                    min_level_size=8,
+                    out_chunk=32,
+                    build_workers=3,
+                    cancel_cb=_cancel_after_a_few_chunks,
+                )
+
+            self.assertFalse(out_path.exists())
+
+
+class FlatOmeToPyramidalConversionTest(unittest.TestCase):
+    def test_converts_flat_multi_channel_ome_to_pyramidal_with_multiple_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            src_path = td_path / "flat.ome.tiff"
+            out_path = td_path / "pyramidal.ome.tiff"
+            shape_yx = (64, 96)
+            planes = np.stack([
+                _synthetic_plane(shape_yx, 0),
+                _synthetic_plane(shape_yx, 1),
+                _synthetic_plane(shape_yx, 2),
+            ])
+            _write_two_channel_ome(src_path, planes, ["DAPI", "MarkerA", "MarkerB"])
+
+            result_path = convert_flat_ome_to_pyramidal(
+                str(src_path),
+                str(out_path),
+                tile_size=16,
+                min_level_size=8,
+                out_chunk=16,
+                build_workers=2,
+            )
+            self.assertEqual(Path(result_path), out_path)
+
+            pyramid_info = inspect_tiff_pyramid(str(out_path))
+            self.assertTrue(bool(pyramid_info["is_pyramidal"]))
+            self.assertGreaterEqual(len(pyramid_info["series"][0]["level_shapes"]), 2)
+
+            for ch, expected in enumerate(planes):
+                np.testing.assert_array_equal(
+                    load_single_channel_tiff_native(str(out_path), ch), expected
+                )
+
+            expected_level1 = _block_average_2x2_cyx(planes, np.dtype("uint16"))
+            level1 = tifffile.imread(str(out_path), series=0, level=1)
+            np.testing.assert_array_equal(level1, expected_level1)
 
 
 class RegistrationResumeTest(unittest.TestCase):

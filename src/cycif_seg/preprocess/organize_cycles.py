@@ -2272,7 +2272,7 @@ def merge_cycles_to_ome_tiff(
     pyramidal_tile_size: int = 512,
     pyramidal_compression: str | int | None = "zlib",
     pyramidal_min_level_size: int = 128,
-    pyramid_progress_chunk: int = 1024,
+    pyramid_progress_chunk: int = 512,
     resume_flat_output: bool = False,
     completed_cycles: Iterable[int] | None = None,
     registration_progress_path: str | None = None,

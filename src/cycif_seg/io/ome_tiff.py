@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import itertools
 import math
 import os
 import tempfile
@@ -1094,6 +1095,134 @@ def _block_average_2x2_cyx(arr_cyx: np.ndarray, out_dtype: np.dtype) -> np.ndarr
     return _cast_like_source(acc, np.dtype(out_dtype))
 
 
+def _build_pyramid_level(
+    *,
+    src,
+    src_y: int,
+    src_x: int,
+    lvl: np.memmap,
+    out_y: int,
+    out_x: int,
+    dtype: np.dtype,
+    out_chunk: int,
+    build_workers: int,
+    level: int,
+    subifds: int,
+    check_cancel: Callable[[], None],
+    step: Callable[[str, str], None],
+) -> None:
+    """Build one pyramid level into ``lvl`` via chunked 2x2 block averaging.
+
+    Uses a bounded number of in-flight futures (``2 * build_workers``) so
+    that at most a small, constant number of completed-but-unwritten chunk
+    results are resident in RAM at once, regardless of how many chunks the
+    level has in total. Periodically flushes ``lvl`` and runs ``gc.collect()``
+    so dirty memmap pages do not accumulate unbounded across a single
+    (potentially very large) level.
+    """
+    src_y = int(src_y)
+    src_x = int(src_x)
+    out_y = int(out_y)
+    out_x = int(out_x)
+    build_workers = max(1, int(build_workers))
+
+    def _build_chunk(oy0: int, oy1: int, ox0: int, ox1: int) -> tuple:
+        sy0 = int(oy0 * 2)
+        sy1 = int(min(src_y, oy1 * 2))
+        sx0 = int(ox0 * 2)
+        sx1 = int(min(src_x, ox1 * 2))
+        chunk = np.asarray(src[:, sy0:sy1, sx0:sx1])
+        return oy0, oy1, ox0, ox1, _block_average_2x2_cyx(chunk, dtype)
+
+    step_y = max(1, int(out_chunk))
+    step_x = max(1, int(out_chunk))
+    chunk_args = [
+        (oy0, min(out_y, oy0 + step_y), ox0, min(out_x, ox0 + step_x))
+        for oy0 in range(0, out_y, step_y)
+        for ox0 in range(0, out_x, step_x)
+    ]
+    total_chunks = len(chunk_args)
+    flush_every = max(1, build_workers * 4)
+    n_done = 0
+    n_since_flush = 0
+
+    def _maybe_flush(pending_count: int) -> None:
+        nonlocal n_since_flush
+        if n_since_flush < flush_every:
+            return
+        lvl.flush()
+        try:
+            gc.collect()
+        except Exception:
+            pass
+        if _debug_tiff_loading:
+            rss = ""
+            try:
+                import psutil as _ps
+                rss = f"  RAM={_ps.Process().memory_info().rss / 1024**2:.0f} MB"
+            except Exception:
+                pass
+            print(
+                f"[pyramid] level {level}/{subifds}: {n_done}/{total_chunks} chunks, "
+                f"pending={pending_count}{rss}",
+                flush=True,
+            )
+        n_since_flush = 0
+
+    if build_workers > 1 and total_chunks > 1:
+        max_pending = max(1, 2 * build_workers)
+        pool = ThreadPoolExecutor(max_workers=build_workers, thread_name_prefix='cycif-pyramid-build')
+        pending: set[Future] = set()
+        arg_iter = iter(chunk_args)
+        try:
+            for args in itertools.islice(arg_iter, max_pending):
+                pending.add(pool.submit(_build_chunk, *args))
+            while pending:
+                check_cancel()
+                done, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    check_cancel()
+                    oy0, oy1, ox0, ox1, result = fut.result()
+                    lvl[:, oy0:oy1, ox0:ox1] = result
+                    del result, fut
+                    n_done += 1
+                    n_since_flush += 1
+                    step(
+                        f'Building pyramid level {level}/{subifds} ({n_done}/{total_chunks} chunks)',
+                        'pyramid_build_chunk',
+                    )
+                    _maybe_flush(len(pending))
+                    nxt = next(arg_iter, None)
+                    if nxt is not None:
+                        pending.add(pool.submit(_build_chunk, *nxt))
+        except BaseException:
+            for f in pending:
+                f.cancel()
+            # Wait for the handful of already-running chunks (at most
+            # build_workers) to finish so their reads of `src` complete
+            # before we return -- avoids leaving background threads holding
+            # open file handles on the source array during cleanup.
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True, cancel_futures=False)
+    else:
+        for oy0, oy1, ox0, ox1 in chunk_args:
+            check_cancel()
+            _, _, _, _, result = _build_chunk(oy0, oy1, ox0, ox1)
+            lvl[:, oy0:oy1, ox0:ox1] = result
+            del result
+            n_done += 1
+            n_since_flush += 1
+            step(
+                f'Building pyramid level {level}/{subifds} ({oy1}/{out_y} rows)',
+                'pyramid_build_chunk',
+            )
+            _maybe_flush(0)
+
+    lvl.flush()
+
+
 def _raw_memmap(path: str, shape: tuple[int, ...], dtype: np.dtype, mode: str = 'w+') -> np.memmap:
     return np.memmap(path, dtype=np.dtype(dtype), mode=mode, shape=tuple(int(v) for v in shape))
 
@@ -1127,8 +1256,22 @@ def _expected_pyramid_level_shapes(shape_cyx: tuple[int, int, int], subifds: int
     return shapes
 
 
+def _pyramid_level_done_marker(path: Path) -> Path:
+    """Path to the sentinel file written once a pyramid level's .dat is fully built.
+
+    ``np.memmap(mode='w+')`` pre-allocates a level's .dat file at its full
+    expected size *before* any chunk is written, so a size/shape match alone
+    cannot distinguish a complete level from one that was only partially
+    built before an interruption (e.g. an OOM kill). The marker is only
+    written after the build loop finishes successfully.
+    """
+    return path.with_name(path.name + '.done')
+
+
 def _valid_raw_level_file(path: Path, shape: tuple[int, int, int], dtype: np.dtype) -> bool:
     try:
+        if not _pyramid_level_done_marker(path).is_file():
+            return False
         expected_bytes = int(np.prod(tuple(int(v) for v in shape))) * int(np.dtype(dtype).itemsize)
         if not path.is_file() or int(path.stat().st_size) != expected_bytes:
             return False
@@ -1185,7 +1328,7 @@ def convert_flat_ome_to_pyramidal(
     tile_size: int = 512,
     compression: str | int | None = 'zlib',
     min_level_size: int = 128,
-    out_chunk: int = 1024,
+    out_chunk: int = 512,
     replace_source: bool = False,
     temp_dir: str | None = None,
     work_dir: str | None = None,
@@ -1333,83 +1476,44 @@ def convert_flat_ome_to_pyramidal(
                 _step(f'Reusing pyramid level {level}/{subifds}', 'pyramid_reuse_level')
             else:
                 for stale_level in range(level, subifds + 1):
+                    stale_path = tmpdir / f'level_{stale_level:02d}.dat'
                     try:
-                        (tmpdir / f'level_{stale_level:02d}.dat').unlink(missing_ok=True)
+                        stale_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        _pyramid_level_done_marker(stale_path).unlink(missing_ok=True)
                     except Exception:
                         pass
                 lvl = _raw_memmap(str(lvl_path), lvl_shape, dtype, mode='w+')
-                step_y = max(1, int(out_chunk))
-                step_x = max(1, int(out_chunk))
-                _src = prev
-                _src_y = prev_y
-                _src_x = prev_x
-                _dtype = dtype
-                _level = level
-                _out_y = int(out_y)
-                _out_x = int(out_x)
-
-                def _build_chunk(oy0: int, oy1: int, ox0: int, ox1: int) -> tuple:
-                    sy0 = int(oy0 * 2)
-                    sy1 = int(min(_src_y, oy1 * 2))
-                    sx0 = int(ox0 * 2)
-                    sx1 = int(min(_src_x, ox1 * 2))
-                    chunk = np.asarray(_src[:, sy0:sy1, sx0:sx1])
-                    return oy0, oy1, ox0, ox1, _block_average_2x2_cyx(chunk, _dtype)
-
-                chunk_args = [
-                    (oy0, min(_out_y, oy0 + step_y), ox0, min(_out_x, ox0 + step_x))
-                    for oy0 in range(0, _out_y, step_y)
-                    for ox0 in range(0, _out_x, step_x)
-                ]
-                total_chunks = len(chunk_args)
-
-                if _build_workers > 1 and total_chunks > 1:
-                    _pool = ThreadPoolExecutor(max_workers=_build_workers, thread_name_prefix='cycif-pyramid-build')
-                    _futs: list[Future] = []
-                    _n_done = 0
-                    try:
-                        _futs = [_pool.submit(_build_chunk, *args) for args in chunk_args]
-                        _pending: set[Future] = set(_futs)
-                        while _pending:
-                            _check_cancel()
-                            _done, _pending = wait(_pending, timeout=0.1, return_when=FIRST_COMPLETED)
-                            for _fut in _done:
-                                _check_cancel()
-                                _oy0, _oy1, _ox0, _ox1, _result = _fut.result()
-                                lvl[:, _oy0:_oy1, _ox0:_ox1] = _result
-                                _n_done += 1
-                                _step(
-                                    f'Building pyramid level {_level}/{subifds} ({_n_done}/{total_chunks} chunks)',
-                                    'pyramid_build_chunk',
-                                )
-                    except BaseException:
-                        for _f in _futs:
-                            _f.cancel()
-                        _pool.shutdown(wait=False, cancel_futures=True)
-                        raise
-                    else:
-                        _pool.shutdown(wait=True, cancel_futures=False)
-                else:
-                    for oy0, oy1, ox0, ox1 in chunk_args:
-                        _check_cancel()
-                        _, _, _, _, _result = _build_chunk(oy0, oy1, ox0, ox1)
-                        lvl[:, oy0:oy1, ox0:ox1] = _result
-                        _step(
-                            f'Building pyramid level {_level}/{subifds} ({oy1}/{_out_y} rows)',
-                            'pyramid_build_chunk',
-                        )
-                lvl.flush()
+                _build_pyramid_level(
+                    src=prev,
+                    src_y=prev_y,
+                    src_x=prev_x,
+                    lvl=lvl,
+                    out_y=int(out_y),
+                    out_x=int(out_x),
+                    dtype=dtype,
+                    out_chunk=int(out_chunk),
+                    build_workers=_build_workers,
+                    level=level,
+                    subifds=subifds,
+                    check_cancel=_check_cancel,
+                    step=_step,
+                )
+                _pyramid_level_done_marker(lvl_path).touch()
             level_arrays.append(lvl)
             level_paths.append(lvl_path)
             prev = lvl
             prev_y, prev_x = int(out_y), int(out_x)
 
+        _write_workers = min(int(_build_workers), 2)
         options = dict(
             photometric='minisblack',
             tile=(int(tile_size), int(tile_size)),
             compression=compression,
             predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
-            maxworkers=_build_workers,
+            maxworkers=_write_workers,
         )
 
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
@@ -1548,7 +1652,7 @@ def convert_registered_zarr_to_pyramidal(
     tile_size: int = 512,
     compression: str | int | None = 'zlib',
     min_level_size: int = 128,
-    out_chunk: int = 1024,
+    out_chunk: int = 512,
     temp_dir: str | None = None,
     work_dir: str | None = None,
     resume: bool = True,
@@ -1653,83 +1757,44 @@ def convert_registered_zarr_to_pyramidal(
                 _step(f'Reusing pyramid level {level}/{subifds}', 'pyramid_reuse_level')
             else:
                 for stale_level in range(level, subifds + 1):
+                    stale_path = tmpdir / f'level_{stale_level:02d}.dat'
                     try:
-                        (tmpdir / f'level_{stale_level:02d}.dat').unlink(missing_ok=True)
+                        stale_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        _pyramid_level_done_marker(stale_path).unlink(missing_ok=True)
                     except Exception:
                         pass
                 lvl = _raw_memmap(str(lvl_path), lvl_shape, dtype, mode='w+')
-                step_y = max(1, int(out_chunk))
-                step_x = max(1, int(out_chunk))
-                _src = prev
-                _src_y = prev_y
-                _src_x = prev_x
-                _dtype = dtype
-                _level = level
-                _out_y = int(out_y)
-                _out_x = int(out_x)
-
-                def _build_chunk(oy0: int, oy1: int, ox0: int, ox1: int) -> tuple:
-                    sy0 = int(oy0 * 2)
-                    sy1 = int(min(_src_y, oy1 * 2))
-                    sx0 = int(ox0 * 2)
-                    sx1 = int(min(_src_x, ox1 * 2))
-                    chunk = np.asarray(_src[:, sy0:sy1, sx0:sx1])
-                    return oy0, oy1, ox0, ox1, _block_average_2x2_cyx(chunk, _dtype)
-
-                chunk_args = [
-                    (oy0, min(_out_y, oy0 + step_y), ox0, min(_out_x, ox0 + step_x))
-                    for oy0 in range(0, _out_y, step_y)
-                    for ox0 in range(0, _out_x, step_x)
-                ]
-                total_chunks = len(chunk_args)
-
-                if _build_workers > 1 and total_chunks > 1:
-                    _pool = ThreadPoolExecutor(max_workers=_build_workers, thread_name_prefix='cycif-pyramid-build')
-                    _futs: list[Future] = []
-                    _n_done = 0
-                    try:
-                        _futs = [_pool.submit(_build_chunk, *args) for args in chunk_args]
-                        _pending: set[Future] = set(_futs)
-                        while _pending:
-                            _check_cancel()
-                            _done, _pending = wait(_pending, timeout=0.1, return_when=FIRST_COMPLETED)
-                            for _fut in _done:
-                                _check_cancel()
-                                _oy0, _oy1, _ox0, _ox1, _result = _fut.result()
-                                lvl[:, _oy0:_oy1, _ox0:_ox1] = _result
-                                _n_done += 1
-                                _step(
-                                    f'Building pyramid level {_level}/{subifds} ({_n_done}/{total_chunks} chunks)',
-                                    'pyramid_build_chunk',
-                                )
-                    except BaseException:
-                        for _f in _futs:
-                            _f.cancel()
-                        _pool.shutdown(wait=False, cancel_futures=True)
-                        raise
-                    else:
-                        _pool.shutdown(wait=True, cancel_futures=False)
-                else:
-                    for oy0, oy1, ox0, ox1 in chunk_args:
-                        _check_cancel()
-                        _, _, _, _, _result = _build_chunk(oy0, oy1, ox0, ox1)
-                        lvl[:, oy0:oy1, ox0:ox1] = _result
-                        _step(
-                            f'Building pyramid level {_level}/{subifds} ({oy1}/{_out_y} rows)',
-                            'pyramid_build_chunk',
-                        )
-                lvl.flush()
+                _build_pyramid_level(
+                    src=prev,
+                    src_y=prev_y,
+                    src_x=prev_x,
+                    lvl=lvl,
+                    out_y=int(out_y),
+                    out_x=int(out_x),
+                    dtype=dtype,
+                    out_chunk=int(out_chunk),
+                    build_workers=_build_workers,
+                    level=level,
+                    subifds=subifds,
+                    check_cancel=_check_cancel,
+                    step=_step,
+                )
+                _pyramid_level_done_marker(lvl_path).touch()
             level_arrays.append(lvl)
             level_paths.append(lvl_path)
             prev = lvl
             prev_y, prev_x = int(out_y), int(out_x)
 
+        _write_workers = min(int(_build_workers), 2)
         options = dict(
             photometric='minisblack',
             tile=(int(tile_size), int(tile_size)),
             compression=compression,
             predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
-            maxworkers=_build_workers,
+            maxworkers=_write_workers,
         )
 
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
