@@ -11,6 +11,8 @@ import tifffile
 from cycif_seg.io.ome_tiff import (
     IncrementalZarrRegisteredWriter,
     _block_average_2x2_cyx,
+    _iter_cyx_tiles,
+    _iter_cyx_tiles_prefetched,
     convert_flat_ome_to_pyramidal,
     convert_registered_zarr_to_pyramidal,
     inspect_tiff_pyramid,
@@ -47,6 +49,24 @@ def _write_two_channel_ome(path: Path, planes: np.ndarray, names: list[str]) -> 
 
 
 class RegisteredZarrPyramidConversionTest(unittest.TestCase):
+    def test_prefetched_base_tile_iterator_preserves_serial_order(self) -> None:
+        arr = np.arange(2 * 5 * 7, dtype=np.uint16).reshape(2, 5, 7)
+
+        serial = list(_iter_cyx_tiles(arr, tile_size=3))
+        prefetched = list(
+            _iter_cyx_tiles_prefetched(
+                arr,
+                tile_size=3,
+                prefetch_workers=3,
+                max_pending=4,
+                progress_interval=2,
+            )
+        )
+
+        self.assertEqual(len(serial), len(prefetched))
+        for expected, got in zip(serial, prefetched):
+            np.testing.assert_array_equal(got, expected)
+
     def test_writer_nests_chunks_and_converts_to_pyramidal_ome_tiff(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td_path = Path(td)
@@ -85,6 +105,7 @@ class RegisteredZarrPyramidConversionTest(unittest.TestCase):
                 min_level_size=8,
                 out_chunk=16,
                 build_workers=1,
+                write_workers=1,
             )
 
             pyramid_info = inspect_tiff_pyramid(str(out_path))
@@ -125,6 +146,7 @@ class RegisteredZarrPyramidConversionTest(unittest.TestCase):
                 min_level_size=8,
                 out_chunk=32,
                 build_workers=3,
+                write_workers=4,
             )
 
             stack = np.stack(planes).astype(np.uint16)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import itertools
 import math
@@ -1227,6 +1228,25 @@ def _raw_memmap(path: str, shape: tuple[int, ...], dtype: np.dtype, mode: str = 
     return np.memmap(path, dtype=np.dtype(dtype), mode=mode, shape=tuple(int(v) for v in shape))
 
 
+def _resolve_tiff_write_workers(write_workers: int | None, build_workers: int) -> int:
+    if write_workers is not None and int(write_workers) > 0:
+        requested = int(write_workers)
+    else:
+        requested = int(build_workers)
+    try:
+        max_tiff_workers = int(getattr(tifffile.TIFF, "MAXWORKERS", 16) or 16)
+    except Exception:
+        max_tiff_workers = 16
+    return max(1, min(requested, max(1, max_tiff_workers)))
+
+
+def _tiff_tile_buffersize(tile_size: int, dtype: np.dtype, write_workers: int) -> int:
+    tile = max(1, int(tile_size))
+    workers = max(1, int(write_workers))
+    tile_bytes = int(tile) * int(tile) * int(np.dtype(dtype).itemsize)
+    return max(tile_bytes, tile_bytes * max(workers, workers * 4))
+
+
 def _iter_cyx_tiles(
     arr_cyx,
     *,
@@ -1244,6 +1264,105 @@ def _iter_cyx_tiles(
                     cancel_cb()
                 x1 = min(x, x0 + tile_size)
                 yield np.asarray(arr_cyx[ci, y0:y1, x0:x1])
+
+
+def _iter_cyx_tiles_prefetched(
+    arr_cyx,
+    *,
+    tile_size: int,
+    prefetch_workers: int = 1,
+    max_pending: int | None = None,
+    progress_cb: Callable[[str], None] | None = None,
+    progress_interval: int = 256,
+    cancel_cb: Callable[[], None] | None = None,
+):
+    """Yield CYX tiles in TIFF order, optionally reading ahead in worker threads."""
+    c, y, x = (int(arr_cyx.shape[0]), int(arr_cyx.shape[1]), int(arr_cyx.shape[2]))
+    tile_size = max(1, int(tile_size))
+    total_tiles = int(c) * int(math.ceil(y / tile_size)) * int(math.ceil(x / tile_size))
+    progress_interval = max(1, int(progress_interval))
+    workers = max(1, int(prefetch_workers))
+    if max_pending is None:
+        max_pending = max(workers, workers * 4)
+    max_pending = max(1, int(max_pending))
+
+    started = time.perf_counter()
+    yielded = 0
+    read_wait_s = 0.0
+
+    def _coords():
+        for ci in range(c):
+            for y0 in range(0, y, tile_size):
+                y1 = min(y, y0 + tile_size)
+                for x0 in range(0, x, tile_size):
+                    x1 = min(x, x0 + tile_size)
+                    yield int(ci), int(y0), int(y1), int(x0), int(x1)
+
+    def _read_tile(coord: tuple[int, int, int, int, int]) -> np.ndarray:
+        ci, y0, y1, x0, x1 = coord
+        return np.asarray(arr_cyx[ci, y0:y1, x0:x1])
+
+    def _emit(final: bool = False) -> None:
+        if progress_cb is None:
+            return
+        elapsed = max(1e-9, time.perf_counter() - started)
+        rate = float(yielded) / elapsed
+        progress_cb(
+            f"Writing pyramid base level: {yielded}/{total_tiles} tiles "
+            f"({rate:.1f} tiles/s, tile-read-wait={read_wait_s:.1f}s)"
+            + (" done" if final else "")
+        )
+
+    if workers <= 1 or total_tiles <= 1:
+        for coord in _coords():
+            if cancel_cb is not None:
+                cancel_cb()
+            t0 = time.perf_counter()
+            tile = _read_tile(coord)
+            read_wait_s += time.perf_counter() - t0
+            yielded += 1
+            if yielded == 1 or yielded % progress_interval == 0:
+                _emit()
+            yield tile
+        _emit(final=True)
+        return
+
+    coord_iter = iter(_coords())
+    pending: deque[Future] = deque()
+
+    def _fill(executor: ThreadPoolExecutor) -> None:
+        while len(pending) < max_pending:
+            if cancel_cb is not None:
+                cancel_cb()
+            try:
+                coord = next(coord_iter)
+            except StopIteration:
+                return
+            pending.append(executor.submit(_read_tile, coord))
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="cycif-pyramid-read") as executor:
+        _fill(executor)
+        try:
+            while pending:
+                if cancel_cb is not None:
+                    cancel_cb()
+                fut = pending.popleft()
+                t0 = time.perf_counter()
+                tile = fut.result()
+                read_wait_s += time.perf_counter() - t0
+                yielded += 1
+                _fill(executor)
+                if yielded == 1 or yielded % progress_interval == 0:
+                    _emit()
+                yield tile
+        except BaseException:
+            for fut in pending:
+                try:
+                    fut.cancel()
+                except Exception:
+                    pass
+            raise
+    _emit(final=True)
 
 
 def _expected_pyramid_level_shapes(shape_cyx: tuple[int, int, int], subifds: int) -> list[tuple[int, int, int]]:
@@ -1338,6 +1457,7 @@ def convert_flat_ome_to_pyramidal(
     progress_step_cb: Callable[[str, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
     build_workers: int | None = None,
+    write_workers: int | None = None,
 ) -> str:
     """Convert a flat CYX OME-TIFF into a pyramidal OME-TIFF.
 
@@ -1507,13 +1627,17 @@ def convert_flat_ome_to_pyramidal(
             prev = lvl
             prev_y, prev_x = int(out_y), int(out_x)
 
-        _write_workers = min(int(_build_workers), 2)
+        _write_workers = _resolve_tiff_write_workers(write_workers, _build_workers)
+        _write_buffersize = _tiff_tile_buffersize(int(tile_size), dtype, _write_workers)
+        _prefetch_workers = max(1, min(_write_workers, _build_workers))
+        _prefetch_pending = max(_prefetch_workers, _prefetch_workers * 4)
         options = dict(
             photometric='minisblack',
             tile=(int(tile_size), int(tile_size)),
             compression=compression,
             predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
             maxworkers=_write_workers,
+            buffersize=_write_buffersize,
         )
 
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
@@ -1524,7 +1648,18 @@ def convert_flat_ome_to_pyramidal(
                 write_kwargs['resolution'] = base_resolution
                 write_kwargs['resolutionunit'] = base_resolutionunit
             tif.write(
-                _iter_cyx_tiles(src_cyx, tile_size=int(tile_size), cancel_cb=_check_cancel),
+                _iter_cyx_tiles_prefetched(
+                    src_cyx,
+                    tile_size=int(tile_size),
+                    prefetch_workers=_prefetch_workers,
+                    max_pending=_prefetch_pending,
+                    progress_cb=(
+                        (lambda msg: _step(msg, 'pyramid_write_base_tile'))
+                        if progress_cb or progress_step_cb else None
+                    ),
+                    progress_interval=max(1, int(out_chunk)),
+                    cancel_cb=_check_cancel,
+                ),
                 shape=(int(c), int(y), int(x)),
                 dtype=dtype,
                 subifds=int(subifds),
@@ -1661,6 +1796,7 @@ def convert_registered_zarr_to_pyramidal(
     progress_step_cb: Callable[[str, str], None] | None = None,
     cancel_cb: Callable[[], bool] | None = None,
     build_workers: int | None = None,
+    write_workers: int | None = None,
 ) -> str:
     """Convert a chunked CYX registered Zarr array into a pyramidal OME-TIFF."""
     if zarr is None:
@@ -1788,13 +1924,17 @@ def convert_registered_zarr_to_pyramidal(
             prev = lvl
             prev_y, prev_x = int(out_y), int(out_x)
 
-        _write_workers = min(int(_build_workers), 2)
+        _write_workers = _resolve_tiff_write_workers(write_workers, _build_workers)
+        _write_buffersize = _tiff_tile_buffersize(int(tile_size), dtype, _write_workers)
+        _prefetch_workers = max(1, min(_write_workers, _build_workers))
+        _prefetch_pending = max(_prefetch_workers, _prefetch_workers * 4)
         options = dict(
             photometric='minisblack',
             tile=(int(tile_size), int(tile_size)),
             compression=compression,
             predictor=True if compression is not None and np.issubdtype(dtype, np.integer) else False,
             maxworkers=_write_workers,
+            buffersize=_write_buffersize,
         )
 
         with tifffile.TiffWriter(dst, bigtiff=True) as tif:
@@ -1805,7 +1945,18 @@ def convert_registered_zarr_to_pyramidal(
                 write_kwargs['resolution'] = base_resolution
                 write_kwargs['resolutionunit'] = base_resolutionunit
             tif.write(
-                _iter_cyx_tiles(src_cyx, tile_size=int(tile_size), cancel_cb=_check_cancel),
+                _iter_cyx_tiles_prefetched(
+                    src_cyx,
+                    tile_size=int(tile_size),
+                    prefetch_workers=_prefetch_workers,
+                    max_pending=_prefetch_pending,
+                    progress_cb=(
+                        (lambda msg: _step(msg, 'pyramid_write_base_tile'))
+                        if progress_cb or progress_step_cb else None
+                    ),
+                    progress_interval=max(1, int(out_chunk)),
+                    cancel_cb=_check_cancel,
+                ),
                 shape=(int(c), int(y), int(x)),
                 dtype=dtype,
                 subifds=int(subifds),

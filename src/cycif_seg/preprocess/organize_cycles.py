@@ -2273,6 +2273,7 @@ def merge_cycles_to_ome_tiff(
     pyramidal_compression: str | int | None = "zlib",
     pyramidal_min_level_size: int = 128,
     pyramid_progress_chunk: int = 512,
+    pyramidal_write_workers: int | None = None,
     resume_flat_output: bool = False,
     completed_cycles: Iterable[int] | None = None,
     registration_progress_path: str | None = None,
@@ -3908,6 +3909,7 @@ def merge_cycles_to_ome_tiff(
                 progress_cb=_pyr_progress,
                 cancel_cb=cancel_cb,
                 build_workers=step1_workers,
+                write_workers=pyramidal_write_workers,
             )
             os.replace(tmp_pyramid_path, out_path)
             try:
@@ -3924,7 +3926,9 @@ def merge_cycles_to_ome_tiff(
                 out_chunk=max(1, int(pyramid_progress_chunk)),
                 replace_source=True,
                 progress_cb=_pyr_progress,
+                cancel_cb=cancel_cb,
                 build_workers=step1_workers,
+                write_workers=pyramidal_write_workers,
             )
         tick += 1
 

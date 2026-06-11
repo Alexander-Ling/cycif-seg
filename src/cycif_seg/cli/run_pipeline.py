@@ -272,6 +272,7 @@ def _run_registration(
     n_workers: int = 1,
     elastic_touchup_workers: int | None = None,
     pyramid_chunk_size: int = 512,
+    pyramid_write_workers: int | None = None,
     force: bool = False,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
@@ -312,6 +313,7 @@ def _run_registration(
             elastic_touchup=elastic_touchup,
             elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
             pyramid_progress_chunk=pyramid_chunk_size,
+            pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
             progress_cb=lambda msg: print(f"  {msg}"),
         )
         print(f"  Done. Merged output: {output_path}")
@@ -385,6 +387,7 @@ def _run_registration(
         elastic_touchup=elastic_touchup,
         elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
         pyramid_progress_chunk=pyramid_chunk_size,
+        pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
         # In pyramidal mode the registration step resumes from the intermediate
         # Zarr store, not `output_path` — let merge_cycles_to_ome_tiff's own
         # open_existing_output check (which looks at the right path) decide.
@@ -448,6 +451,8 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Override default tile filename regex pattern")
     stitch_grp.add_argument("--pyramid-chunk-size", type=int, default=512, metavar="INT",
                              help="Edge length (px) of chunks used to build pyramid levels; lower to reduce peak RAM (default: 512)")
+    stitch_grp.add_argument("--pyramid-write-workers", type=int, default=None, metavar="INT",
+                             help="Compression workers for final pyramidal TIFF writes (default: --n-workers, capped by tifffile)")
 
     reg_grp = p.add_argument_group("registration")
     reg_grp.add_argument("--registration-marker", default="DAPI", metavar="STR",
@@ -608,6 +613,7 @@ def main(argv: list[str] | None = None) -> int:
             n_workers=args.n_workers,
             elastic_touchup_workers=args.elastic_touchup_workers,
             pyramid_chunk_size=args.pyramid_chunk_size,
+            pyramid_write_workers=args.pyramid_write_workers,
             force=args.force_register,
         )
     except Exception as exc:
