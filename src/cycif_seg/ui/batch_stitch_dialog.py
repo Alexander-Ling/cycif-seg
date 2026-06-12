@@ -11,6 +11,7 @@ from napari.utils.notifications import show_warning
 
 from cycif_seg.io.ome_tiff import load_channel_names_only
 from cycif_seg.stitch.stitch_core import (
+    DEFAULT_STITCH_OUTPUT_SUFFIX,
     _DEFAULT_TILE_RE,
     _DEFAULT_X_GROUP,
     _DEFAULT_Y_GROUP,
@@ -29,7 +30,7 @@ class StitchSample:
     cycle_dirs: list[Path]
     enabled: bool = True
     stitch_channel: int = 0
-    output_suffix: str = 'stitched'
+    output_suffix: str = DEFAULT_STITCH_OUTPUT_SUFFIX
     pyramidal_output: bool = True
     avg_tiles_per_cycle: float = 0.0
 
@@ -65,7 +66,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
         root.addLayout(row)
 
         defaults = QtWidgets.QHBoxLayout()
-        self.txt_default_suffix = QtWidgets.QLineEdit('stitched')
+        self.txt_default_suffix = QtWidgets.QLineEdit(DEFAULT_STITCH_OUTPUT_SUFFIX)
         self.spin_default_channel = QtWidgets.QSpinBox()
         self.spin_default_channel.setMinimum(0)
         self.spin_default_channel.setMaximum(999)
@@ -263,7 +264,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                     cycle_dirs=cycle_dirs,
                     enabled=True,
                     stitch_channel=int(self.spin_default_channel.value()),
-                    output_suffix=(self.txt_default_suffix.text().strip() or 'stitched'),
+                    output_suffix=(self.txt_default_suffix.text().strip() or DEFAULT_STITCH_OUTPUT_SUFFIX),
                     pyramidal_output=bool(self.chk_default_pyramidal.isChecked()),
                     avg_tiles_per_cycle=float(avg_tiles),
                 )
@@ -291,7 +292,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                 avg_tiles.setFlags(avg_tiles.flags() & ~QtCore.Qt.ItemIsEditable)
                 self.tbl.setItem(r, 3, avg_tiles)
                 self.tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(str(int(s.stitch_channel))))
-                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.output_suffix or 'stitched')))
+                self.tbl.setItem(r, 5, QtWidgets.QTableWidgetItem(str(s.output_suffix or DEFAULT_STITCH_OUTPUT_SUFFIX)))
                 pit = QtWidgets.QTableWidgetItem('')
                 pit.setFlags(pit.flags() | QtCore.Qt.ItemIsUserCheckable)
                 pit.setCheckState(QtCore.Qt.Checked if s.pyramidal_output else QtCore.Qt.Unchecked)
@@ -317,14 +318,14 @@ class BatchStitchDialog(QtWidgets.QDialog):
             elif c == 4:
                 s.stitch_channel = max(0, int((item.text() or '0').strip() or '0'))
             elif c == 5:
-                s.output_suffix = (item.text() or '').strip() or 'stitched'
+                s.output_suffix = (item.text() or '').strip() or DEFAULT_STITCH_OUTPUT_SUFFIX
             elif c == 6:
                 s.pyramidal_output = (item.checkState() == QtCore.Qt.Checked)
         except Exception:
             return
 
     def _apply_defaults(self) -> None:
-        suffix = self.txt_default_suffix.text().strip() or 'stitched'
+        suffix = self.txt_default_suffix.text().strip() or DEFAULT_STITCH_OUTPUT_SUFFIX
         ch = int(self.spin_default_channel.value())
         pyr = bool(self.chk_default_pyramidal.isChecked())
         for s in self._samples:
@@ -391,7 +392,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
             'schema_version': PLAN_SCHEMA_VERSION,
             'root_dir': self.txt_root.text().strip(),
             'defaults': {
-                'output_suffix': self.txt_default_suffix.text().strip() or 'stitched',
+                'output_suffix': self.txt_default_suffix.text().strip() or DEFAULT_STITCH_OUTPUT_SUFFIX,
                 'stitch_channel': int(self.spin_default_channel.value()),
                 'pyramidal_output': bool(self.chk_default_pyramidal.isChecked()),
                 'use_custom_filename_parsing': bool(self.grp_advanced.isChecked()),
@@ -408,7 +409,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                     'enabled': bool(s.enabled),
                     'avg_tiles_per_cycle': float(s.avg_tiles_per_cycle),
                     'stitch_channel': int(s.stitch_channel),
-                    'output_suffix': str(s.output_suffix or 'stitched'),
+                    'output_suffix': str(s.output_suffix or DEFAULT_STITCH_OUTPUT_SUFFIX),
                     'pyramidal_output': bool(s.pyramidal_output),
                 }
                 for s in self._samples
@@ -436,7 +437,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
             return
         self.txt_root.setText(str(d.get('root_dir') or ''))
         defs = d.get('defaults') or {}
-        self.txt_default_suffix.setText(str(defs.get('output_suffix') or 'stitched'))
+        self.txt_default_suffix.setText(str(defs.get('output_suffix') or DEFAULT_STITCH_OUTPUT_SUFFIX))
         self.spin_default_channel.setValue(max(0, int(defs.get('stitch_channel') or 0)))
         self.chk_default_pyramidal.setChecked(bool(defs.get('pyramidal_output', True)))
         self.grp_advanced.setChecked(bool(defs.get('use_custom_filename_parsing', False)))
@@ -451,7 +452,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                 cycle_dirs=[Path(p).expanduser() for p in (rec.get('cycle_dirs') or [])],
                 enabled=bool(rec.get('enabled', True)),
                 stitch_channel=max(0, int(rec.get('stitch_channel') or 0)),
-                output_suffix=str(rec.get('output_suffix') or 'stitched'),
+                output_suffix=str(rec.get('output_suffix') or DEFAULT_STITCH_OUTPUT_SUFFIX),
                 pyramidal_output=bool(rec.get('pyramidal_output', True)),
                 avg_tiles_per_cycle=float(rec.get('avg_tiles_per_cycle') or 0.0),
             )
@@ -475,7 +476,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
                 it_pyr = self.tbl.item(r, 6)
                 s.enabled = (it_run.checkState() == QtCore.Qt.Checked) if it_run else True
                 s.stitch_channel = max(0, int((it_ch.text() if it_ch else '0').strip() or '0'))
-                s.output_suffix = (it_suf.text() if it_suf else 'stitched').strip() or 'stitched'
+                s.output_suffix = (it_suf.text() if it_suf else DEFAULT_STITCH_OUTPUT_SUFFIX).strip() or DEFAULT_STITCH_OUTPUT_SUFFIX
                 s.pyramidal_output = (it_pyr.checkState() == QtCore.Qt.Checked) if it_pyr else True
             except Exception:
                 continue

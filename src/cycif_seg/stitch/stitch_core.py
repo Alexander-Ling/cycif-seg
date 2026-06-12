@@ -30,6 +30,7 @@ from cycif_seg.io.ome_tiff import (
 _DEFAULT_TILE_RE = re.compile(r"^(?:area|raw).*_(\d+)_(\d+)\.ome\.tiff?$", re.IGNORECASE)
 _DEFAULT_X_GROUP = 1
 _DEFAULT_Y_GROUP = 2
+DEFAULT_STITCH_OUTPUT_SUFFIX = 'cyseg-stitched'
 
 
 @dataclass(frozen=True)
@@ -823,7 +824,7 @@ def _solve_positions(
 def stitch_cycle_tiles(
     cycle_dir: str | Path,
     *,
-    output_suffix: str = 'stitched',
+    output_suffix: str = DEFAULT_STITCH_OUTPUT_SUFFIX,
     stitch_channel: int = 0,
     pyramidal_output: bool = True,
     tile_filename_regex: str | None = None,
@@ -886,7 +887,7 @@ def stitch_cycle_tiles(
     max_x = max(int(v[1]) for v in positions.values()) + int(tile_w)
     shape_yxc = (int(max_y), int(max_x), int(n_channels))
 
-    base_name = f"{cycle_dir.name}_{str(output_suffix or 'stitched').strip()}.ome.tiff"
+    base_name = f"{cycle_dir.name}_{str(output_suffix or DEFAULT_STITCH_OUTPUT_SUFFIX).strip()}.ome.tiff"
     out_flat = cycle_dir / f".{base_name}.flat_tmp.ome.tiff"
     out_final = cycle_dir / base_name
     feather = _feather_weights(tile_h, tile_w)
