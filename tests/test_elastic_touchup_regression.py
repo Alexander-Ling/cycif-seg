@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from cycif_seg.io.ome_tiff import load_single_channel_tiff_native
 from cycif_seg.preprocess.organize_cycles import (
     CycleInput,
     _elastic_tile_trust_weight,
+    _run_elastix_bspline,
     _strip_source_row_bounds_for_field,
     merge_cycles_to_ome_tiff,
 )
@@ -220,6 +222,33 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
 
         self.assertLessEqual(src_y0, 96 - 19 - 4)
         self.assertGreaterEqual(src_y1, 160 - 3 + 4)
+
+    def test_elastix_touchup_does_not_write_transformix_scratch_to_cwd(self) -> None:
+        yy, xx = np.indices((48, 48), dtype=np.float32)
+        fixed = np.zeros((48, 48), dtype=np.float32)
+        moving = np.zeros((48, 48), dtype=np.float32)
+        fixed[_disk(yy, xx, 24, 24, 10)] = 1.0
+        moving[_disk(yy, xx, 25, 23, 10)] = 1.0
+        mask = fixed > 0
+
+        old_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as td:
+            scratch_cwd = Path(td)
+            try:
+                os.chdir(scratch_cwd)
+                result = _run_elastix_bspline(
+                    fixed,
+                    moving,
+                    mask,
+                    grid_spacing_px=16,
+                    max_iterations=1,
+                    max_step_length=0.5,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertIsNotNone(result)
+            self.assertFalse((scratch_cwd / "deformationField.nii").exists())
 
     def test_low_mem_tiled_elastic_registration_preserves_correlation(self) -> None:
         fixed = _synthetic_two_island_image()

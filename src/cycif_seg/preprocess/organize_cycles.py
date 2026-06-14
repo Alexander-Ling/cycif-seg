@@ -1629,7 +1629,7 @@ _ELASTIX_MAX_DIM: int = 512
 # initialises inside the napari/Qt process, where it hard-crashes due to a
 # DLL conflict.  The worker script is written to a temp file at call time.
 _ELASTIX_WORKER_SCRIPT = r"""
-import sys, numpy as np, itk
+import sys, tempfile, numpy as np, itk
 
 d    = np.load(sys.argv[1])
 ref  = d['ref'].astype(np.float32)
@@ -1641,6 +1641,16 @@ msl  = float(d['msl'][0])
 
 fixed_itk  = itk.GetImageFromArray(ref)
 moving_itk = itk.GetImageFromArray(mov)
+
+def _compute_deformation_field(moving_image, transform):
+    # Transformix writes deformationField.nii even when we only need the in-memory image.
+    with tempfile.TemporaryDirectory(prefix='cycif_transformix_') as _outdir:
+        tx = itk.TransformixFilter.New(moving_image, transform)
+        tx.SetComputeDeformationField(True)
+        tx.SetLogToConsole(False)
+        tx.SetOutputDirectory(_outdir)
+        tx.UpdateLargestPossibleRegion()
+        return tx.GetOutputDeformationField()
 
 po = itk.ParameterObject.New()
 pm = po.GetDefaultParameterMap('bspline')
@@ -1658,7 +1668,7 @@ po.AddParameterMap(pm)
 
 _, tf = itk.elastix_registration_method(
     fixed_itk, moving_itk, parameter_object=po, log_to_console=False)
-df_img = itk.transformix_deformation_field(moving_itk, tf, log_to_console=False)
+df_img = _compute_deformation_field(moving_itk, tf)
 df = itk.GetArrayFromImage(df_img)   # (H, W, 2): [0]=dx [1]=dy
 fy = -df[..., 1].astype(np.float32)
 fx = -df[..., 0].astype(np.float32)
@@ -1669,7 +1679,7 @@ np.savez_compressed(sys.argv[2], fy=fy, fx=fx)
 
 # Batch variant: processes N tile pairs in one subprocess, amortising startup overhead.
 _ELASTIX_BATCH_WORKER_SCRIPT = r"""
-import sys, numpy as np, itk
+import sys, tempfile, numpy as np, itk
 
 d    = np.load(sys.argv[1])
 refs = d['refs'].astype(np.float32)   # (N, H, W)
@@ -1683,6 +1693,16 @@ N, H, W = refs.shape
 fys = np.zeros((N, H, W), dtype=np.float32)
 fxs = np.zeros((N, H, W), dtype=np.float32)
 ok  = np.zeros(N, dtype=np.uint8)
+
+def _compute_deformation_field(moving_image, transform):
+    # Transformix writes deformationField.nii even when we only need the in-memory image.
+    with tempfile.TemporaryDirectory(prefix='cycif_transformix_') as _outdir:
+        tx = itk.TransformixFilter.New(moving_image, transform)
+        tx.SetComputeDeformationField(True)
+        tx.SetLogToConsole(False)
+        tx.SetOutputDirectory(_outdir)
+        tx.UpdateLargestPossibleRegion()
+        return tx.GetOutputDeformationField()
 
 po = itk.ParameterObject.New()
 pm = po.GetDefaultParameterMap('bspline')
@@ -1704,7 +1724,7 @@ for i in range(N):
         moving_itk = itk.GetImageFromArray(movs[i])
         _, tf = itk.elastix_registration_method(
             fixed_itk, moving_itk, parameter_object=po, log_to_console=False)
-        df_img = itk.transformix_deformation_field(moving_itk, tf, log_to_console=False)
+        df_img = _compute_deformation_field(moving_itk, tf)
         df = itk.GetArrayFromImage(df_img)
         fy = -df[..., 1].astype(np.float32)
         fx = -df[..., 0].astype(np.float32)
