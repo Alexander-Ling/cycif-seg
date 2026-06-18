@@ -715,6 +715,82 @@ def _masked_corr_score(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) 
     return float(np.sum(a * b) / (da * db))
 
 
+def _estimate_masked_rigid_touchup(
+    fixed_crop: np.ndarray,
+    moving_crop: np.ndarray,
+    mask: np.ndarray,
+    *,
+    max_shift: float,
+    min_improvement: float = 0.02,
+    target_dim: int = 256,
+) -> tuple[float, float, float, float, bool]:
+    """Estimate a bounded residual translation for one elastic tile.
+
+    Returns ``(dy, dx, base_corr, candidate_corr, accepted)``.  The accepted
+    shift is intended to be added to the tile displacement field and blended
+    with the same tent weights as elastic output, not applied as a hard seam.
+    """
+    base_corr = _masked_corr_score(fixed_crop, moving_crop, mask)
+    h, w = int(fixed_crop.shape[0]), int(fixed_crop.shape[1])
+    if h <= 0 or w <= 0 or int(np.asarray(mask).sum()) < 32:
+        return 0.0, 0.0, float(base_corr), float(base_corr), False
+
+    factor = max(1, int(math.ceil(max(h, w) / max(32, int(target_dim)))))
+    fixed_ds = _normalized_for_registration(_downsample_image(fixed_crop, factor))
+    moving_ds = _normalized_for_registration(_downsample_image(moving_crop, factor))
+    if factor > 1:
+        mask_ds = _downsample_image(mask.astype(np.float32, copy=False), factor) > 0.2
+    else:
+        mask_ds = mask.astype(bool, copy=False)
+    if mask_ds.shape != fixed_ds.shape:
+        yy = min(mask_ds.shape[0], fixed_ds.shape[0])
+        xx = min(mask_ds.shape[1], fixed_ds.shape[1])
+        mask_ds = mask_ds[:yy, :xx]
+        fixed_ds = fixed_ds[:yy, :xx]
+        moving_ds = moving_ds[:yy, :xx]
+    if int(mask_ds.sum()) < 32:
+        return 0.0, 0.0, float(base_corr), float(base_corr), False
+
+    radius = max(1, int(math.ceil(float(max_shift) / float(factor))))
+    step = max(1, int(math.ceil(radius / 8.0)))
+    best_dy = 0
+    best_dx = 0
+    best_score = _masked_corr_score(fixed_ds, moving_ds, mask_ds)
+
+    def _score(dy_i: int, dx_i: int) -> float:
+        shifted = _apply_translation(moving_ds, float(dy_i), float(dx_i), order=1)
+        return _masked_corr_score(fixed_ds, shifted, mask_ds)
+
+    while True:
+        y_min = max(-radius, best_dy - step * 4)
+        y_max = min(radius, best_dy + step * 4)
+        x_min = max(-radius, best_dx - step * 4)
+        x_max = min(radius, best_dx + step * 4)
+        for dy_i in range(y_min, y_max + 1, step):
+            for dx_i in range(x_min, x_max + 1, step):
+                score = _score(dy_i, dx_i)
+                if score > best_score + 1e-6:
+                    best_score = float(score)
+                    best_dy = int(dy_i)
+                    best_dx = int(dx_i)
+        if step <= 1:
+            break
+        step = max(1, step // 2)
+
+    dy = float(best_dy * factor)
+    dx = float(best_dx * factor)
+    dy = float(np.clip(dy, -float(max_shift), float(max_shift)))
+    dx = float(np.clip(dx, -float(max_shift), float(max_shift)))
+    if abs(dy) <= 1e-6 and abs(dx) <= 1e-6:
+        return 0.0, 0.0, float(base_corr), float(base_corr), False
+    candidate = _apply_translation(moving_crop, dy, dx, order=1)
+    candidate_corr = _masked_corr_score(fixed_crop, candidate, mask)
+    accepted = bool(np.isfinite(candidate_corr) and candidate_corr >= float(base_corr) + float(min_improvement))
+    if not accepted:
+        return 0.0, 0.0, float(base_corr), float(candidate_corr), False
+    return dy, dx, float(base_corr), float(candidate_corr), True
+
+
 def _score_mask_for_crop(mask_crop: np.ndarray) -> np.ndarray:
     use = mask_crop.astype(bool, copy=False)
     if int(use.sum()) >= 32:
@@ -2071,18 +2147,31 @@ def _elastic_touchup_island(
     if corr > float(skip_corr_threshold):
         return None
 
+    rigid_bound = min(128.0, max(16.0, float(tile_size) / 8.0))
     if h * w < int(large_island_px):
         _check_cancel(cancel_cb)
+        _rdy, _rdx, _base_corr, _rigid_corr, _rigid_ok = _estimate_masked_rigid_touchup(
+            ref_crop,
+            mov_crop,
+            island_crop,
+            max_shift=rigid_bound,
+            min_improvement=0.02,
+        )
+        mov_for_elastic = _apply_translation(mov_crop, _rdy, _rdx, order=1) if _rigid_ok else mov_crop
         result = _run_elastix_bspline(
-            ref_crop, mov_crop, island_crop,
+            ref_crop, mov_for_elastic, island_crop,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
             max_step_length=max_step_length,
         )
         if result is None:
             if _debug_elastic_field:
-                print("[elastic]   -> no correction (elastix returned None)", flush=True)
+                _mode = "rigid candidate + elastix failed" if _rigid_ok else "elastix returned None"
+                print(f"[elastic]   -> no correction ({_mode})", flush=True)
             return None
         disp_y, disp_x = result
+        if _rigid_ok:
+            disp_y = disp_y + np.float32(_rdy)
+            disp_x = disp_x + np.float32(_rdx)
         if _debug_elastic_field:
             _mag = np.sqrt(disp_y ** 2 + disp_x ** 2)
             _isl = island_crop.astype(bool)
@@ -2090,7 +2179,9 @@ def _elastic_touchup_island(
             print(
                 f"[elastic]   -> direct disp: max={float(np.max(_mag)):.3f}px "
                 f"mean(island)={float(np.mean(_vals)):.3f}px "
-                f"p95(island)={float(np.percentile(_vals, 95)):.3f}px",
+                f"p95(island)={float(np.percentile(_vals, 95)):.3f}px "
+                f"mode={'rigid+elastic' if _rigid_ok else 'elastic-only'} "
+                f"corr={_base_corr:.3f}->{_rigid_corr:.3f}",
                 flush=True,
             )
         return disp_y, disp_x, (y0, y1, x0, x1)
@@ -2168,14 +2259,26 @@ def _elastic_touchup_island(
 
     def _run_tile(_ty0, _ty1, _tx0, _tx1, _tent, _t_ref, _t_mov, _t_isl):
         _check_cancel(cancel_cb)
+        _rdy, _rdx, _base_corr, _rigid_corr, _rigid_ok = _estimate_masked_rigid_touchup(
+            _t_ref,
+            _t_mov,
+            _t_isl,
+            max_shift=rigid_bound,
+            min_improvement=0.02,
+        )
+        _mov_for_elastic = _apply_translation(_t_mov, _rdy, _rdx, order=1) if _rigid_ok else _t_mov
         _tres = _run_elastix_bspline(
-            _t_ref, _t_mov, _t_isl,
+            _t_ref, _mov_for_elastic, _t_isl,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
             max_step_length=max_step_length,
         )
         if _tres is None:
             return None
-        return _ty0, _ty1, _tx0, _tx1, _tent, _tres[0], _tres[1]
+        _tdy, _tdx = _tres
+        if _rigid_ok:
+            _tdy = _tdy + np.float32(_rdy)
+            _tdx = _tdx + np.float32(_rdx)
+        return _ty0, _ty1, _tx0, _tx1, _tent, _tdy, _tdx
 
     def _accumulate(_res):
         nonlocal _n_tiles_ok
@@ -2871,8 +2974,19 @@ def merge_cycles_to_ome_tiff(
                         int(gy0), int(gy1), int(gx0), int(gx1),
                     )
                 _t = time.perf_counter()
+                _rigid_bound = min(128.0, max(16.0, float(elastic_touchup_tile_size) / 8.0))
+                _rdy, _rdx, _base_corr, _rigid_corr, _rigid_ok = _estimate_masked_rigid_touchup(
+                    _ref_crop,
+                    _mov_crop,
+                    _island_tile,
+                    max_shift=_rigid_bound,
+                    min_improvement=0.02,
+                )
+                _rigid_s = time.perf_counter() - _t
+                _mov_for_elastic = _apply_translation(_mov_crop, _rdy, _rdx, order=1) if _rigid_ok else _mov_crop
+                _t = time.perf_counter()
                 _res = _run_elastix_bspline(
-                    _ref_crop, _mov_crop, _island_tile,
+                    _ref_crop, _mov_for_elastic, _island_tile,
                     grid_spacing_px=int(elastic_touchup_bspline_spacing),
                     max_iterations=int(elastic_touchup_max_iterations),
                     max_step_length=float(elastic_touchup_max_step_length),
@@ -2880,19 +2994,27 @@ def merge_cycles_to_ome_tiff(
                 _elastix_s = time.perf_counter() - _t
                 if _res is None:
                     return (
-                        "elastix_failed",
+                        "rigid_candidate_elastix_failed" if _rigid_ok else "elastix_failed",
                         {
                             "total": time.perf_counter() - _t_total,
                             "mask": _mask_s,
                             "ref": _ref_s,
                             "mov": _mov_s,
                             "tile_corr": _tile_corr_s,
+                            "rigid": _rigid_s,
                             "elastix": _elastix_s,
+                            "rigid_delta_y": float(_rdy),
+                            "rigid_delta_x": float(_rdx),
+                            "rigid_corr_gain": float(_rigid_corr - _base_corr),
+                            "rigid_rejected": 0.0 if _rigid_ok else 1.0,
                         },
                         None, None, None,
                         int(gy0), int(gy1), int(gx0), int(gx1),
                     )
                 _edy, _edx = _res
+                if _rigid_ok:
+                    _edy = _edy + np.float32(_rdy)
+                    _edx = _edx + np.float32(_rdx)
                 _t = time.perf_counter()
                 _tent = _elastic_tile_trust_weight(
                     _th,
@@ -2908,15 +3030,20 @@ def merge_cycles_to_ome_tiff(
                 _edx_w = _edx * _tent
                 _weight_s = time.perf_counter() - _t
                 return (
-                    "ok",
+                    "rigid_elastic_ok" if _rigid_ok else "elastic_only_ok",
                     {
                         "total": time.perf_counter() - _t_total,
                         "mask": _mask_s,
                         "ref": _ref_s,
                         "mov": _mov_s,
                         "tile_corr": _tile_corr_s,
+                        "rigid": _rigid_s,
                         "elastix": _elastix_s,
                         "weight": _weight_s,
+                        "rigid_delta_y": float(_rdy),
+                        "rigid_delta_x": float(_rdx),
+                        "rigid_corr_gain": float(_rigid_corr - _base_corr),
+                        "rigid_rejected": 0.0 if _rigid_ok else 1.0,
                     },
                     _edy_w, _edx_w, _tent,
                     int(gy0), int(gy1), int(gx0), int(gx1),
@@ -2938,11 +3065,21 @@ def merge_cycles_to_ome_tiff(
             _timing_tile_ref_s = 0.0
             _timing_tile_mov_s = 0.0
             _timing_tile_corr_s = 0.0
+            _timing_tile_rigid_s = 0.0
             _timing_tile_elastix_s = 0.0
             _timing_tile_weight_s = 0.0
             _timing_accum_s = 0.0
             _timing_field_write_s = 0.0
             _timing_provider_read_s = 0.0
+            _tile_status_counts: dict[str, int] = {
+                "empty": 0,
+                "skip_corr": 0,
+                "rigid_elastic_ok": 0,
+                "elastic_only_ok": 0,
+                "rigid_candidate_elastix_failed": 0,
+                "elastix_failed": 0,
+                "rigid_candidate_rejected": 0,
+            }
 
             def _emit_elastic_tile_progress(detail: str = "") -> None:
                 if progress_event_cb is None:
@@ -2955,7 +3092,12 @@ def merge_cycles_to_ome_tiff(
                         f"7. elastic touch-up Cycle {cycle}: "
                         f"island {_current_island_idx}/{len(regs_ds)}  "
                         f"tiles completed={_n_tiles_completed}/{_n_tiles_submitted}  "
-                        f"ok={_n_tiles_ok}  skipped/failed={_n_tiles_failed}  "
+                        f"rigid+elastic={_tile_status_counts['rigid_elastic_ok']}  "
+                        f"elastic-only={_tile_status_counts['elastic_only_ok']}  "
+                        f"rigid_rejected={_tile_status_counts['rigid_candidate_rejected']}  "
+                        f"skip_corr={_tile_status_counts['skip_corr']}  "
+                        f"empty={_tile_status_counts['empty']}  "
+                        f"failed={_tile_status_counts['elastix_failed'] + _tile_status_counts['rigid_candidate_elastix_failed']}  "
                         f"running={_running}  elapsed={_elapsed}s{_detail}"
                     ),
                     "phase": "elastic_touchup_tile",
@@ -2974,7 +3116,7 @@ def merge_cycles_to_ome_tiff(
             ) -> None:
                 nonlocal _pending, _n_tiles_completed, _n_tiles_ok, _n_tiles_failed
                 nonlocal _timing_tile_total_s, _timing_tile_mask_s, _timing_tile_ref_s
-                nonlocal _timing_tile_mov_s, _timing_tile_corr_s, _timing_tile_elastix_s
+                nonlocal _timing_tile_mov_s, _timing_tile_corr_s, _timing_tile_rigid_s, _timing_tile_elastix_s
                 nonlocal _timing_tile_weight_s, _timing_accum_s
                 if not _pending:
                     return
@@ -3000,9 +3142,13 @@ def merge_cycles_to_ome_tiff(
                     _timing_tile_ref_s += float(_timings.get("ref", 0.0))
                     _timing_tile_mov_s += float(_timings.get("mov", 0.0))
                     _timing_tile_corr_s += float(_timings.get("tile_corr", 0.0))
+                    _timing_tile_rigid_s += float(_timings.get("rigid", 0.0))
                     _timing_tile_elastix_s += float(_timings.get("elastix", 0.0))
                     _timing_tile_weight_s += float(_timings.get("weight", 0.0))
-                    if _status != "ok" or _edy_w is None or _edx_w is None or _wt is None:
+                    _tile_status_counts[_status] = int(_tile_status_counts.get(_status, 0)) + 1
+                    if float(_timings.get("rigid_rejected", 0.0)) > 0.5:
+                        _tile_status_counts["rigid_candidate_rejected"] += 1
+                    if _status not in {"rigid_elastic_ok", "elastic_only_ok"} or _edy_w is None or _edx_w is None or _wt is None:
                         _n_tiles_failed += 1
                         _emit_elastic_tile_progress()
                         continue
@@ -3197,6 +3343,7 @@ def merge_cycles_to_ome_tiff(
                     - _timing_tile_ref_s
                     - _timing_tile_mov_s
                     - _timing_tile_corr_s
+                    - _timing_tile_rigid_s
                     - _timing_tile_elastix_s
                     - _timing_tile_weight_s,
                 )
@@ -3204,6 +3351,17 @@ def merge_cycles_to_ome_tiff(
                     f"[elastic] cycle {cycle}: {_n_tiles_ok}/{_n_tiles_submitted} tile(s) "
                     f"produced island-scoped corrections "
                     f"({_n_tiles_failed} skipped/failed after submission)",
+                    flush=True,
+                )
+                print(
+                    f"[elastic] cycle {cycle}: tile categories "
+                    f"rigid+elastic={_tile_status_counts['rigid_elastic_ok']} "
+                    f"elastic-only={_tile_status_counts['elastic_only_ok']} "
+                    f"rigid_rejected={_tile_status_counts['rigid_candidate_rejected']} "
+                    f"skip_corr={_tile_status_counts['skip_corr']} "
+                    f"empty={_tile_status_counts['empty']} "
+                    f"elastix_failed={_tile_status_counts['elastix_failed']} "
+                    f"rigid_candidate_elastix_failed={_tile_status_counts['rigid_candidate_elastix_failed']}",
                     flush=True,
                 )
                 print(
@@ -3221,6 +3379,7 @@ def merge_cycles_to_ome_tiff(
                     f"ref_roi={_timing_tile_ref_s:.3f}s "
                     f"moving_roi_translate={_timing_tile_mov_s:.3f}s "
                     f"tile_corr={_timing_tile_corr_s:.3f}s "
+                    f"rigid_search={_timing_tile_rigid_s:.3f}s "
                     f"elastix={_timing_tile_elastix_s:.3f}s "
                     f"weight={_timing_tile_weight_s:.3f}s "
                     f"other={_timing_tile_other_s:.3f}s",

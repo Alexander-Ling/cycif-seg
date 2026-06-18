@@ -13,7 +13,9 @@ import tifffile
 from cycif_seg.io.ome_tiff import load_single_channel_tiff_native
 from cycif_seg.preprocess.organize_cycles import (
     CycleInput,
+    _apply_translation,
     _elastic_tile_trust_weight,
+    _estimate_masked_rigid_touchup,
     _run_elastix_bspline,
     _strip_source_row_bounds_for_field,
     merge_cycles_to_ome_tiff,
@@ -173,6 +175,57 @@ def _save_visual_artifacts(
 
 
 class ElasticTouchupRegressionTest(unittest.TestCase):
+    def test_masked_rigid_touchup_accepts_improving_shift(self) -> None:
+        fixed = _synthetic_two_island_image((160, 160)).astype(np.float32)
+        moving = _apply_translation(fixed, -12.0, 8.0, order=1)
+        mask = fixed > 1000
+
+        dy, dx, base_corr, candidate_corr, accepted = _estimate_masked_rigid_touchup(
+            fixed,
+            moving,
+            mask,
+            max_shift=24.0,
+            min_improvement=0.02,
+        )
+
+        self.assertTrue(accepted)
+        self.assertGreater(candidate_corr, base_corr + 0.02)
+        self.assertLessEqual(abs(dy), 24.0)
+        self.assertLessEqual(abs(dx), 24.0)
+
+    def test_masked_rigid_touchup_rejects_non_improving_shift(self) -> None:
+        fixed = _synthetic_two_island_image((160, 160)).astype(np.float32)
+        mask = fixed > 1000
+
+        dy, dx, base_corr, candidate_corr, accepted = _estimate_masked_rigid_touchup(
+            fixed,
+            fixed.copy(),
+            mask,
+            max_shift=24.0,
+            min_improvement=0.02,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(dy, 0.0)
+        self.assertEqual(dx, 0.0)
+        self.assertAlmostEqual(candidate_corr, base_corr, places=6)
+
+    def test_masked_rigid_touchup_respects_shift_bound(self) -> None:
+        fixed = _synthetic_two_island_image((160, 160)).astype(np.float32)
+        moving = _apply_translation(fixed, -30.0, 30.0, order=1)
+        mask = fixed > 1000
+
+        dy, dx, _base_corr, _candidate_corr, _accepted = _estimate_masked_rigid_touchup(
+            fixed,
+            moving,
+            mask,
+            max_shift=8.0,
+            min_improvement=0.0,
+        )
+
+        self.assertLessEqual(abs(dy), 8.0)
+        self.assertLessEqual(abs(dx), 8.0)
+
     def test_elastic_tile_trust_weight_suppresses_only_artificial_edges(self) -> None:
         weight = _elastic_tile_trust_weight(
             32,
@@ -290,11 +343,18 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
             ev for ev in tile_events
             if "tiles completed=" in str(ev.get("msg", "")) and "submitted tile" not in str(ev.get("msg", ""))
         ]
+        category_events = [
+            ev for ev in completed_events
+            if "rigid+elastic=" in str(ev.get("msg", ""))
+            and "elastic-only=" in str(ev.get("msg", ""))
+            and "skip_corr=" in str(ev.get("msg", ""))
+        ]
 
         self.assertGreaterEqual(fixed.shape[0] // 96, 4)
         self.assertGreaterEqual(len(corr_scan_events), 1)
         self.assertGreaterEqual(len(submitted_events), 6)
         self.assertGreaterEqual(len(completed_events), 1)
+        self.assertGreaterEqual(len(category_events), 1)
         self.assertGreater(corr_w1, pre_corr + 0.05)
         self.assertGreater(corr_w3, pre_corr + 0.05)
         self.assertGreaterEqual(corr_w1, 0.90)
