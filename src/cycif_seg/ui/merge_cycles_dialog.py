@@ -212,19 +212,31 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "Smaller values allow finer local corrections at the cost of more tiles.\n"
             "(default: 2048, min: 64)"
         )
+        self.spn_rigid_max_shift = QtWidgets.QDoubleSpinBox()
+        self.spn_rigid_max_shift.setRange(1.0, 5000.0)
+        self.spn_rigid_max_shift.setSingleStep(64.0)
+        self.spn_rigid_max_shift.setDecimals(1)
+        self.spn_rigid_max_shift.setValue(512.0)
+        self.spn_rigid_max_shift.setToolTip(
+            "Maximum local rigid touch-up shift before elastic correction, in pixels.\n"
+            "Larger values help when residual tile offsets exceed the old 128 px cap (default: 512)."
+        )
         elastic_form.addRow("B-spline grid spacing (px):", self.spn_bspline_spacing)
         elastic_form.addRow("Max iterations:", self.spn_max_iterations)
         elastic_form.addRow("Max step length:", self.spn_max_step_length)
         elastic_form.addRow("Elastic tile size (px):", self.spn_elastic_tile_size)
+        elastic_form.addRow("Pre-elastic rigid max shift (px):", self.spn_rigid_max_shift)
         elastic_layout.addLayout(elastic_form)
         self.spn_bspline_spacing.setEnabled(True)
         self.spn_max_iterations.setEnabled(True)
         self.spn_max_step_length.setEnabled(True)
         self.spn_elastic_tile_size.setEnabled(True)
+        self.spn_rigid_max_shift.setEnabled(True)
         self.chk_elastic_touchup.toggled.connect(self.spn_bspline_spacing.setEnabled)
         self.chk_elastic_touchup.toggled.connect(self.spn_max_iterations.setEnabled)
         self.chk_elastic_touchup.toggled.connect(self.spn_max_step_length.setEnabled)
         self.chk_elastic_touchup.toggled.connect(self.spn_elastic_tile_size.setEnabled)
+        self.chk_elastic_touchup.toggled.connect(self.spn_rigid_max_shift.setEnabled)
         root.addWidget(elastic_group)
         try:
             if isinstance(self._initial_cfg, dict):
@@ -243,6 +255,9 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 vets = self._initial_cfg.get("elastic_touchup_tile_size")
                 if vets is not None:
                     self.spn_elastic_tile_size.setValue(max(64, int(vets)))
+                vrms = self._initial_cfg.get("elastic_touchup_rigid_max_shift")
+                if vrms is not None:
+                    self.spn_rigid_max_shift.setValue(max(1.0, float(vrms)))
         except Exception:
             pass
 
@@ -655,5 +670,6 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "elastic_touchup_max_iterations": int(self.spn_max_iterations.value()),
             "elastic_touchup_max_step_length": float(self.spn_max_step_length.value()),
             "elastic_touchup_tile_size": int(self.spn_elastic_tile_size.value()),
+            "elastic_touchup_rigid_max_shift": float(self.spn_rigid_max_shift.value()),
             "cycles": cycles_out,
         }

@@ -567,6 +567,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 "elastic_touchup_max_iterations": int(getattr(s, 'elastic_touchup_max_iterations', 10) or 10),
                 "elastic_touchup_max_step_length": float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0),
                 "elastic_touchup_tile_size": int(getattr(s, 'elastic_touchup_tile_size', 2048) or 2048),
+                "elastic_touchup_rigid_max_shift": float(getattr(s, 'elastic_touchup_rigid_max_shift', 512.0) or 512.0),
                 "cycles": cycles_out,
             }
         except Exception:
@@ -633,6 +634,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 s.elastic_touchup_max_step_length = max(0.01, float(cfg.get('elastic_touchup_max_step_length') or 1.0))
             if 'elastic_touchup_tile_size' in cfg:
                 s.elastic_touchup_tile_size = max(64, int(cfg.get('elastic_touchup_tile_size') or 2048))
+            if 'elastic_touchup_rigid_max_shift' in cfg:
+                s.elastic_touchup_rigid_max_shift = max(1.0, float(cfg.get('elastic_touchup_rigid_max_shift') or 512.0))
         except Exception:
             pass
 
@@ -940,6 +943,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                         elastic_touchup_large_island_px=max(1, int(getattr(s, 'elastic_touchup_large_island_px', 4_000_000) or 4_000_000)),
                         elastic_touchup_workers=max(0, int(getattr(s, 'elastic_touchup_workers', 0) or 0)),
                         elastic_touchup_max_step_length=max(0.01, float(getattr(s, 'elastic_touchup_max_step_length', 1.0) or 1.0)),
+                        elastic_touchup_rigid_max_shift=max(1.0, float(getattr(s, 'elastic_touchup_rigid_max_shift', 512.0) or 512.0)),
                         debug_elastic_touchup=is_debug_elastic_touchup(),
                         debug_dir=str(getattr(s, 'debug_dir') or '') or None,
                         pyramidal_output=bool(getattr(s, 'pyramidal_output', False)),

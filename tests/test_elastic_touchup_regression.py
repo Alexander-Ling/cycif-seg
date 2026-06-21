@@ -16,6 +16,9 @@ from cycif_seg.preprocess.organize_cycles import (
     _apply_translation,
     _elastic_tile_trust_weight,
     _estimate_masked_rigid_touchup,
+    _resolve_borrowed_rigid_touchups,
+    _RigidTouchupTile,
+    _smooth_rigid_prior_for_tile,
     _run_elastix_bspline,
     _strip_source_row_bounds_for_field,
     merge_cycles_to_ome_tiff,
@@ -175,6 +178,131 @@ def _save_visual_artifacts(
 
 
 class ElasticTouchupRegressionTest(unittest.TestCase):
+    def _rigid_tile(
+        self,
+        y: int,
+        x: int,
+        *,
+        island: int = 1,
+        accepted: bool = False,
+        dy: float = 0.0,
+        dx: float = 0.0,
+        gain: float = 0.1,
+    ) -> _RigidTouchupTile:
+        return _RigidTouchupTile(
+            y0=y,
+            y1=y + 10,
+            x0=x,
+            x1=x + 10,
+            island_label=island,
+            center_y=y + 5.0,
+            center_x=x + 5.0,
+            rigid_dy=dy,
+            rigid_dx=dx,
+            base_corr=0.1,
+            candidate_corr=0.1 + gain,
+            accepted=accepted,
+        )
+
+    def test_borrowed_rigid_touchup_propagates_across_failed_chain(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, accepted=True, dy=20.0, dx=-6.0),
+            self._rigid_tile(0, 10),
+            self._rigid_tile(0, 20),
+            self._rigid_tile(0, 30),
+        ]
+
+        counts = _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=64, neighborhood_radius=1)
+
+        self.assertEqual(counts["accepted"], 1)
+        self.assertEqual(counts["borrowed"], 3)
+        self.assertEqual(tiles[-1].mode, "borrowed")
+        self.assertAlmostEqual(tiles[-1].resolved_dy, 20.0, places=6)
+        self.assertAlmostEqual(tiles[-1].resolved_dx, -6.0, places=6)
+
+    def test_borrowed_rigid_touchup_uses_multiple_good_neighbors(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, accepted=True, dy=10.0, dx=0.0, gain=0.2),
+            self._rigid_tile(0, 20, accepted=True, dy=30.0, dx=0.0, gain=0.2),
+            self._rigid_tile(0, 10),
+        ]
+
+        counts = _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        self.assertEqual(counts["borrowed"], 1)
+        self.assertEqual(tiles[2].mode, "borrowed")
+        self.assertAlmostEqual(tiles[2].resolved_dy, 20.0, places=6)
+        self.assertAlmostEqual(tiles[2].resolved_dx, 0.0, places=6)
+
+    def test_borrowed_rigid_touchup_does_not_cross_islands(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, island=1, accepted=True, dy=14.0, dx=7.0),
+            self._rigid_tile(0, 10, island=2),
+        ]
+
+        counts = _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        self.assertEqual(counts["borrowed"], 0)
+        self.assertEqual(counts["elastic_only"], 1)
+        self.assertEqual(tiles[1].mode, "elastic_only")
+        self.assertEqual(tiles[1].resolved_dy, 0.0)
+        self.assertEqual(tiles[1].resolved_dx, 0.0)
+
+    def test_borrowed_rigid_touchup_clamps_shift_magnitude(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, accepted=True, dy=100.0, dx=0.0),
+            self._rigid_tile(0, 10),
+        ]
+
+        _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=25)
+
+        self.assertEqual(tiles[1].mode, "borrowed")
+        self.assertLessEqual(abs(tiles[1].resolved_dy), 25.0)
+
+    def test_high_correlation_tile_becomes_stable_zero_prior_anchor(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, accepted=True, dy=24.0, dx=0.0),
+            self._rigid_tile(0, 10),
+        ]
+        tiles[1].prior_anchor = True
+        tiles[1].base_corr = 0.98
+        tiles[1].candidate_corr = 0.98
+
+        counts = _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        self.assertEqual(counts["stable_zero"], 1)
+        self.assertEqual(tiles[1].mode, "stable_zero")
+        self.assertEqual(tiles[1].resolved_dy, 0.0)
+
+    def test_smooth_rigid_prior_uses_stable_zero_anchor_to_reduce_jump(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, accepted=True, dy=30.0, dx=0.0, gain=0.2),
+            self._rigid_tile(0, 10),
+        ]
+        tiles[1].prior_anchor = True
+        tiles[1].base_corr = 0.98
+        tiles[1].candidate_corr = 0.98
+        _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        dy, dx = _smooth_rigid_prior_for_tile(tiles[1], tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        self.assertGreaterEqual(dy, 0.0)
+        self.assertLess(dy, 30.0)
+        self.assertAlmostEqual(dx, 0.0, places=6)
+
+    def test_smooth_rigid_prior_blends_multiple_resolved_neighbors(self) -> None:
+        tiles = [
+            self._rigid_tile(0, 0, accepted=True, dy=10.0, dx=0.0, gain=0.2),
+            self._rigid_tile(0, 20, accepted=True, dy=30.0, dx=0.0, gain=0.2),
+            self._rigid_tile(0, 10),
+        ]
+        _resolve_borrowed_rigid_touchups(tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        dy, dx = _smooth_rigid_prior_for_tile(tiles[2], tiles, stride_y=10, stride_x=10, max_shift=64)
+
+        self.assertAlmostEqual(dy, 20.0, places=6)
+        self.assertAlmostEqual(dx, 0.0, places=6)
+
     def test_masked_rigid_touchup_accepts_improving_shift(self) -> None:
         fixed = _synthetic_two_island_image((160, 160)).astype(np.float32)
         moving = _apply_translation(fixed, -12.0, 8.0, order=1)

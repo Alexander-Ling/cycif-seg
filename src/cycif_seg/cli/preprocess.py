@@ -322,6 +322,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     args.elastic_touchup_max_step_length if args.elastic_touchup_max_step_length is not None
                     else (getattr(s, "elastic_touchup_max_step_length", 1.0) or 1.0)
                 )),
+                elastic_touchup_rigid_max_shift=max(1.0, float(
+                    args.elastic_touchup_rigid_max_shift if args.elastic_touchup_rigid_max_shift is not None
+                    else (getattr(s, "elastic_touchup_rigid_max_shift", 512.0) or 512.0)
+                )),
                 debug_elastic_touchup=bool(getattr(args, "debug_elastic_touchup", False)) or bool(getattr(s, "debug_elastic_touchup", False)),
                 debug_dir=str(getattr(args, "debug_dir") or getattr(s, "debug_dir") or "") or None,
                 pyramidal_output=bool(getattr(s, "pyramidal_output", False)),
@@ -560,6 +564,7 @@ def _sample_from_sample_dir(args: argparse.Namespace) -> BatchSample:
         elastic_touchup_large_island_px=max(1, int(getattr(args, "elastic_touchup_large_island_px", None) or 4_000_000)),
         elastic_touchup_workers=max(0, int(getattr(args, "elastic_touchup_workers", None) or 0)),
         elastic_touchup_max_step_length=max(0.01, float(getattr(args, "elastic_touchup_max_step_length", None) or 1.0)),
+        elastic_touchup_rigid_max_shift=max(1.0, float(getattr(args, "elastic_touchup_rigid_max_shift", None) or 512.0)),
         debug_elastic_touchup=bool(getattr(args, "debug_elastic_touchup", False)),
         debug_dir=str(getattr(args, "debug_dir") or "") or None,
     )
@@ -622,8 +627,19 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
             global_translation_only=global_translation_only,
             tiled_rigid_tile_size=max(128, int(getattr(sample, "tiled_rigid_tile_size", default_tiled_rigid_tile_size))),
             tiled_rigid_search_factor=max(1.0, float(getattr(sample, "tiled_rigid_search_factor", default_tiled_rigid_search_factor))),
-            low_mem=True,
+            low_mem=bool(getattr(sample, "low_mem", True)),
             strip_height=strip_height,
+            elastic_touchup=(
+                bool(args.elastic_touchup) if args.elastic_touchup is not None
+                else bool(getattr(sample, "elastic_touchup", True))
+            ),
+            elastic_touchup_tile_size=max(64, int(getattr(args, "elastic_touchup_tile_size", None) or getattr(sample, "elastic_touchup_tile_size", 2048) or 2048)),
+            elastic_touchup_skip_corr=float(getattr(args, "elastic_touchup_skip_corr", None) or getattr(sample, "elastic_touchup_skip_corr", 0.95) or 0.95),
+            elastic_touchup_bspline_spacing=max(4, int(getattr(args, "elastic_touchup_bspline_spacing", None) or getattr(sample, "elastic_touchup_bspline_spacing", 50) or 50)),
+            elastic_touchup_max_iterations=max(1, int(getattr(args, "elastic_touchup_max_iterations", None) or getattr(sample, "elastic_touchup_max_iterations", 10) or 10)),
+            elastic_touchup_large_island_px=max(1, int(getattr(sample, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000)),
+            elastic_touchup_max_step_length=max(0.01, float(getattr(args, "elastic_touchup_max_step_length", None) or getattr(sample, "elastic_touchup_max_step_length", 1.0) or 1.0)),
+            elastic_touchup_rigid_max_shift=max(1.0, float(getattr(args, "elastic_touchup_rigid_max_shift", None) or getattr(sample, "elastic_touchup_rigid_max_shift", 512.0) or 512.0)),
             completion=str(args.completion),
             force_from_cycle=args.force_from_cycle,
         )
@@ -679,6 +695,7 @@ def _cmd_resume_registration(args: argparse.Namespace) -> int:
             elastic_touchup_large_island_px=max(1, int(getattr(sample, "elastic_touchup_large_island_px", 4_000_000) or 4_000_000)),
             elastic_touchup_workers=max(0, int(getattr(args, "elastic_touchup_workers", None) or getattr(sample, "elastic_touchup_workers", 0) or 0)),
             elastic_touchup_max_step_length=max(0.01, float(getattr(args, "elastic_touchup_max_step_length", None) or getattr(sample, "elastic_touchup_max_step_length", 1.0) or 1.0)),
+            elastic_touchup_rigid_max_shift=max(1.0, float(getattr(args, "elastic_touchup_rigid_max_shift", None) or getattr(sample, "elastic_touchup_rigid_max_shift", 512.0) or 512.0)),
             debug_elastic_touchup=bool(getattr(args, "debug_elastic_touchup", False)) or bool(getattr(sample, "debug_elastic_touchup", False)),
             debug_dir=str(getattr(args, "debug_dir") or getattr(sample, "debug_dir") or "") or None,
             pyramidal_output=bool(args.pyramidal),
@@ -770,6 +787,8 @@ def main() -> None:
                        help="Worker threads for parallel tile processing (overrides plan; default: 0 = auto)")
     p_run.add_argument("--elastic-touchup-max-step-length", type=float, default=None, metavar="F",
                        help="Maximum optimizer step length per iteration in pixels (overrides plan; default: 1.0)")
+    p_run.add_argument("--elastic-touchup-rigid-max-shift", type=float, default=None, metavar="PX",
+                       help="Maximum pre-elastic local rigid shift in pixels (overrides plan; default: 512)")
     p_run.add_argument("--debug-elastic-touchup", action="store_true",
                        help="Save DAPI registration channel after rigid and after elastic touch-up for each cycle")
     p_run.add_argument("--debug-dir", type=str, default=None, metavar="DIR",
@@ -863,6 +882,8 @@ def main() -> None:
                        help="Worker threads for parallel tile processing (overrides plan; default: 0 = auto)")
     p_res.add_argument("--elastic-touchup-max-step-length", type=float, default=None, metavar="F",
                        help="Maximum optimizer step length per iteration in pixels (overrides plan; default: 1.0)")
+    p_res.add_argument("--elastic-touchup-rigid-max-shift", type=float, default=None, metavar="PX",
+                       help="Maximum pre-elastic local rigid shift in pixels (overrides plan; default: 512)")
     p_res.add_argument("--debug-elastic-touchup", action="store_true",
                        help="Save DAPI registration channel after rigid and after elastic touch-up for each cycle")
     p_res.add_argument("--debug-dir", type=str, default=None, metavar="DIR",

@@ -271,6 +271,7 @@ def _run_registration(
     elastic_touchup: bool = True,
     n_workers: int = 1,
     elastic_touchup_workers: int | None = None,
+    elastic_touchup_rigid_max_shift: float = 512.0,
     pyramid_chunk_size: int = 512,
     pyramid_write_workers: int | None = None,
     force: bool = False,
@@ -312,6 +313,7 @@ def _run_registration(
             pyramidal_output=pyramidal_output,
             elastic_touchup=elastic_touchup,
             elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
+            elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
             pyramid_progress_chunk=pyramid_chunk_size,
             pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
             progress_cb=lambda msg: print(f"  {msg}"),
@@ -338,8 +340,10 @@ def _run_registration(
             cycles,
             output_path,
             registration_algorithm=registration_algorithm,
-            low_mem=False,
+            low_mem=True,
             strip_height=strip_height,
+            elastic_touchup=elastic_touchup,
+            elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
             completion="hybrid",
             manifest_path=progress_path,
         )
@@ -386,6 +390,7 @@ def _run_registration(
         pyramidal_output=pyramidal_output,
         elastic_touchup=elastic_touchup,
         elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
+        elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
         pyramid_progress_chunk=pyramid_chunk_size,
         pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
         # In pyramidal mode the registration step resumes from the intermediate
@@ -466,6 +471,8 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Apply B-spline elastic touch-up after rigid registration (default: on)")
     reg_grp.add_argument("--elastic-touchup-workers", type=int, default=None, metavar="INT",
                           help="Override worker count for elastic touch-up only (default: --n-workers)")
+    reg_grp.add_argument("--elastic-touchup-rigid-max-shift", type=float, default=512.0, metavar="PX",
+                          help="Maximum pre-elastic local rigid shift in pixels (default: 512)")
 
     misc_grp = p.add_argument_group("misc")
     misc_grp.add_argument("--no-pyramidal", action="store_true",
@@ -612,6 +619,7 @@ def main(argv: list[str] | None = None) -> int:
             elastic_touchup=args.elastic_touchup,
             n_workers=args.n_workers,
             elastic_touchup_workers=args.elastic_touchup_workers,
+            elastic_touchup_rigid_max_shift=max(1.0, float(args.elastic_touchup_rigid_max_shift)),
             pyramid_chunk_size=args.pyramid_chunk_size,
             pyramid_write_workers=args.pyramid_write_workers,
             force=args.force_register,
