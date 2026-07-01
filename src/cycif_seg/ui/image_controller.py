@@ -1,21 +1,87 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Callable, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from qtpy import QtCore, QtWidgets
 from napari.qt.threading import thread_worker
-from napari.utils.notifications import show_warning, show_info
+from napari.settings import get_settings
+from napari.utils.notifications import show_warning
 
 from cycif_seg.io.ome_tiff import (
     LazyChannelImage,
+    inspect_tiff_pyramid,
     inspect_tiff_yxc,
     is_tiff_loading_debug,
     load_channel_downsampled,
     load_channel_multiscale_lazy,
     load_single_channel_tiff_native,
 )
+
+
+class ViewerTileRuntime:
+    """Small owner for viewer async/tile scheduling state.
+
+    Napari 0.7 can slice layers off the main thread, but the setting is off by
+    default.  Step 2a multiscale layers are the only app path that needs this
+    aggressive viewer behavior, so the controller owns the opt-in and the
+    generation counters used to ignore stale worker callbacks.
+    """
+
+    def __init__(self, *, max_workers: int | None = None):
+        cpu = os.cpu_count() or 2
+        self.max_workers = max(1, int(max_workers or min(8, max(2, cpu // 2))))
+        self._pool: ThreadPoolExecutor | None = None
+        self._load_generation = 0
+        self._channel_generation = 0
+
+    def configure_for_multiscale(self) -> None:
+        try:
+            get_settings().experimental.async_ = True
+        except Exception:
+            pass
+
+        try:
+            from cycif_seg.io import ome_tiff as _ome_tiff
+
+            if _ome_tiff.dask is not None:
+                if self._pool is None:
+                    self._pool = ThreadPoolExecutor(
+                        max_workers=self.max_workers,
+                        thread_name_prefix="cycif-viewer-tile",
+                    )
+                _ome_tiff.dask.config.set(scheduler="threads", pool=self._pool)
+        except Exception:
+            pass
+
+    def next_load_generation(self) -> int:
+        self._load_generation += 1
+        self._channel_generation += 1
+        return self._load_generation
+
+    def current_load_generation(self) -> int:
+        return self._load_generation
+
+    def is_current_load(self, generation: int) -> bool:
+        return int(generation) == int(self._load_generation)
+
+    def next_channel_generation(self) -> int:
+        self._channel_generation += 1
+        return self._channel_generation
+
+    def is_current_channel(self, generation: int) -> bool:
+        return int(generation) == int(self._channel_generation)
+
+    def shutdown(self) -> None:
+        pool = self._pool
+        self._pool = None
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
 
 
 class ImageController:
@@ -27,6 +93,7 @@ class ImageController:
 
     def __init__(self, w):
         self.w = w
+        self.tile_runtime = ViewerTileRuntime()
 
     # --------------------------
     # Multiscale / contrast helpers
@@ -66,6 +133,118 @@ class ImageController:
     def _get_contrast_limits(self, path: str, channel_index: int, dtype) -> tuple[float, float]:
         lims = self._contrast_limits_from_thumbnail(path, channel_index, dtype)
         return lims if lims is not None else self._dtype_contrast_limits(dtype)
+
+    def _want_multiscale(self) -> bool:
+        w = self.w
+        return bool(getattr(w, "chk_multiscale", None) and w.chk_multiscale.isChecked())
+
+    def _load_multiscale_levels(self, path: str | None, channel_index: int) -> list | None:
+        if not path or not self._want_multiscale():
+            return None
+        self.tile_runtime.configure_for_multiscale()
+        return load_channel_multiscale_lazy(path, int(channel_index))
+
+    @staticmethod
+    def _dask_available() -> bool:
+        try:
+            from cycif_seg.io import ome_tiff as _ome_tiff
+
+            return _ome_tiff.dask is not None and _ome_tiff.da is not None
+        except Exception:
+            return False
+
+    @classmethod
+    def _can_use_lazy_pyramid(cls, path: str, *, want_multiscale: bool) -> bool:
+        if not want_multiscale or not cls._dask_available():
+            return False
+        try:
+            return bool(inspect_tiff_pyramid(path).get("is_pyramidal"))
+        except Exception:
+            return False
+
+    @classmethod
+    def _load_initial_display_probe(cls, path: str, *, want_multiscale: bool) -> tuple[bool, np.ndarray | None]:
+        if cls._can_use_lazy_pyramid(path, want_multiscale=want_multiscale):
+            return True, None
+        return False, np.asarray(load_single_channel_tiff_native(path, 0))
+
+    def _add_or_update_channel_layer(
+        self,
+        channel_index: int,
+        *,
+        levels: list | None = None,
+        plane: np.ndarray | None = None,
+    ) -> bool:
+        w = self.w
+        if w.img is None or w.ch_names is None:
+            return False
+
+        i = int(channel_index)
+        nm = w.ch_names[i]
+        path = getattr(w.img, "path", None)
+        if levels is None and plane is None:
+            levels = self._load_multiscale_levels(path, i)
+
+        if levels is not None:
+            if is_tiff_loading_debug():
+                print(
+                    f"[viewer ch={i}] multiscale path: {len(levels)} level(s), "
+                    f"shapes={[tuple(l.shape) for l in levels]}",
+                    flush=True,
+                )
+            clims = self._get_contrast_limits(str(path), i, w.img.dtype)
+            if is_tiff_loading_debug():
+                print(f"[viewer ch={i}] contrast_limits={clims}", flush=True)
+            if nm in w.viewer.layers:
+                layer = w.viewer.layers[nm]
+                layer.data = levels
+                try:
+                    layer.multiscale = len(levels) > 1
+                    layer.contrast_limits = clims
+                except Exception:
+                    pass
+                layer.visible = True
+            else:
+                w.viewer.add_image(
+                    levels,
+                    name=nm,
+                    multiscale=(len(levels) > 1),
+                    contrast_limits=clims,
+                    blending="additive",
+                    opacity=0.6,
+                    gamma=0.3,
+                    colormap=w._colormap_for_channel(i),
+                    cache=True,
+                )
+            try:
+                w._connect_layer_dirty(w.viewer.layers[nm])
+            except Exception:
+                pass
+            return True
+
+        if plane is None:
+            if is_tiff_loading_debug():
+                print(f"[viewer ch={i}] fallback to numpy (multiscale unavailable)", flush=True)
+            plane = w.img[..., i]
+
+        if nm in w.viewer.layers:
+            layer = w.viewer.layers[nm]
+            layer.data = plane
+            layer.visible = True
+        else:
+            w.viewer.add_image(
+                plane,
+                name=nm,
+                blending="additive",
+                opacity=0.6,
+                gamma=0.3,
+                colormap=w._colormap_for_channel(i),
+            )
+            try:
+                w._connect_layer_dirty(w.viewer.layers[nm])
+            except Exception:
+                pass
+        return False
 
     # --------------------------
     # Channel selection utilities
@@ -165,49 +344,10 @@ class ImageController:
                 except Exception:
                     pass
 
-        # Add missing selected layers
-        _want_multiscale = bool(getattr(w, "chk_multiscale", None) and w.chk_multiscale.isChecked())
         for i in indices:
             nm = w.ch_names[i]
             if nm not in w.viewer.layers:
-                _levels = load_channel_multiscale_lazy(w.img.path, i) if _want_multiscale else None
-                if _levels is not None:
-                    if is_tiff_loading_debug():
-                        print(
-                            f"[viewer ch={i}] multiscale path: {len(_levels)} level(s), "
-                            f"shapes={[tuple(l.shape) for l in _levels]}",
-                            flush=True,
-                        )
-                    # Pass explicit contrast limits so napari does not materialise the
-                    # full dask array to compute statistics.
-                    _clims = self._get_contrast_limits(w.img.path, i, w.img.dtype)
-                    if is_tiff_loading_debug():
-                        print(f"[viewer ch={i}] contrast_limits={_clims}", flush=True)
-                    w.viewer.add_image(
-                        _levels,
-                        name=nm,
-                        multiscale=(len(_levels) > 1),
-                        contrast_limits=_clims,
-                        blending="additive",
-                        opacity=0.6,
-                        gamma=0.3,
-                        colormap=w._colormap_for_channel(i),
-                    )
-                else:
-                    if is_tiff_loading_debug():
-                        print(f"[viewer ch={i}] fallback to numpy (multiscale unavailable)", flush=True)
-                    w.viewer.add_image(
-                        w.img[..., i],
-                        name=nm,
-                        blending="additive",
-                        opacity=0.6,
-                        gamma=0.3,
-                        colormap=w._colormap_for_channel(i),
-                    )
-                try:
-                    w._connect_layer_dirty(w.viewer.layers[nm])
-                except Exception:
-                    pass
+                self._add_or_update_channel_layer(i)
 
         # Keep scribbles on top
         if w._scribbles_layer_name not in w.viewer.layers:
@@ -296,47 +436,23 @@ class ImageController:
 
         # Fast path for pyramidal files: dask array creation is near-instant so
         # we can add all new channels synchronously without a background worker.
-        _want_multiscale = bool(getattr(w, "chk_multiscale", None) and w.chk_multiscale.isChecked())
+        channel_generation = self.tile_runtime.next_channel_generation()
         _img_path = getattr(w.img, "path", None) if w.img else None
-        _probe = load_channel_multiscale_lazy(_img_path, 0) if (_want_multiscale and _img_path) else None
+        _probe = self._load_multiscale_levels(_img_path, 0)
         _multiscale_ok = bool(_probe is not None)
         if is_tiff_loading_debug():
-            print(f"[viewer incremental] want_multiscale={_want_multiscale} ok={_multiscale_ok}, adding channels={to_add}", flush=True)
+            print(f"[viewer incremental] want_multiscale={self._want_multiscale()} ok={_multiscale_ok}, adding channels={to_add}", flush=True)
 
         if _multiscale_ok and _img_path:
             for i in to_add:
-                nm = w.ch_names[i]
-                _levels = load_channel_multiscale_lazy(_img_path, i)
+                if not self.tile_runtime.is_current_channel(channel_generation):
+                    return
+                _levels = self._load_multiscale_levels(_img_path, i)
                 if _levels is None:
                     _multiscale_ok = False
                     break
-                # Explicit contrast limits to prevent napari from materialising the
-                # full dask array when computing display statistics.
-                _clims = self._get_contrast_limits(_img_path, i, w.img.dtype)
                 try:
-                    if nm in w.viewer.layers:
-                        w.viewer.layers[nm].data = _levels
-                        try:
-                            w.viewer.layers[nm].multiscale = len(_levels) > 1
-                            w.viewer.layers[nm].contrast_limits = _clims
-                        except Exception:
-                            pass
-                        w.viewer.layers[nm].visible = True
-                    else:
-                        w.viewer.add_image(
-                            _levels,
-                            name=nm,
-                            multiscale=(len(_levels) > 1),
-                            contrast_limits=_clims,
-                            blending="additive",
-                            opacity=0.6,
-                            gamma=0.3,
-                            colormap=w._colormap_for_channel(i),
-                        )
-                        try:
-                            w._connect_layer_dirty(w.viewer.layers[nm])
-                        except Exception:
-                            pass
+                    self._add_or_update_channel_layer(i, levels=_levels)
                 except Exception:
                     _multiscale_ok = False
                     break
@@ -357,38 +473,27 @@ class ImageController:
 
         @worker.yielded.connect
         def _on_plane_loaded(result):
+            if not self.tile_runtime.is_current_channel(channel_generation):
+                return
             i, plane = result
-            nm = w.ch_names[i]
+            if i not in should_display:
+                return
             try:
-                if nm in w.viewer.layers:
-                    try:
-                        w.viewer.layers[nm].data = plane
-                        w.viewer.layers[nm].visible = True
-                    except Exception:
-                        pass
-                else:
-                    w.viewer.add_image(
-                        plane,
-                        name=nm,
-                        blending="additive",
-                        opacity=0.6,
-                        gamma=0.3,
-                        colormap=w._colormap_for_channel(i),
-                    )
-                    try:
-                        w._connect_layer_dirty(w.viewer.layers[nm])
-                    except Exception:
-                        pass
+                self._add_or_update_channel_layer(i, plane=plane)
                 _bump_progress()
             except Exception:
                 raise
 
         @worker.returned.connect
         def _on_done(_):
+            if not self.tile_runtime.is_current_channel(channel_generation):
+                return
             _finish()
 
         @worker.errored.connect
         def _on_err(e):
+            if not self.tile_runtime.is_current_channel(channel_generation):
+                return
             show_warning(f"Update displayed channels failed: {e}")
             try:
                 w.set_status(f"Update displayed channels failed: {e}")
@@ -443,6 +548,11 @@ class ImageController:
         if not path:
             return
 
+        load_generation = self.tile_runtime.next_load_generation()
+        want_multiscale = self._want_multiscale()
+        if want_multiscale:
+            self.tile_runtime.configure_for_multiscale()
+
         w.path = path
         w.lbl_file.setText(path)
 
@@ -463,19 +573,27 @@ class ImageController:
             pass
 
         @thread_worker
-        def _load_worker(p):
+        def _load_worker(p, use_multiscale):
             info = inspect_tiff_yxc(p)
             yield ("metadata", info)
-            first_plane = np.asarray(load_single_channel_tiff_native(p, 0))
+            used_lazy_pyramid, first_plane = self._load_initial_display_probe(
+                p,
+                want_multiscale=bool(use_multiscale),
+            )
+            if used_lazy_pyramid:
+                yield ("lazy_pyramid", None)
+                return {"info": info, "used_lazy_pyramid": True, "first_plane": None}
             yield ("first_plane", first_plane)
-            return info
+            return {"info": info, "used_lazy_pyramid": False, "first_plane": first_plane}
 
-        worker = _load_worker(path)
-        state = {"info": None, "first_plane": None}
+        worker = _load_worker(path, want_multiscale)
+        state = {"info": None, "first_plane": None, "used_lazy_pyramid": False}
         w._image_load_worker = worker
 
         @worker.yielded.connect
         def _on_progress(payload):
+            if not self.tile_runtime.is_current_load(load_generation):
+                return
             kind, value = payload
             if kind == "metadata":
                 state["info"] = value
@@ -489,18 +607,33 @@ class ImageController:
                     w.prog.setValue(2)
                 except Exception:
                     pass
+            elif kind == "lazy_pyramid":
+                state["used_lazy_pyramid"] = True
+                try:
+                    w.prog.setValue(2)
+                except Exception:
+                    pass
 
         @worker.returned.connect
-        def _on_loaded(info):
+        def _on_loaded(result):
+            if not self.tile_runtime.is_current_load(load_generation):
+                return
+            info = dict((result or {}).get("info") or state.get("info") or {})
+            used_lazy_pyramid = bool((result or {}).get("used_lazy_pyramid") or state.get("used_lazy_pyramid"))
             ch_names = list(info.get("channel_names") or [])
             if not ch_names:
                 ch_names = ["Channel 0"]
 
             w.img = LazyChannelImage(path)
-            try:
-                w.img._root._cache[0] = np.asarray(state.get("first_plane"))
-            except Exception:
-                pass
+            if not used_lazy_pyramid:
+                try:
+                    first_plane = (result or {}).get("first_plane")
+                    if first_plane is None:
+                        first_plane = state.get("first_plane")
+                    if first_plane is not None:
+                        w.img._root._cache[0] = np.asarray(first_plane)
+                except Exception:
+                    pass
             w.ch_names = ch_names
 
             # Populate channel list
@@ -540,6 +673,8 @@ class ImageController:
 
         @worker.errored.connect
         def _on_load_err(e):
+            if not self.tile_runtime.is_current_load(load_generation):
+                return
             show_warning(f"Load failed: {e}")
             w.set_status(f"Load failed: {e}")
             w.prog.setRange(0, 1)
