@@ -272,9 +272,12 @@ def _run_registration(
     n_workers: int = 1,
     elastic_touchup_workers: int | None = None,
     elastic_touchup_rigid_max_shift: float = 512.0,
+    elastic_touchup_skip_corr: float = 0.85,
     pyramid_chunk_size: int = 512,
     pyramid_write_workers: int | None = None,
     force: bool = False,
+    debug_elastic_touchup: bool = False,
+    debug_dir: str | None = None,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
     from cycif_seg.preprocess.organize_cycles import (
@@ -314,8 +317,11 @@ def _run_registration(
             elastic_touchup=elastic_touchup,
             elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
             elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
+            elastic_touchup_skip_corr=float(elastic_touchup_skip_corr),
             pyramid_progress_chunk=pyramid_chunk_size,
             pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
+            debug_elastic_touchup=debug_elastic_touchup,
+            debug_dir=debug_dir,
             progress_cb=lambda msg: print(f"  {msg}"),
         )
         print(f"  Done. Merged output: {output_path}")
@@ -344,6 +350,7 @@ def _run_registration(
             strip_height=strip_height,
             elastic_touchup=elastic_touchup,
             elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
+            elastic_touchup_skip_corr=float(elastic_touchup_skip_corr),
             completion="hybrid",
             manifest_path=progress_path,
         )
@@ -391,6 +398,7 @@ def _run_registration(
         elastic_touchup=elastic_touchup,
         elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
         elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
+        elastic_touchup_skip_corr=float(elastic_touchup_skip_corr),
         pyramid_progress_chunk=pyramid_chunk_size,
         pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
         # In pyramidal mode the registration step resumes from the intermediate
@@ -400,6 +408,8 @@ def _run_registration(
         completed_cycles=completed_cycles,
         registration_progress_path=str(resume_state["manifest_path"]),
         registration_fingerprint=resume_state["fingerprint"],
+        debug_elastic_touchup=debug_elastic_touchup,
+        debug_dir=debug_dir,
         progress_cb=lambda msg: print(f"  {msg}"),
     )
     print(f"  Done. Merged output: {output_path}")
@@ -473,6 +483,12 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Override worker count for elastic touch-up only (default: --n-workers)")
     reg_grp.add_argument("--elastic-touchup-rigid-max-shift", type=float, default=512.0, metavar="PX",
                           help="Maximum pre-elastic local rigid shift in pixels (default: 512)")
+    reg_grp.add_argument("--elastic-touchup-skip-corr", type=float, default=0.85, metavar="CORR",
+                          help=(
+                              "Per-tile masked-NCC threshold: a tile at or above this after the "
+                              "rigid stage is considered aligned and skips elastic (default: 0.85). "
+                              "Applied per tile, never island-wide."
+                          ))
 
     misc_grp = p.add_argument_group("misc")
     misc_grp.add_argument("--no-pyramidal", action="store_true",
@@ -481,6 +497,19 @@ def _build_parser() -> argparse.ArgumentParser:
                            help=(
                                "Print verbose preprocessing debug messages, and full "
                                "stack tracebacks for stitching/registration failures"
+                           ))
+    misc_grp.add_argument("--debug-elastic-touchup", action="store_true",
+                           help=(
+                               "Diagnostic output for the elastic touch-up stage: write a "
+                               "'<output>_rigid_only.ome.tiff' with the tiled-rigid field but no "
+                               "elastic pass (A/B baseline), and, in strip mode, a downsampled "
+                               "'<output>_elastic_field_cycle_<N>.tiff' of the weight-normalized "
+                               "elastic correction field. Requires elastic touch-up enabled."
+                           ))
+    misc_grp.add_argument("--debug-dir", default=None, metavar="PATH",
+                           help=(
+                               "Directory for --debug-elastic-touchup outputs "
+                               "(default: alongside the merged output)"
                            ))
 
     mode_grp = p.add_mutually_exclusive_group()
@@ -508,6 +537,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.debug:
         from cycif_seg.preprocess.organize_cycles import set_preprocess_debug
         set_preprocess_debug(True)
+
+    if args.debug_elastic_touchup:
+        # Per-island/per-tile elastic stats (tile category counts, corr values,
+        # per-tile rigid deltas) — the console signal for which sub-mechanism drives seams.
+        from cycif_seg.preprocess.organize_cycles import set_debug_elastic_field
+        set_debug_elastic_field(True)
 
     sample_dir = Path(args.sample_dir).expanduser().resolve()
     if not sample_dir.is_dir():
@@ -620,9 +655,12 @@ def main(argv: list[str] | None = None) -> int:
             n_workers=args.n_workers,
             elastic_touchup_workers=args.elastic_touchup_workers,
             elastic_touchup_rigid_max_shift=max(1.0, float(args.elastic_touchup_rigid_max_shift)),
+            elastic_touchup_skip_corr=float(args.elastic_touchup_skip_corr),
             pyramid_chunk_size=args.pyramid_chunk_size,
             pyramid_write_workers=args.pyramid_write_workers,
             force=args.force_register,
+            debug_elastic_touchup=args.debug_elastic_touchup,
+            debug_dir=args.debug_dir,
         )
     except Exception as exc:
         if args.debug:
