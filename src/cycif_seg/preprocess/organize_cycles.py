@@ -2366,9 +2366,19 @@ def _elastic_touchup_island(
 
     rigid_bound = max(1.0, float(rigid_max_shift))
     _min_improve = float(_ELASTIC_TOUCHUP_MIN_IMPROVEMENT)
+    _min_abs_corr = float(_ELASTIC_TOUCHUP_MIN_ABS_CORR)
+    _min_signal_px = int(_ELASTIC_TOUCHUP_MIN_SIGNAL_PX)
     if h * w < int(large_island_px):
         _check_cancel(cancel_cb)
         _isl_bool = island_crop.astype(bool)
+        # True-signal mask: real reference foreground within the island. Decisions use
+        # this rather than the blank-inclusive solid island mask; a crop with too little
+        # real signal abstains entirely.
+        _score_mask = _isl_bool & fg_crop.astype(bool)
+        if int(_score_mask.sum()) < _min_signal_px:
+            if _debug_elastic_field:
+                print(f"[elastic]   -> abstain (blank: {int(_score_mask.sum())} signal px)", flush=True)
+            return None
 
         def _const_disp(_cdy: float, _cdx: float) -> tuple[np.ndarray, np.ndarray]:
             _dy = np.full((h, w), np.float32(_cdy), dtype=np.float32)
@@ -2378,20 +2388,21 @@ def _elastic_touchup_island(
             return _dy, _dx
 
         # Stage 1 baseline.
-        _base_corr = _masked_corr_score(ref_crop, mov_crop, island_crop)
+        _base_corr = _masked_corr_score(ref_crop, mov_crop, _score_mask)
         _best_corr = float(_base_corr)
         _best_mov = mov_crop
         _best_dy = 0.0
         _best_dx = 0.0
 
-        # Stage 2: rigid touch-up, applied only if it measurably helps.
+        # Stage 2: rigid touch-up, applied only if it measurably helps AND clears the floor.
         _rdy, _rdx, _rb_corr, _rc_corr, _rigid_ok = _estimate_masked_rigid_touchup(
-            ref_crop, mov_crop, island_crop, max_shift=rigid_bound, min_improvement=0.02,
+            ref_crop, mov_crop, _score_mask, max_shift=rigid_bound, min_improvement=0.02,
         )
         if _rigid_ok and (abs(float(_rdy)) > 1e-6 or abs(float(_rdx)) > 1e-6):
             _mov_rigid = _apply_translation(mov_crop, _rdy, _rdx, order=1)
-            _rigid_corr = _masked_corr_score(ref_crop, _mov_rigid, island_crop)
-            if np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve:
+            _rigid_corr = _masked_corr_score(ref_crop, _mov_rigid, _score_mask)
+            if (np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve
+                    and _rigid_corr >= _min_abs_corr):
                 _best_corr = float(_rigid_corr)
                 _best_mov = _mov_rigid
                 _best_dy, _best_dx = float(_rdy), float(_rdx)
@@ -2403,7 +2414,7 @@ def _elastic_touchup_island(
                 return disp_y, disp_x, (y0, y1, x0, x1)
             return None
 
-        # Stage 3: elastic, applied only if it measurably improves the tile.
+        # Stage 3: elastic, applied only if it measurably improves AND clears the floor.
         result = _run_elastix_bspline(
             ref_crop, _best_mov, island_crop,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
@@ -2412,8 +2423,9 @@ def _elastic_touchup_island(
         if result is not None:
             _edy_e, _edx_e = result
             _mov_elastic = _warp_plane_by_field(_best_mov, _edy_e, _edx_e, order=1)
-            _elastic_corr = _masked_corr_score(ref_crop, _mov_elastic, island_crop)
-            if np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve:
+            _elastic_corr = _masked_corr_score(ref_crop, _mov_elastic, _score_mask)
+            if (np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve
+                    and _elastic_corr >= _min_abs_corr):
                 disp_y = _edy_e + np.float32(_best_dy)
                 disp_x = _edx_e + np.float32(_best_dx)
                 disp_y[~_isl_bool] = 0.0
@@ -2476,11 +2488,17 @@ def _elastic_touchup_island(
             _t_island = island_crop[_ty0:_ty1, _tx0:_tx1]
             if int(_t_island.sum()) < 200:
                 continue
+            # True-signal mask: real reference foreground within the island. A tile with
+            # too little real signal abstains (not submitted -> zero weight); a signal-rich
+            # neighbour covers this border region through the 50% tile overlap.
+            _t_signal = _t_island.astype(bool) & fg_crop[_ty0:_ty1, _tx0:_tx1].astype(bool)
+            if int(_t_signal.sum()) < _min_signal_px:
+                continue
             _n_tiles_island_px += 1
             _t_corr = _masked_corr_score(
                 ref_crop[_ty0:_ty1, _tx0:_tx1],
                 mov_crop[_ty0:_ty1, _tx0:_tx1],
-                _t_island,
+                _t_signal,
             )
             _rigid_tile = _RigidTouchupTile(
                 y0=int(_ty0),
@@ -2503,10 +2521,11 @@ def _elastic_touchup_island(
             _rdy, _rdx, _base_corr, _rigid_corr, _rigid_ok = _estimate_masked_rigid_touchup(
                 ref_crop[_ty0:_ty1, _tx0:_tx1],
                 mov_crop[_ty0:_ty1, _tx0:_tx1],
-                _t_island,
+                _t_signal,
                 max_shift=rigid_bound,
                 min_improvement=0.02,
             )
+            _rigid_ok = bool(_rigid_ok) and float(_rigid_corr) >= _min_abs_corr
             _rigid_tile.rigid_dy = float(_rdy)
             _rigid_tile.rigid_dx = float(_rdx)
             _rigid_tile.base_corr = float(_base_corr)
@@ -2517,7 +2536,7 @@ def _elastic_touchup_island(
                 _rigid_tile, _tent,
                 ref_crop[_ty0:_ty1, _tx0:_tx1].copy(),
                 mov_crop[_ty0:_ty1, _tx0:_tx1].copy(),
-                _t_island.copy(),
+                _t_signal.copy(),
             ))
 
     _avg_corr_submitted = float(np.mean(_tile_corrs)) if _tile_corrs else 0.0
@@ -2563,25 +2582,27 @@ def _elastic_touchup_island(
         if _t_ref is None or _t_mov is None or _t_isl is None:
             return None
         _min_improve = float(_ELASTIC_TOUCHUP_MIN_IMPROVEMENT)
+        _min_abs_corr = float(_ELASTIC_TOUCHUP_MIN_ABS_CORR)
 
         def _const_tile(_cdy: float, _cdx: float):
             _tdy = np.full(_tent.shape, np.float32(_cdy), dtype=np.float32)
             _tdx = np.full(_tent.shape, np.float32(_cdx), dtype=np.float32)
             return int(_rigid_tile.y0), int(_rigid_tile.y1), int(_rigid_tile.x0), int(_rigid_tile.x1), _tent, _tdy, _tdx
 
-        # Stage 1 baseline.
+        # Stage 1 baseline (_t_isl is the true-signal mask for this tile).
         _base_corr = _masked_corr_score(_t_ref, _t_mov, _t_isl)
         _best_corr = float(_base_corr)
         _best_mov = _t_mov
         _best_dy = 0.0
         _best_dx = 0.0
 
-        # Stage 2: rigid prior, applied only if it measurably helps.
+        # Stage 2: rigid prior, applied only if it measurably helps AND clears the floor.
         _use_rigid = _mode in {"accepted", "borrowed"}
         if _use_rigid and (abs(float(_rdy)) > 1e-6 or abs(float(_rdx)) > 1e-6):
             _mov_rigid = _apply_translation(_t_mov, _rdy, _rdx, order=1)
             _rigid_corr = _masked_corr_score(_t_ref, _mov_rigid, _t_isl)
-            if np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve:
+            if (np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve
+                    and _rigid_corr >= _min_abs_corr):
                 _best_corr = float(_rigid_corr)
                 _best_mov = _mov_rigid
                 _best_dy, _best_dx = float(_rdy), float(_rdx)
@@ -2590,7 +2611,7 @@ def _elastic_touchup_island(
         if _best_corr >= float(skip_corr_threshold):
             return _const_tile(_best_dy, _best_dx)
 
-        # Stage 3: elastic, applied only if it measurably improves the tile.
+        # Stage 3: elastic, applied only if it measurably improves AND clears the floor.
         _tres = _run_elastix_bspline(
             _t_ref, _best_mov, _t_isl,
             grid_spacing_px=grid_spacing_px, max_iterations=max_iterations,
@@ -2600,7 +2621,8 @@ def _elastic_touchup_island(
             _edy_e, _edx_e = _tres
             _mov_elastic = _warp_plane_by_field(_best_mov, _edy_e, _edx_e, order=1)
             _elastic_corr = _masked_corr_score(_t_ref, _mov_elastic, _t_isl)
-            if np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve:
+            if (np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve
+                    and _elastic_corr >= _min_abs_corr):
                 _tdy = _edy_e + np.float32(_best_dy)
                 _tdx = _edx_e + np.float32(_best_dx)
                 return int(_rigid_tile.y0), int(_rigid_tile.y1), int(_rigid_tile.x0), int(_rigid_tile.x1), _tent, _tdy, _tdx
@@ -2696,6 +2718,19 @@ def _elastic_touchup_island(
 # to a tile. Guards against corrections that don't measurably improve (or actively
 # worsen) an already-good local registration.
 _ELASTIC_TOUCHUP_MIN_IMPROVEMENT: float = 0.01
+
+# A touch-up correction is trusted only if the post-correction masked NCC clears this
+# absolute floor. A blank/degenerate tile can improve from (say) -0.2 to +0.2 with a
+# spurious large shift; that "improvement" clears the relative gate but never this
+# floor, so it is rejected. Well-registered tissue tiles sit well above it (~0.7-0.9).
+_ELASTIC_TOUCHUP_MIN_ABS_CORR: float = 0.5
+
+# Minimum count of true-foreground pixels (real signal in the reference registration
+# channel, intersected with the island) a tile must contain before it is trusted to
+# score or contribute a correction. Tiles below this — the blank edges of the coarse
+# solid island mask — abstain entirely (zero weight) rather than voting, so a
+# signal-rich neighbour's correction extends across the tissue border via tile overlap.
+_ELASTIC_TOUCHUP_MIN_SIGNAL_PX: int = 1024
 
 
 def _block_sum_2d(a: np.ndarray, ds: int) -> np.ndarray:
@@ -3117,6 +3152,8 @@ def merge_cycles_to_ome_tiff(
             )
             _weight_eps = 1e-5
             _min_fg_px = 200
+            _min_signal_px = int(_ELASTIC_TOUCHUP_MIN_SIGNAL_PX)
+            _min_abs_corr = float(_ELASTIC_TOUCHUP_MIN_ABS_CORR)
             _base_dy_fr = float(base_shift_ds[0]) * float(_ds)
             _base_dx_fr = float(base_shift_ds[1]) * float(_ds)
             _moving_shape_yx = (int(moving_shape_yx[0]), int(moving_shape_yx[1]))
@@ -3335,6 +3372,22 @@ def merge_cycles_to_ome_tiff(
                     return -1.0
                 return float((sum_ab - (sum_a * sum_b / float(n))) / math.sqrt(_da * _db))
 
+            def _tile_signal_mask(gy0: int, gy1: int, gx0: int, gx1: int, island_tile: np.ndarray) -> np.ndarray:
+                # True reference-signal foreground within this tile, intersected with the
+                # island. Scoring/searching over this (rather than the blank-inclusive
+                # solid island mask) is what prevents empty edge tiles from having a
+                # degenerate correlation that a spurious large shift can game.
+                if _ref_fg_ds_for_elastic is None:
+                    return island_tile
+                _fg = _upsample_ds_mask_to_local(
+                    _ref_fg_ds_for_elastic, label=None,
+                    y0_fr=gy0, y1_fr=gy1, x0_fr=gx0, x1_fr=gx1,
+                    downsample=_ds,
+                )
+                if _fg.shape != island_tile.shape:
+                    return island_tile
+                return island_tile & _fg
+
             if _debug_elastic_field:
                 print(
                     f"[elastic] cycle {cycle}: island-scoped elastic touch-up  "
@@ -3382,6 +3435,17 @@ def merge_cycles_to_ome_tiff(
                         {"total": time.perf_counter() - _t_total, "mask": _mask_s},
                         None,
                     )
+                # True-signal gate: abstain (never submitted -> zero weight) on tiles whose
+                # island region holds too little real reference signal. These blank edges of
+                # the coarse solid island mask are exactly what a large spurious shift can
+                # game; a signal-rich neighbour covers this area through the 50% tile overlap.
+                _score_mask = _tile_signal_mask(gy0, gy1, gx0, gx1, _island_tile)
+                if int(_score_mask.sum()) < _min_signal_px:
+                    return (
+                        "blank",
+                        {"total": time.perf_counter() - _t_total, "mask": _mask_s},
+                        None,
+                    )
                 _t = time.perf_counter()
                 _ref_crop = _canvas_channel_roi(ref_ci.path, int(ref_ch_idx), _ref_shape_yx, gy0, gy1, gx0, gx1)
                 _ref_s = time.perf_counter() - _t
@@ -3389,7 +3453,7 @@ def merge_cycles_to_ome_tiff(
                 _mov_crop = _translated_moving_tile(gy0, gy1, gx0, gx1, dy_fr, dx_fr)
                 _mov_s = time.perf_counter() - _t
                 _t = time.perf_counter()
-                _tile_corr = _masked_corr_score(_ref_crop, _mov_crop, _island_tile)
+                _tile_corr = _masked_corr_score(_ref_crop, _mov_crop, _score_mask)
                 _tile_corr_s = time.perf_counter() - _t
                 _tile = _RigidTouchupTile(
                     y0=int(gy0),
@@ -3420,10 +3484,14 @@ def merge_cycles_to_ome_tiff(
                 _rdy, _rdx, _base_corr, _rigid_corr, _rigid_ok = _estimate_masked_rigid_touchup(
                     _ref_crop,
                     _mov_crop,
-                    _island_tile,
+                    _score_mask,
                     max_shift=_rigid_bound,
                     min_improvement=0.02,
                 )
+                # Only treat the rigid shift as an accepted seed (and let neighbours borrow
+                # it) if it also clears the absolute correlation floor. A shift that merely
+                # improves a poor baseline to a still-poor result is not trustworthy.
+                _rigid_ok = bool(_rigid_ok) and float(_rigid_corr) >= _min_abs_corr
                 _rigid_s = time.perf_counter() - _t
                 _tile.rigid_dy = float(_rdy)
                 _tile.rigid_dx = float(_rdx)
@@ -3471,6 +3539,16 @@ def merge_cycles_to_ome_tiff(
                 if int(_island_tile.sum()) < _min_fg_px:
                     return (
                         "empty",
+                        {"total": time.perf_counter() - _t_total, "mask": _mask_s},
+                        None, None, None,
+                        int(gy0), int(gy1), int(gx0), int(gx1),
+                    )
+                # True-signal mask used for all correlation decisions (scoring the
+                # blank-inclusive solid island mask is what let empty tiles be gamed).
+                _score_mask = _tile_signal_mask(gy0, gy1, gx0, gx1, _island_tile)
+                if int(_score_mask.sum()) < _min_signal_px:
+                    return (
+                        "blank",
                         {"total": time.perf_counter() - _t_total, "mask": _mask_s},
                         None, None, None,
                         int(gy0), int(gy1), int(gx0), int(gx1),
@@ -3545,19 +3623,21 @@ def merge_cycles_to_ome_tiff(
                 _skip_thr = float(elastic_touchup_skip_corr)
 
                 # Stage 1 baseline: masked alignment after the island rigid shift.
-                _base_corr = _masked_corr_score(_ref_crop, _mov_base, _island_tile)
+                _base_corr = _masked_corr_score(_ref_crop, _mov_base, _score_mask)
                 _best_corr = float(_base_corr)
                 _best_dy = 0.0
                 _best_dx = 0.0
                 _best_mov = _mov_base
 
-                # Stage 2: apply the (smoothed) rigid prior only if it measurably helps.
+                # Stage 2: apply the (smoothed) rigid prior only if it measurably helps
+                # AND the result clears the absolute correlation floor.
                 _use_rigid = _mode in {"accepted", "borrowed"}
                 _rigid_applied = False
                 if _use_rigid and (abs(float(_rdy)) > 1e-6 or abs(float(_rdx)) > 1e-6):
                     _mov_rigid = _apply_translation(_mov_base, _rdy, _rdx, order=1)
-                    _rigid_corr = _masked_corr_score(_ref_crop, _mov_rigid, _island_tile)
-                    if np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve:
+                    _rigid_corr = _masked_corr_score(_ref_crop, _mov_rigid, _score_mask)
+                    if (np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve
+                            and _rigid_corr >= _min_abs_corr):
                         _best_corr = float(_rigid_corr)
                         _best_dy, _best_dx = float(_rdy), float(_rdx)
                         _best_mov = _mov_rigid
@@ -3588,8 +3668,9 @@ def merge_cycles_to_ome_tiff(
                 if _res is not None:
                     _edy_e, _edx_e = _res
                     _mov_elastic = _warp_plane_by_field(_best_mov, _edy_e, _edx_e, order=1)
-                    _elastic_corr = _masked_corr_score(_ref_crop, _mov_elastic, _island_tile)
-                    if np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve:
+                    _elastic_corr = _masked_corr_score(_ref_crop, _mov_elastic, _score_mask)
+                    if (np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve
+                            and _elastic_corr >= _min_abs_corr):
                         _t = time.perf_counter()
                         _tent = _tent_weighted()
                         _edy_w = (_edy_e + np.float32(_best_dy)) * _tent
@@ -3649,6 +3730,7 @@ def merge_cycles_to_ome_tiff(
             _timing_provider_read_s = 0.0
             _tile_status_counts: dict[str, int] = {
                 "empty": 0,
+                "blank": 0,
                 "skip_corr": 0,
                 "prior_only_ok": 0,
                 "rigid_only_ok": 0,
@@ -3822,7 +3904,7 @@ def merge_cycles_to_ome_tiff(
                             _timing_tile_mov_s += float(_timings.get("mov", 0.0))
                             _timing_tile_corr_s += float(_timings.get("tile_corr", 0.0))
                             _timing_tile_rigid_s += float(_timings.get("rigid", 0.0))
-                            if _status in {"empty", "skip_corr"}:
+                            if _status in {"empty", "blank", "skip_corr"}:
                                 _tile_status_counts[_status] = int(_tile_status_counts.get(_status, 0)) + 1
                             if _rigid_tile is not None:
                                 _planned_tiles.append(_rigid_tile)
@@ -3910,6 +3992,7 @@ def merge_cycles_to_ome_tiff(
                     f"rigid_rejected={_tile_status_counts['rigid_candidate_rejected']} "
                     f"skip_corr={_tile_status_counts['skip_corr']} "
                     f"empty={_tile_status_counts['empty']} "
+                    f"blank(abstained)={_tile_status_counts['blank']} "
                     f"elastix_failed={_tile_status_counts['elastix_failed']} "
                     f"rigid_candidate_elastix_failed={_tile_status_counts['rigid_candidate_elastix_failed']}",
                     flush=True,
