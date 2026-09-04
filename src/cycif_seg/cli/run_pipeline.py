@@ -38,6 +38,40 @@ def print(*args, **kwargs):  # type: ignore[override]
     return builtins.print(*args, **kwargs)
 
 
+def _format_registration_cycle_message(
+    message: str,
+    cycle_labels: dict[int, str],
+) -> str:
+    """Replace internal registration indices with displayed cycle labels."""
+    def _replace(match: re.Match[str]) -> str:
+        internal_cycle = int(match.group(1))
+        label = cycle_labels.get(internal_cycle)
+        return f"Cycle {label}" if label is not None else match.group(0)
+
+    return re.sub(r"\bCycle\s+(\d+)\b", _replace, str(message))
+
+
+def _print_registration_progress_event(
+    event: dict,
+    cycle_labels: dict[int, str],
+) -> None:
+    """Print elastic progress as newline-delimited messages.
+
+    The elastic strip-mode provider reports detailed tile and island progress
+    through ``progress_event_cb``.  Keep the detailed tile events as ordinary
+    lines so output is useful both in an interactive terminal and when stdout
+    is captured in a cluster log; carriage-return progress bars do not survive
+    log capture well.  The ordinary progress callback already reports the
+    stage and island starts, so those events are intentionally not repeated.
+    """
+    phase = str(event.get("phase") or "")
+    if phase != "elastic_touchup_tile":
+        return
+    msg = str(event.get("msg") or "").strip()
+    if msg:
+        print(f"  [progress] {_format_registration_cycle_message(msg, cycle_labels)}")
+
+
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
@@ -271,6 +305,8 @@ def _run_registration(
     elastic_touchup: bool = True,
     n_workers: int = 1,
     elastic_touchup_workers: int | None = None,
+    elastic_touchup_max_iterations: int = 10,
+    elastic_touchup_max_step_length: float = 1.0,
     elastic_touchup_rigid_max_shift: float = 512.0,
     elastic_touchup_skip_corr: float = 0.85,
     pyramid_chunk_size: int = 512,
@@ -298,6 +334,29 @@ def _run_registration(
             registration_marker=registration_marker,
         ))
 
+    cycle_labels = {
+        int(ci["cycle_int"]): str(ci["label"])
+        for ci in cycle_infos
+    }
+
+    def _registration_progress(msg: str) -> None:
+        print(f"  {_format_registration_cycle_message(msg, cycle_labels)}")
+
+    _last_reported_elastic_completed = -1
+
+    def _registration_progress_event(event: dict) -> None:
+        nonlocal _last_reported_elastic_completed
+        if str(event.get("phase") or "") != "elastic_touchup_tile":
+            return
+        completed = int(event.get("idx") or 0)
+        total = int(event.get("n") or 0)
+        if completed <= 0 or (completed % 20 != 0 and completed != total):
+            return
+        if completed == _last_reported_elastic_completed:
+            return
+        _last_reported_elastic_completed = completed
+        _print_registration_progress_event(event, cycle_labels)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     progress_path = registration_progress_sidecar_path(output_path)
@@ -316,13 +375,16 @@ def _run_registration(
             pyramidal_output=pyramidal_output,
             elastic_touchup=elastic_touchup,
             elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
+            elastic_touchup_max_iterations=max(1, int(elastic_touchup_max_iterations)),
+            elastic_touchup_max_step_length=max(0.01, float(elastic_touchup_max_step_length)),
             elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
             elastic_touchup_skip_corr=float(elastic_touchup_skip_corr),
             pyramid_progress_chunk=pyramid_chunk_size,
             pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
             debug_elastic_touchup=debug_elastic_touchup,
             debug_dir=debug_dir,
-            progress_cb=lambda msg: print(f"  {msg}"),
+            progress_cb=_registration_progress,
+            progress_event_cb=_registration_progress_event,
         )
         print(f"  Done. Merged output: {output_path}")
         return
@@ -349,6 +411,8 @@ def _run_registration(
             low_mem=True,
             strip_height=strip_height,
             elastic_touchup=elastic_touchup,
+            elastic_touchup_max_iterations=max(1, int(elastic_touchup_max_iterations)),
+            elastic_touchup_max_step_length=max(0.01, float(elastic_touchup_max_step_length)),
             elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
             elastic_touchup_skip_corr=float(elastic_touchup_skip_corr),
             completion="hybrid",
@@ -397,6 +461,8 @@ def _run_registration(
         pyramidal_output=pyramidal_output,
         elastic_touchup=elastic_touchup,
         elastic_touchup_workers=elastic_touchup_workers if elastic_touchup_workers is not None else n_workers,
+        elastic_touchup_max_iterations=max(1, int(elastic_touchup_max_iterations)),
+        elastic_touchup_max_step_length=max(0.01, float(elastic_touchup_max_step_length)),
         elastic_touchup_rigid_max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
         elastic_touchup_skip_corr=float(elastic_touchup_skip_corr),
         pyramid_progress_chunk=pyramid_chunk_size,
@@ -410,7 +476,8 @@ def _run_registration(
         registration_fingerprint=resume_state["fingerprint"],
         debug_elastic_touchup=debug_elastic_touchup,
         debug_dir=debug_dir,
-        progress_cb=lambda msg: print(f"  {msg}"),
+        progress_cb=_registration_progress,
+        progress_event_cb=_registration_progress_event,
     )
     print(f"  Done. Merged output: {output_path}")
 
@@ -481,6 +548,10 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Apply B-spline elastic touch-up after rigid registration (default: on)")
     reg_grp.add_argument("--elastic-touchup-workers", type=int, default=None, metavar="INT",
                           help="Override worker count for elastic touch-up only (default: --n-workers)")
+    reg_grp.add_argument("--elastic-touchup-max-iterations", type=int, default=10, metavar="INT",
+                          help="Maximum optimizer iterations per elastic tile (default: 10)")
+    reg_grp.add_argument("--elastic-touchup-max-step-length", type=float, default=1.0, metavar="FLOAT",
+                          help="Maximum optimizer step length per elastic iteration (default: 1.0)")
     reg_grp.add_argument("--elastic-touchup-rigid-max-shift", type=float, default=512.0, metavar="PX",
                           help="Maximum pre-elastic local rigid shift in pixels (default: 512)")
     reg_grp.add_argument("--elastic-touchup-skip-corr", type=float, default=0.85, metavar="CORR",
@@ -654,6 +725,8 @@ def main(argv: list[str] | None = None) -> int:
             elastic_touchup=args.elastic_touchup,
             n_workers=args.n_workers,
             elastic_touchup_workers=args.elastic_touchup_workers,
+            elastic_touchup_max_iterations=max(1, int(args.elastic_touchup_max_iterations)),
+            elastic_touchup_max_step_length=max(0.01, float(args.elastic_touchup_max_step_length)),
             elastic_touchup_rigid_max_shift=max(1.0, float(args.elastic_touchup_rigid_max_shift)),
             elastic_touchup_skip_corr=float(args.elastic_touchup_skip_corr),
             pyramid_chunk_size=args.pyramid_chunk_size,

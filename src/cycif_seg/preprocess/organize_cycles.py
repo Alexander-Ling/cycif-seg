@@ -3287,6 +3287,27 @@ def merge_cycles_to_ome_tiff(
                 _x1 = min(_canvas_w, int(reg.bbox[3]) * _ds)
                 return _y0, _y1, _x0, _x1
 
+            # Count the full candidate lattice up front. The later planning
+            # pass applies signal/correlation gates, so this includes tiles
+            # that will be rejected before an elastic worker is submitted.
+            _n_tiles_total = 0
+            for _ereg in regs_ds:
+                _iy0, _iy1, _ix0, _ix1 = _island_bbox_fr(_ereg)
+                for _win_y0 in range(_iy0, _iy1, _chunk_y):
+                    _win_y1 = min(_iy1, _win_y0 + _chunk_y)
+                    _n_tiles_total += sum(
+                        1
+                        for _tile in _iter_tiles_by_start(
+                            _win_y0,
+                            _win_y1,
+                            _iy1,
+                            _ix0,
+                            _ix1,
+                            overlap=True,
+                            lattice_origin_y=_iy0,
+                        )
+                    )
+
             def _translated_moving_tile(
                 gy0: int,
                 gy1: int,
@@ -3617,6 +3638,11 @@ def merge_cycles_to_ome_tiff(
                     _cx = np.full((_th, _tw), np.float32(_cdx), dtype=np.float32) * _tnt
                     _tim = {"total": time.perf_counter() - _t_total, "mask": _mask_s, "ref": _ref_s, "mov": _mov_s}
                     _tim.update(_extra)
+                    _tim["base_corr"] = float(_base_corr)
+                    _tim["best_corr"] = float(_best_corr)
+                    _tim["elastic_corr"] = (
+                        float(_elastic_corr) if _elastic_corr is not None else None
+                    )
                     return (_status, _tim, _cy, _cx, _tnt, int(gy0), int(gy1), int(gx0), int(gx1))
 
                 _min_improve = float(_ELASTIC_TOUCHUP_MIN_IMPROVEMENT)
@@ -3628,6 +3654,7 @@ def merge_cycles_to_ome_tiff(
                 _best_dy = 0.0
                 _best_dx = 0.0
                 _best_mov = _mov_base
+                _elastic_corr: float | None = None
 
                 # Stage 2: apply the (smoothed) rigid prior only if it measurably helps
                 # AND the result clears the absolute correlation floor.
@@ -3711,6 +3738,12 @@ def merge_cycles_to_ome_tiff(
             _n_tiles_completed = 0
             _n_tiles_ok = 0
             _n_tiles_failed = 0
+            _diagnostic_records: list[dict[str, Any]] = []
+            _diagnostic_pending: dict[tuple[int, int, int, int], dict[str, Any]] = {}
+            _island_index_by_label = {
+                int(reg.label): idx
+                for idx, reg in enumerate(regs_ds, start=1)
+            }
             _elastic_progress_started = time.monotonic()
             _current_island_idx = 0
             _pending: set[Future] = set()
@@ -3753,7 +3786,8 @@ def merge_cycles_to_ome_tiff(
                     "msg": (
                         f"7. elastic touch-up Cycle {cycle}: "
                         f"island {_current_island_idx}/{len(regs_ds)}  "
-                        f"tiles completed={_n_tiles_completed}/{_n_tiles_submitted}  "
+                        f"tiles completed={_n_tiles_completed}/{_n_tiles_total}  "
+                        f"submitted={_n_tiles_submitted}  "
                         f"rigid+elastic={_tile_status_counts['rigid_elastic_ok']}  "
                         f"borrowed+elastic={_tile_status_counts['borrowed_rigid_elastic_ok']}  "
                         f"prior-only={_tile_status_counts['prior_only_ok']}  "
@@ -3766,7 +3800,7 @@ def merge_cycles_to_ome_tiff(
                     ),
                     "phase": "elastic_touchup_tile",
                     "idx": int(_n_tiles_completed),
-                    "n": int(max(1, _n_tiles_submitted)),
+                    "n": int(max(1, _n_tiles_total)),
                     "cycle": int(cycle),
                 })
 
@@ -3801,6 +3835,20 @@ def merge_cycles_to_ome_tiff(
                     _res = _fut.result()
                     _n_tiles_completed += 1
                     _status, _timings, _edy_w, _edx_w, _wt, _gy0, _gy1, _gx0, _gx1 = _res
+                    _diag = _diagnostic_pending.pop(
+                        (int(_gy0), int(_gy1), int(_gx0), int(_gx1)),
+                        None,
+                    )
+                    if _diag is not None:
+                        _diag["final_status"] = str(_status)
+                        _diag["result_timings"] = dict(_timings)
+                        _diag["completed_order"] = int(_n_tiles_completed)
+                        _diag["usable_field"] = bool(
+                            _edy_w is not None and _edx_w is not None and _wt is not None
+                        )
+                        _diag["resolved_dy"] = float(_timings.get("rigid_delta_y", 0.0))
+                        _diag["resolved_dx"] = float(_timings.get("rigid_delta_x", 0.0))
+                        _diagnostic_records.append(_diag)
                     _timing_tile_total_s += float(_timings.get("total", 0.0))
                     _timing_tile_mask_s += float(_timings.get("mask", 0.0))
                     _timing_tile_ref_s += float(_timings.get("ref", 0.0))
@@ -3904,9 +3952,50 @@ def merge_cycles_to_ome_tiff(
                             _timing_tile_mov_s += float(_timings.get("mov", 0.0))
                             _timing_tile_corr_s += float(_timings.get("tile_corr", 0.0))
                             _timing_tile_rigid_s += float(_timings.get("rigid", 0.0))
+                            _diag_base: dict[str, Any] = {
+                                "cycle": int(cycle),
+                                "island_index": int(_island_index_by_label.get(int(_ereg.label), 0)),
+                                "island_total": int(len(regs_ds)),
+                                "island_label": int(_ereg.label),
+                                "island_bbox_y0": int(_iy0),
+                                "island_bbox_y1": int(_iy1),
+                                "island_bbox_x0": int(_ix0),
+                                "island_bbox_x1": int(_ix1),
+                                "tile_y0": int(_gy0),
+                                "tile_y1": int(_gy1),
+                                "tile_x0": int(_gx0),
+                                "tile_x1": int(_gx1),
+                                "base_shift_y": float(_dy_fr),
+                                "base_shift_x": float(_dx_fr),
+                                "plan_status": str(_status),
+                                "plan_timings": dict(_timings),
+                            }
+                            if _rigid_tile is not None:
+                                _diag_base.update({
+                                    "rigid_dy": float(_rigid_tile.rigid_dy),
+                                    "rigid_dx": float(_rigid_tile.rigid_dx),
+                                    "rigid_base_corr": float(_rigid_tile.base_corr),
+                                    "rigid_candidate_corr": float(_rigid_tile.candidate_corr),
+                                    "rigid_accepted": bool(_rigid_tile.accepted),
+                                    "prior_anchor": bool(_rigid_tile.prior_anchor),
+                                })
+                            else:
+                                _diag_base.update({
+                                    "final_status": str(_status),
+                                    "completed_order": int(_n_tiles_completed + 1),
+                                    "usable_field": False,
+                                })
+                                _diagnostic_records.append(_diag_base)
                             if _status in {"empty", "blank", "skip_corr"}:
                                 _tile_status_counts[_status] = int(_tile_status_counts.get(_status, 0)) + 1
+                            if _rigid_tile is None:
+                                # This candidate was fully evaluated by the
+                                # pre-screen and will not become a worker task.
+                                _n_tiles_completed += 1
                             if _rigid_tile is not None:
+                                _diagnostic_pending[
+                                    (int(_gy0), int(_gy1), int(_gx0), int(_gx1))
+                                ] = _diag_base
                                 _planned_tiles.append(_rigid_tile)
                         _rigid_counts = _resolve_borrowed_rigid_touchups(
                             _planned_tiles,
@@ -3914,6 +4003,20 @@ def merge_cycles_to_ome_tiff(
                             stride_x=float(_stride_w),
                             max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
                         )
+                        for _rigid_tile in _planned_tiles:
+                            _diag = _diagnostic_pending.get(
+                                (
+                                    int(_rigid_tile.y0), int(_rigid_tile.y1),
+                                    int(_rigid_tile.x0), int(_rigid_tile.x1),
+                                )
+                            )
+                            if _diag is not None:
+                                _diag.update({
+                                    "rigid_mode": str(_rigid_tile.mode),
+                                    "resolved_prior_dy": float(_rigid_tile.resolved_dy),
+                                    "resolved_prior_dx": float(_rigid_tile.resolved_dx),
+                                    "rigid_seed_accepted": bool(_rigid_tile.accepted),
+                                })
                         if _planned_tiles:
                             _emit_elastic_tile_progress(
                                 "planned rigid tiles "
@@ -3962,6 +4065,10 @@ def merge_cycles_to_ome_tiff(
                 raise
             else:
                 _pool.shutdown(wait=True, cancel_futures=False)
+
+            # Attach the final worker result to its planning record. Records
+            # are written after the complete cycle so each line is a complete,
+            # self-contained tile diagnostic suitable for later analysis.
 
             if _debug_elastic_field:
                 _timing_tile_other_s = max(
@@ -4020,6 +4127,55 @@ def merge_cycles_to_ome_tiff(
                 )
 
             if _doing_debug_write:
+                try:
+                    _diag_dir = Path(debug_dir) if debug_dir else Path(output_path).parent
+                    _diag_stem = Path(output_path).name
+                    for _ext in ('.ome.tiff', '.ome.tif', '.tiff', '.tif'):
+                        if _diag_stem.lower().endswith(_ext):
+                            _diag_stem = _diag_stem[:-len(_ext)]
+                            break
+                    _diag_jsonl_path = _diag_dir / f"{_diag_stem}_elastic_diagnostics_cycle_{int(cycle)}.jsonl"
+                    _diag_summary_path = _diag_dir / f"{_diag_stem}_elastic_diagnostics_cycle_{int(cycle)}_summary.json"
+                    with _diag_jsonl_path.open("w", encoding="utf-8", newline="\n") as _diag_fh:
+                        for _record in _diagnostic_records:
+                            _diag_fh.write(json.dumps(_record, sort_keys=True) + "\n")
+                    _diag_summary = {
+                        "schema_version": 1,
+                        "cycle": int(cycle),
+                        "n_islands": int(len(regs_ds)),
+                        "candidate_tiles": int(_n_tiles_total),
+                        "diagnostic_records": int(len(_diagnostic_records)),
+                        "submitted_tiles": int(_n_tiles_submitted),
+                        "completed_tiles": int(_n_tiles_completed),
+                        "parameters": {
+                            "rigid_max_shift_px": float(elastic_touchup_rigid_max_shift),
+                            "skip_corr": float(elastic_touchup_skip_corr),
+                            "bspline_spacing_px": int(elastic_touchup_bspline_spacing),
+                            "max_iterations": int(elastic_touchup_max_iterations),
+                            "max_step_length_px": float(elastic_touchup_max_step_length),
+                            "tile_size_px": int(elastic_touchup_tile_size),
+                            "downsample": int(_ds),
+                        },
+                        "status_counts": {
+                            str(_key): int(_value)
+                            for _key, _value in sorted(_tile_status_counts.items())
+                        },
+                        "jsonl_path": str(_diag_jsonl_path),
+                    }
+                    _diag_summary_path.write_text(
+                        json.dumps(_diag_summary, indent=2, sort_keys=True) + "\n",
+                        encoding="utf-8",
+                    )
+                    print(
+                        f"[elastic] cycle {cycle}: wrote diagnostic JSONL ({len(_diagnostic_records)} records) "
+                        f"and summary -> {_diag_jsonl_path}",
+                        flush=True,
+                    )
+                except Exception as _diag_e:
+                    print(
+                        f"[elastic] cycle {cycle}: failed to write diagnostic artifact: {_diag_e}",
+                        flush=True,
+                    )
                 try:
                     _fld_dir = Path(debug_dir) if debug_dir else Path(output_path).parent
                     _fld_stem = Path(output_path).name
