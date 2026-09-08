@@ -313,6 +313,7 @@ def _run_registration(
     pyramid_write_workers: int | None = None,
     force: bool = False,
     debug_elastic_touchup: bool = False,
+    debug_island_map: bool = False,
     debug_dir: str | None = None,
 ) -> None:
     from cycif_seg.io.ome_tiff import inspect_tiff_pyramid
@@ -382,6 +383,7 @@ def _run_registration(
             pyramid_progress_chunk=pyramid_chunk_size,
             pyramidal_write_workers=pyramid_write_workers if pyramid_write_workers is not None else n_workers,
             debug_elastic_touchup=debug_elastic_touchup,
+            debug_island_map=debug_island_map,
             debug_dir=debug_dir,
             progress_cb=_registration_progress,
             progress_event_cb=_registration_progress_event,
@@ -475,6 +477,7 @@ def _run_registration(
         registration_progress_path=str(resume_state["manifest_path"]),
         registration_fingerprint=resume_state["fingerprint"],
         debug_elastic_touchup=debug_elastic_touchup,
+        debug_island_map=debug_island_map,
         debug_dir=debug_dir,
         progress_cb=_registration_progress,
         progress_event_cb=_registration_progress_event,
@@ -556,7 +559,7 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Maximum pre-elastic local rigid shift in pixels (default: 512)")
     reg_grp.add_argument("--elastic-touchup-skip-corr", type=float, default=0.85, metavar="CORR",
                           help=(
-                              "Per-tile masked-NCC threshold: a tile at or above this after the "
+                              "Per-tile full-field correlation threshold: a tile at or above this after the "
                               "rigid stage is considered aligned and skips elastic (default: 0.85). "
                               "Applied per tile, never island-wide."
                           ))
@@ -577,9 +580,14 @@ def _build_parser() -> argparse.ArgumentParser:
                                "'<output>_elastic_field_cycle_<N>.tiff' of the weight-normalized "
                                "elastic correction field. Requires elastic touch-up enabled."
                            ))
+    misc_grp.add_argument("--debug-island-map", action="store_true",
+                           help=(
+                               "Write a low-resolution color TIFF of the exact foreground "
+                               "islands used by tiled-rigid registration"
+                           ))
     misc_grp.add_argument("--debug-dir", default=None, metavar="PATH",
                            help=(
-                               "Directory for --debug-elastic-touchup outputs "
+                               "Directory for elastic-touchup and island-map debug outputs "
                                "(default: alongside the merged output)"
                            ))
 
@@ -604,6 +612,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.debug_island_map and args.registration_algorithm != "tiled_rigid":
+        parser.error("--debug-island-map requires --registration-algorithm tiled_rigid")
 
     if args.debug:
         from cycif_seg.preprocess.organize_cycles import set_preprocess_debug
@@ -733,6 +744,7 @@ def main(argv: list[str] | None = None) -> int:
             pyramid_write_workers=args.pyramid_write_workers,
             force=args.force_register,
             debug_elastic_touchup=args.debug_elastic_touchup,
+            debug_island_map=args.debug_island_map,
             debug_dir=args.debug_dir,
         )
     except Exception as exc:

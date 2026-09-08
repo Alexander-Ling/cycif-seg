@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-import shutil
 
 import numpy as np
 import tifffile
@@ -131,8 +130,12 @@ def _run_registration(
     fixed_path: Path,
     moving_path: Path,
     workers: int,
+    *,
+    low_mem: bool = True,
+    debug_island_map: bool = False,
 ) -> tuple[float, list[dict], Path]:
-    out_path = tmp / f"registered_workers_{workers}.ome.tiff"
+    mode = "strip" if low_mem else "full"
+    out_path = tmp / f"registered_{mode}_workers_{workers}.ome.tiff"
     events: list[dict] = []
     merge_cycles_to_ome_tiff(
         [
@@ -146,8 +149,8 @@ def _run_registration(
         downsample_for_registration=1,
         tiled_rigid_tile_size=96,
         tiled_rigid_search_factor=2.0,
-        low_mem=True,
-        strip_height=96,
+        low_mem=low_mem,
+        strip_height=96 if low_mem else None,
         elastic_touchup=True,
         elastic_touchup_tile_size=96,
         elastic_touchup_skip_corr=0.99,
@@ -157,24 +160,13 @@ def _run_registration(
         elastic_touchup_workers=workers,
         pyramidal_output=False,
         progress_event_cb=events.append,
+        debug_island_map=debug_island_map,
+        debug_dir=str(tmp),
     )
     fixed_out = load_single_channel_tiff_native(str(out_path), 0)
     moving_out = load_single_channel_tiff_native(str(out_path), 2)
     mask = fixed_out > 1000
     return _pearson_corr(fixed_out, moving_out, mask), events, out_path
-
-
-def _save_visual_artifacts(
-    fixed_path: Path,
-    moving_path: Path,
-    registered_w1_path: Path,
-    registered_w3_path: Path,
-) -> None:
-    VISUAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(fixed_path, VISUAL_OUTPUT_DIR / "fixed_two_islands.ome.tiff")
-    shutil.copy2(moving_path, VISUAL_OUTPUT_DIR / "moving_two_islands_distorted.ome.tiff")
-    shutil.copy2(registered_w1_path, VISUAL_OUTPUT_DIR / "registered_workers_1.ome.tiff")
-    shutil.copy2(registered_w3_path, VISUAL_OUTPUT_DIR / "registered_workers_3.ome.tiff")
 
 
 class ElasticTouchupRegressionTest(unittest.TestCase):
@@ -245,8 +237,8 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
         self.assertEqual(counts["borrowed"], 0)
         self.assertEqual(counts["elastic_only"], 1)
         self.assertEqual(tiles[1].mode, "elastic_only")
-        self.assertEqual(tiles[1].resolved_dy, 0.0)
-        self.assertEqual(tiles[1].resolved_dx, 0.0)
+        self.assertIsNone(tiles[1].resolved_dy)
+        self.assertIsNone(tiles[1].resolved_dx)
 
     def test_borrowed_rigid_touchup_clamps_shift_magnitude(self) -> None:
         tiles = [
@@ -449,17 +441,17 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
                 side_effect=_fast_elastic_kernel,
             ):
                 corr_w1, events_w1, registered_w1_path = _run_registration(
-                    tmp, fixed_path, moving_path, workers=1
+                    tmp, fixed_path, moving_path, workers=1, debug_island_map=True
                 )
                 corr_w3, events_w3, registered_w3_path = _run_registration(
                     tmp, fixed_path, moving_path, workers=3
                 )
-                _save_visual_artifacts(
-                    fixed_path,
-                    moving_path,
-                    registered_w1_path,
-                    registered_w3_path,
+                corr_full, _events_full, _registered_full_path = _run_registration(
+                    tmp, fixed_path, moving_path, workers=1, low_mem=False,
+                    debug_island_map=True,
                 )
+                self.assertTrue((tmp / "registered_strip_workers_1_island_map_cycle_1.tiff").is_file())
+                self.assertTrue((tmp / "registered_full_workers_1_island_map_cycle_1.tiff").is_file())
 
         tile_events = [ev for ev in events_w3 if ev.get("phase") == "elastic_touchup_tile"]
         submitted_events = [ev for ev in tile_events if "submitted tile" in str(ev.get("msg", ""))]
@@ -488,7 +480,9 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
         self.assertGreater(corr_w3, pre_corr + 0.05)
         self.assertGreaterEqual(corr_w1, 0.90)
         self.assertGreaterEqual(corr_w3, 0.90)
+        self.assertGreaterEqual(corr_full, 0.90)
         self.assertLessEqual(abs(corr_w1 - corr_w3), 0.03)
+        self.assertLessEqual(abs(corr_w1 - corr_full), 0.05)
 
 
 if __name__ == "__main__":

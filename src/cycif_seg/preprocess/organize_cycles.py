@@ -112,6 +112,121 @@ def _elastic_tile_trust_weight(
     return weight
 
 
+@dataclass(frozen=True)
+class _HarmonicTileField:
+    """Continuous same-island fallback fitted to trusted tile endpoints."""
+
+    origin_y: float
+    origin_x: float
+    stride_y: float
+    stride_x: float
+    field_y: np.ndarray
+    field_x: np.ndarray
+
+    def sample(self, y0: int, y1: int, x0: int, x1: int) -> tuple[np.ndarray, np.ndarray]:
+        yy = (np.arange(y0, y1, dtype=np.float32)[:, None] - self.origin_y) / self.stride_y
+        xx = (np.arange(x0, x1, dtype=np.float32)[None, :] - self.origin_x) / self.stride_x
+        yy, xx = np.broadcast_arrays(yy, xx)
+        return (
+            map_coordinates(self.field_y, [yy, xx], order=1, mode="nearest", prefilter=False),
+            map_coordinates(self.field_x, [yy, xx], order=1, mode="nearest", prefilter=False),
+        )
+
+
+def _harmonic_fill_tile_lattice(
+    values_y: np.ndarray,
+    values_x: np.ndarray,
+    known: np.ndarray,
+    *,
+    max_iterations: int = 500,
+    tolerance: float = 1e-3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Harmonically extend trusted vectors across a compact tile lattice."""
+    known = np.asarray(known, dtype=bool)
+    if not known.any():
+        return np.zeros_like(values_y, dtype=np.float32), np.zeros_like(values_x, dtype=np.float32)
+    missing = ~known
+    if not missing.any():
+        return np.asarray(values_y, dtype=np.float32), np.asarray(values_x, dtype=np.float32)
+    if distance_transform_edt is None:
+        raise RuntimeError("scipy is required to interpolate failed elastic tiles")
+    nearest = distance_transform_edt(missing, return_distances=False, return_indices=True)
+    outputs: list[np.ndarray] = []
+    for source in (values_y, values_x):
+        current = np.asarray(source, dtype=np.float32).copy()
+        current[missing] = current[nearest[0][missing], nearest[1][missing]]
+        for _ in range(max(1, int(max_iterations))):
+            padded = np.pad(current, 1, mode="edge")
+            proposed = 0.25 * (
+                padded[:-2, 1:-1] + padded[2:, 1:-1]
+                + padded[1:-1, :-2] + padded[1:-1, 2:]
+            )
+            delta = float(np.max(np.abs(proposed[missing] - current[missing])))
+            current[missing] = proposed[missing]
+            if delta < float(tolerance):
+                break
+        outputs.append(current)
+    return outputs[0], outputs[1]
+
+
+def _build_harmonic_tile_field(
+    samples: list[tuple[float, float, float, float]],
+    *,
+    bounds: tuple[int, int, int, int],
+    stride_y: int,
+    stride_x: int,
+) -> _HarmonicTileField | None:
+    """Fit a bilinear fallback surface from trusted tile-center vectors."""
+    if not samples:
+        return None
+    y0, y1, x0, x1 = (int(v) for v in bounds)
+    sy, sx = max(1, int(stride_y)), max(1, int(stride_x))
+    origin_y = float(min(sample[0] for sample in samples))
+    origin_x = float(min(sample[1] for sample in samples))
+    max_y = max(float(y1 - 1), max(float(sample[0]) for sample in samples))
+    max_x = max(float(x1 - 1), max(float(sample[1]) for sample in samples))
+    rows = max(2, int(math.ceil((max_y - origin_y) / sy)) + 1)
+    cols = max(2, int(math.ceil((max_x - origin_x) / sx)) + 1)
+    sums_y = np.zeros((rows, cols), dtype=np.float64)
+    sums_x = np.zeros((rows, cols), dtype=np.float64)
+    counts = np.zeros((rows, cols), dtype=np.int32)
+    for cy, cx, dy, dx in samples:
+        iy = int(np.clip(round((float(cy) - origin_y) / sy), 0, rows - 1))
+        ix = int(np.clip(round((float(cx) - origin_x) / sx), 0, cols - 1))
+        sums_y[iy, ix] += float(dy)
+        sums_x[iy, ix] += float(dx)
+        counts[iy, ix] += 1
+    known = counts > 0
+    values_y = np.zeros_like(sums_y, dtype=np.float32)
+    values_x = np.zeros_like(sums_x, dtype=np.float32)
+    values_y[known] = (sums_y[known] / counts[known]).astype(np.float32)
+    values_x[known] = (sums_x[known] / counts[known]).astype(np.float32)
+    values_y, values_x = _harmonic_fill_tile_lattice(values_y, values_x, known)
+    return _HarmonicTileField(origin_y, origin_x, float(sy), float(sx), values_y, values_x)
+
+
+def _fill_missing_touchup_field(
+    field_y: np.ndarray,
+    field_x: np.ndarray,
+    direct_support: np.ndarray,
+    island_support: np.ndarray,
+    model: _HarmonicTileField | None,
+    *,
+    bounds: tuple[int, int, int, int],
+) -> int:
+    """Fill only unsupported same-island pixels from a trusted fallback model."""
+    if model is None:
+        return 0
+    missing = np.asarray(island_support, dtype=bool) & ~np.asarray(direct_support, dtype=bool)
+    if not np.any(missing):
+        return 0
+    y0, y1, x0, x1 = (int(v) for v in bounds)
+    fallback_y, fallback_x = model.sample(y0, y1, x0, x1)
+    field_y[missing] = fallback_y[missing]
+    field_x[missing] = fallback_x[missing]
+    return int(missing.sum())
+
+
 def set_debug_elastic_field(enabled: bool) -> None:
     """Enable or disable per-island elastic field statistics output."""
     global _debug_elastic_field
@@ -699,13 +814,22 @@ def _bbox_from_mask(mask: np.ndarray, pad: int = 0) -> tuple[int, int, int, int]
     return y0, y1, x0, x1
 
 
-def _masked_corr_score(fixed: np.ndarray, moving: np.ndarray, mask: np.ndarray) -> float:
-    use = mask.astype(bool, copy=False)
-    n = int(use.sum())
+def _masked_corr_score(
+    fixed: np.ndarray,
+    moving: np.ndarray,
+    mask: np.ndarray | None,
+) -> float:
+    if mask is None:
+        a = np.asarray(fixed, dtype=np.float32).ravel().copy()
+        b = np.asarray(moving, dtype=np.float32).ravel().copy()
+        n = int(a.size)
+    else:
+        use = mask.astype(bool, copy=False)
+        n = int(use.sum())
+        a = fixed[use].astype(np.float32, copy=False)
+        b = moving[use].astype(np.float32, copy=False)
     if n < 32:
         return -1.0
-    a = fixed[use].astype(np.float32, copy=False)
-    b = moving[use].astype(np.float32, copy=False)
     a -= float(a.mean())
     b -= float(b.mean())
     da = float(np.sqrt(np.sum(a * a)))
@@ -730,7 +854,10 @@ def _estimate_masked_rigid_touchup(
     shift is intended to be added to the tile displacement field and blended
     with the same tent weights as elastic output, not applied as a hard seam.
     """
-    base_corr = _masked_corr_score(fixed_crop, moving_crop, mask)
+    # Foreground remains an eligibility gate, but correlation is deliberately
+    # measured over the complete field so alignment of low- and high-signal
+    # regions both influence the decision.
+    base_corr = _masked_corr_score(fixed_crop, moving_crop, None)
     h, w = int(fixed_crop.shape[0]), int(fixed_crop.shape[1])
     if h <= 0 or w <= 0 or int(np.asarray(mask).sum()) < 32:
         return 0.0, 0.0, float(base_corr), float(base_corr), False
@@ -755,11 +882,11 @@ def _estimate_masked_rigid_touchup(
     step = max(1, int(math.ceil(radius / 8.0)))
     best_dy = 0
     best_dx = 0
-    best_score = _masked_corr_score(fixed_ds, moving_ds, mask_ds)
+    best_score = _masked_corr_score(fixed_ds, moving_ds, None)
 
     def _score(dy_i: int, dx_i: int) -> float:
         shifted = _apply_translation(moving_ds, float(dy_i), float(dx_i), order=1)
-        return _masked_corr_score(fixed_ds, shifted, mask_ds)
+        return _masked_corr_score(fixed_ds, shifted, None)
 
     while True:
         y_min = max(-radius, best_dy - step * 4)
@@ -784,7 +911,7 @@ def _estimate_masked_rigid_touchup(
     if abs(dy) <= 1e-6 and abs(dx) <= 1e-6:
         return 0.0, 0.0, float(base_corr), float(base_corr), False
     candidate = _apply_translation(moving_crop, dy, dx, order=1)
-    candidate_corr = _masked_corr_score(fixed_crop, candidate, mask)
+    candidate_corr = _masked_corr_score(fixed_crop, candidate, None)
     accepted = bool(np.isfinite(candidate_corr) and candidate_corr >= float(base_corr) + float(min_improvement))
     if not accepted:
         return 0.0, 0.0, float(base_corr), float(candidate_corr), False
@@ -802,8 +929,8 @@ class _RigidTouchupTile:
     center_x: float
     rigid_dy: float = 0.0
     rigid_dx: float = 0.0
-    resolved_dy: float = 0.0
-    resolved_dx: float = 0.0
+    resolved_dy: float | None = None
+    resolved_dx: float | None = None
     base_corr: float = -1.0
     candidate_corr: float = -1.0
     accepted: bool = False
@@ -851,8 +978,8 @@ def _resolve_borrowed_rigid_touchups(
         if not seeds:
             for tile in island_tiles:
                 if not tile.accepted and not tile.prior_anchor:
-                    tile.resolved_dy = 0.0
-                    tile.resolved_dx = 0.0
+                    tile.resolved_dy = None
+                    tile.resolved_dx = None
                     tile.mode = "elastic_only"
                     counts["elastic_only"] += 1
             continue
@@ -884,8 +1011,8 @@ def _resolve_borrowed_rigid_touchups(
                         weighted.append(((improvement / dist), seed, dist))
             total_w = float(sum(w for w, _seed, _dist in weighted))
             if total_w <= 1e-12:
-                tile.resolved_dy = 0.0
-                tile.resolved_dx = 0.0
+                tile.resolved_dy = None
+                tile.resolved_dx = None
                 tile.mode = "elastic_only"
                 counts["elastic_only"] += 1
                 continue
@@ -912,7 +1039,7 @@ def _smooth_rigid_prior_for_tile(
     stride_x: float,
     max_shift: float,
     neighborhood_radius: float = 3.0,
-) -> tuple[float, float]:
+) -> tuple[float, float] | None:
     """Return a locally smoothed rigid prior for one elastic tile.
 
     The resolved per-tile rigid touch-up is treated as a prior field rather than
@@ -927,7 +1054,9 @@ def _smooth_rigid_prior_for_tile(
     for other in tiles:
         if int(other.island_label) != int(tile.island_label):
             continue
-        if str(other.mode) not in {"accepted", "borrowed", "elastic_only", "stable_zero"}:
+        if str(other.mode) not in {"accepted", "borrowed", "stable_zero"}:
+            continue
+        if other.resolved_dy is None or other.resolved_dx is None:
             continue
         dist = max(
             abs(float(tile.center_y) - float(other.center_y)) / step_y,
@@ -945,7 +1074,9 @@ def _smooth_rigid_prior_for_tile(
         for other in tiles:
             if int(other.island_label) != int(tile.island_label):
                 continue
-            if str(other.mode) not in {"accepted", "borrowed", "elastic_only", "stable_zero"}:
+            if str(other.mode) not in {"accepted", "borrowed", "stable_zero"}:
+                continue
+            if other.resolved_dy is None or other.resolved_dx is None:
                 continue
             dist = max(
                 abs(float(tile.center_y) - float(other.center_y)) / step_y,
@@ -959,7 +1090,7 @@ def _smooth_rigid_prior_for_tile(
                 candidates.append((gain / ((dist + 1.0) ** 2), other, dist))
     total_w = float(sum(w for w, _other, _dist in candidates))
     if total_w <= 1e-12:
-        return 0.0, 0.0
+        return None
     dy = float(sum(w * float(other.resolved_dy) for w, other, _dist in candidates) / total_w)
     dx = float(sum(w * float(other.resolved_dx) for w, other, _dist in candidates) / total_w)
     mag = math.hypot(dy, dx)
@@ -2355,7 +2486,7 @@ def _elastic_touchup_island(
     # No island-wide correlation skip: an average over a large island masks locally
     # poor registration. Each processing unit (this whole crop for a small island, or
     # each tile below for a large one) is gated individually with a validated escalation.
-    corr = _masked_corr_score(ref_crop, mov_crop, fg_crop)
+    corr = _masked_corr_score(ref_crop, mov_crop, None)
     if _debug_elastic_field:
         _path = "tiled" if h * w >= int(large_island_px) else "direct"
         print(
@@ -2371,9 +2502,8 @@ def _elastic_touchup_island(
     if h * w < int(large_island_px):
         _check_cancel(cancel_cb)
         _isl_bool = island_crop.astype(bool)
-        # True-signal mask: real reference foreground within the island. Decisions use
-        # this rather than the blank-inclusive solid island mask; a crop with too little
-        # real signal abstains entirely.
+        # Reference foreground is an eligibility gate only. Correlation is scored over
+        # the complete crop so both high- and low-signal separation affects acceptance.
         _score_mask = _isl_bool & fg_crop.astype(bool)
         if int(_score_mask.sum()) < _min_signal_px:
             if _debug_elastic_field:
@@ -2388,7 +2518,7 @@ def _elastic_touchup_island(
             return _dy, _dx
 
         # Stage 1 baseline.
-        _base_corr = _masked_corr_score(ref_crop, mov_crop, _score_mask)
+        _base_corr = _masked_corr_score(ref_crop, mov_crop, None)
         _best_corr = float(_base_corr)
         _best_mov = mov_crop
         _best_dy = 0.0
@@ -2400,7 +2530,7 @@ def _elastic_touchup_island(
         )
         if _rigid_ok and (abs(float(_rdy)) > 1e-6 or abs(float(_rdx)) > 1e-6):
             _mov_rigid = _apply_translation(mov_crop, _rdy, _rdx, order=1)
-            _rigid_corr = _masked_corr_score(ref_crop, _mov_rigid, _score_mask)
+            _rigid_corr = _masked_corr_score(ref_crop, _mov_rigid, None)
             if (np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve
                     and _rigid_corr >= _min_abs_corr):
                 _best_corr = float(_rigid_corr)
@@ -2423,7 +2553,7 @@ def _elastic_touchup_island(
         if result is not None:
             _edy_e, _edx_e = result
             _mov_elastic = _warp_plane_by_field(_best_mov, _edy_e, _edx_e, order=1)
-            _elastic_corr = _masked_corr_score(ref_crop, _mov_elastic, _score_mask)
+            _elastic_corr = _masked_corr_score(ref_crop, _mov_elastic, None)
             if (np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve
                     and _elastic_corr >= _min_abs_corr):
                 disp_y = _edy_e + np.float32(_best_dy)
@@ -2488,17 +2618,18 @@ def _elastic_touchup_island(
             _t_island = island_crop[_ty0:_ty1, _tx0:_tx1]
             if int(_t_island.sum()) < 200:
                 continue
-            # True-signal mask: real reference foreground within the island. A tile with
-            # too little real signal abstains (not submitted -> zero weight); a signal-rich
-            # neighbour covers this border region through the 50% tile overlap.
+            # Reference foreground is an eligibility gate only. A tile with too little
+            # real signal abstains (not submitted -> zero weight); a signal-rich neighbour
+            # covers this border region through the 50% tile overlap.
             _t_signal = _t_island.astype(bool) & fg_crop[_ty0:_ty1, _tx0:_tx1].astype(bool)
             if int(_t_signal.sum()) < _min_signal_px:
                 continue
+            _tent *= _t_island.astype(np.float32, copy=False)
             _n_tiles_island_px += 1
             _t_corr = _masked_corr_score(
                 ref_crop[_ty0:_ty1, _tx0:_tx1],
                 mov_crop[_ty0:_ty1, _tx0:_tx1],
-                _t_signal,
+                None,
             )
             _rigid_tile = _RigidTouchupTile(
                 y0=int(_ty0),
@@ -2563,11 +2694,12 @@ def _elastic_touchup_island(
 
     _n_tiles_tried = len(_tile_tasks)
     _n_tiles_ok = 0
+    _trusted_samples: list[tuple[float, float, float, float]] = []
     _BAR_W = 20
 
     def _run_tile(_rigid_tile, _tent, _t_ref, _t_mov, _t_isl):
         _check_cancel(cancel_cb)
-        _rdy, _rdx = _smooth_rigid_prior_for_tile(
+        _prior = _smooth_rigid_prior_for_tile(
             _rigid_tile,
             _rigid_tiles,
             stride_y=float(stride_h),
@@ -2576,36 +2708,36 @@ def _elastic_touchup_island(
         )
         _mode = str(getattr(_rigid_tile, "mode", ""))
         if _mode == "stable_zero":
-            _tdy = np.full(_tent.shape, np.float32(_rdy), dtype=np.float32)
-            _tdx = np.full(_tent.shape, np.float32(_rdx), dtype=np.float32)
+            _tdy = np.zeros(_tent.shape, dtype=np.float32)
+            _tdx = np.zeros(_tent.shape, dtype=np.float32)
             return int(_rigid_tile.y0), int(_rigid_tile.y1), int(_rigid_tile.x0), int(_rigid_tile.x1), _tent, _tdy, _tdx
         if _t_ref is None or _t_mov is None or _t_isl is None:
             return None
         _min_improve = float(_ELASTIC_TOUCHUP_MIN_IMPROVEMENT)
         _min_abs_corr = float(_ELASTIC_TOUCHUP_MIN_ABS_CORR)
+        _has_rigid = _mode in {"accepted", "borrowed"} and _prior is not None
+        _rdy, _rdx = _prior if _prior is not None else (0.0, 0.0)
 
         def _const_tile(_cdy: float, _cdx: float):
             _tdy = np.full(_tent.shape, np.float32(_cdy), dtype=np.float32)
             _tdx = np.full(_tent.shape, np.float32(_cdx), dtype=np.float32)
             return int(_rigid_tile.y0), int(_rigid_tile.y1), int(_rigid_tile.x0), int(_rigid_tile.x1), _tent, _tdy, _tdx
 
-        # Stage 1 baseline (_t_isl is the true-signal mask for this tile).
-        _base_corr = _masked_corr_score(_t_ref, _t_mov, _t_isl)
+        # Stage 1 baseline is scored over the complete rectangular tile.
+        _base_corr = _masked_corr_score(_t_ref, _t_mov, None)
         _best_corr = float(_base_corr)
         _best_mov = _t_mov
         _best_dy = 0.0
         _best_dx = 0.0
 
-        # Stage 2: rigid prior, applied only if it measurably helps AND clears the floor.
-        _use_rigid = _mode in {"accepted", "borrowed"}
-        if _use_rigid and (abs(float(_rdy)) > 1e-6 or abs(float(_rdx)) > 1e-6):
-            _mov_rigid = _apply_translation(_t_mov, _rdy, _rdx, order=1)
-            _rigid_corr = _masked_corr_score(_t_ref, _mov_rigid, _t_isl)
-            if (np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve
-                    and _rigid_corr >= _min_abs_corr):
-                _best_corr = float(_rigid_corr)
-                _best_mov = _mov_rigid
-                _best_dy, _best_dx = float(_rdy), float(_rdx)
+        # Accepted and same-island borrowed rigid priors are trusted fallbacks.
+        # Do not reject a borrowed prior using the unreliable local measurement
+        # that caused this tile to need borrowing in the first place.
+        if _has_rigid:
+            _best_dy, _best_dx = float(_rdy), float(_rdx)
+            if abs(_best_dy) > 1e-6 or abs(_best_dx) > 1e-6:
+                _best_mov = _apply_translation(_t_mov, _best_dy, _best_dx, order=1)
+            _best_corr = _masked_corr_score(_t_ref, _best_mov, None)
 
         # Stage 2 re-check: rigid alone already good enough -> no elastic.
         if _best_corr >= float(skip_corr_threshold):
@@ -2620,15 +2752,18 @@ def _elastic_touchup_island(
         if _tres is not None:
             _edy_e, _edx_e = _tres
             _mov_elastic = _warp_plane_by_field(_best_mov, _edy_e, _edx_e, order=1)
-            _elastic_corr = _masked_corr_score(_t_ref, _mov_elastic, _t_isl)
+            _elastic_corr = _masked_corr_score(_t_ref, _mov_elastic, None)
             if (np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve
                     and _elastic_corr >= _min_abs_corr):
                 _tdy = _edy_e + np.float32(_best_dy)
                 _tdx = _edx_e + np.float32(_best_dx)
                 return int(_rigid_tile.y0), int(_rigid_tile.y1), int(_rigid_tile.x0), int(_rigid_tile.x1), _tent, _tdy, _tdx
 
-        # Elastic failed or did not help: keep the best (rigid-only or unchanged).
-        return _const_tile(_best_dy, _best_dx)
+        # A trusted rigid prior remains a valid fallback. With no trusted
+        # endpoint this tile abstains instead of voting for a zero correction.
+        if _has_rigid:
+            return _const_tile(_best_dy, _best_dx)
+        return None
 
     def _accumulate(_res):
         nonlocal _n_tiles_ok
@@ -2639,6 +2774,14 @@ def _elastic_touchup_island(
         disp_y_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tdy * _tentr
         disp_x_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tdx * _tentr
         weight_acc[_ty0r:_ty1r, _tx0r:_tx1r] += _tentr
+        _support = _tentr > 0
+        if np.any(_support):
+            _trusted_samples.append((
+                float(_ty0r + _ty1r - 1) / 2.0,
+                float(_tx0r + _tx1r - 1) / 2.0,
+                float(np.median(_tdy[_support])),
+                float(np.median(_tdx[_support])),
+            ))
         if progress_event_cb is not None:
             progress_event_cb({
                 "msg": (
@@ -2700,6 +2843,20 @@ def _elastic_touchup_island(
         return None
     disp_y_acc[nz] /= weight_acc[nz]
     disp_x_acc[nz] /= weight_acc[nz]
+    _fallback = _build_harmonic_tile_field(
+        _trusted_samples,
+        bounds=(0, h, 0, w),
+        stride_y=stride_h,
+        stride_x=stride_w,
+    )
+    _fill_missing_touchup_field(
+        disp_y_acc,
+        disp_x_acc,
+        nz,
+        island_crop,
+        _fallback,
+        bounds=(0, h, 0, w),
+    )
     if _debug_elastic_field:
         _mag = np.sqrt(disp_y_acc[nz] ** 2 + disp_x_acc[nz] ** 2)
         _isl_nz = (island_crop.astype(bool))[nz]
@@ -2714,12 +2871,12 @@ def _elastic_touchup_island(
     return disp_y_acc, disp_x_acc, (y0, y1, x0, x1)
 
 
-# Minimum masked-NCC gain required before a rigid or elastic touch-up is applied
+# Minimum full-field correlation gain required before a rigid or elastic touch-up is applied
 # to a tile. Guards against corrections that don't measurably improve (or actively
 # worsen) an already-good local registration.
 _ELASTIC_TOUCHUP_MIN_IMPROVEMENT: float = 0.01
 
-# A touch-up correction is trusted only if the post-correction masked NCC clears this
+# A touch-up correction is trusted only if the post-correction full-field correlation clears this
 # absolute floor. A blank/degenerate tile can improve from (say) -0.2 to +0.2 with a
 # spurious large shift; that "improvement" clears the relative gate but never this
 # floor, so it is rejected. Well-registered tissue tiles sit well above it (~0.7-0.9).
@@ -2744,6 +2901,61 @@ def _block_sum_2d(a: np.ndarray, ds: int) -> np.ndarray:
     if ph or pw:
         a = np.pad(a, ((0, ph), (0, pw)))
     return a.reshape(a.shape[0] // ds, ds, a.shape[1] // ds, ds).sum(axis=(1, 3))
+
+
+def _write_island_map_debug_tiff(
+    island_labels: np.ndarray,
+    *,
+    out_path: str | Path,
+    cycle: int,
+    source_downsample: int,
+    target_max_dim: int = 4096,
+) -> tuple[int, str]:
+    """Write a compact deterministic RGB view of the authoritative island labels."""
+    labels = np.asarray(island_labels)
+    if labels.ndim != 2:
+        raise ValueError("island_labels must be a 2D array")
+    h, w = int(labels.shape[0]), int(labels.shape[1])
+    preview_ds = max(1, int(math.ceil(max(h, w) / max(1, int(target_max_dim)))))
+    if preview_ds == 1:
+        preview = labels.astype(np.uint32, copy=False)
+    else:
+        out_h = (h + preview_ds - 1) // preview_ds
+        out_w = (w + preview_ds - 1) // preview_ds
+        preview = np.zeros((out_h, out_w), dtype=np.uint32)
+        # Label-aware max pooling guarantees that a block containing foreground
+        # is not converted to background by point sampling.
+        for oy in range(out_h):
+            y0 = oy * preview_ds
+            y1 = min(h, y0 + preview_ds)
+            band = np.asarray(labels[y0:y1, :], dtype=np.uint32)
+            pad_w = out_w * preview_ds - w
+            if pad_w:
+                band = np.pad(band, ((0, 0), (0, pad_w)), mode="constant")
+            preview[oy] = band.reshape(y1 - y0, out_w, preview_ds).max(axis=(0, 2))
+
+    ids = preview.astype(np.uint32, copy=False)
+    hashed = ids * np.uint32(2654435761)
+    rgb = np.zeros((*ids.shape, 3), dtype=np.uint8)
+    foreground = ids > 0
+    rgb[..., 0][foreground] = (64 + (hashed[foreground] & np.uint32(191))).astype(np.uint8)
+    rgb[..., 1][foreground] = (64 + ((hashed[foreground] >> np.uint32(8)) & np.uint32(191))).astype(np.uint8)
+    rgb[..., 2][foreground] = (64 + ((hashed[foreground] >> np.uint32(16)) & np.uint32(191))).astype(np.uint8)
+    total_downsample = max(1, int(source_downsample)) * preview_ds
+    metadata = {
+        "axes": "YXS",
+        "cycle": int(cycle),
+        "island_count": int(labels.max()) if labels.size else 0,
+        "source_shape_yx": [h, w],
+        "source_downsample": int(max(1, source_downsample)),
+        "preview_downsample": int(preview_ds),
+        "total_downsample": int(total_downsample),
+        "label_color_hash": "uint32(label * 2654435761)",
+    }
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(str(path), rgb, photometric="rgb", metadata=metadata)
+    return int(total_downsample), str(path)
 
 
 def _write_elastic_field_debug_tiff(
@@ -2835,6 +3047,7 @@ def merge_cycles_to_ome_tiff(
     elastic_touchup_max_step_length: float = 1.0,
     elastic_touchup_rigid_max_shift: float = 512.0,
     debug_elastic_touchup: bool = False,
+    debug_island_map: bool = False,
     debug_dir: str | None = None,
     pyramidal_output: bool = False,
     pyramidal_tile_size: int = 512,
@@ -3474,7 +3687,7 @@ def merge_cycles_to_ome_tiff(
                 _mov_crop = _translated_moving_tile(gy0, gy1, gx0, gx1, dy_fr, dx_fr)
                 _mov_s = time.perf_counter() - _t
                 _t = time.perf_counter()
-                _tile_corr = _masked_corr_score(_ref_crop, _mov_crop, _score_mask)
+                _tile_corr = _masked_corr_score(_ref_crop, _mov_crop, None)
                 _tile_corr_s = time.perf_counter() - _t
                 _tile = _RigidTouchupTile(
                     y0=int(gy0),
@@ -3564,8 +3777,8 @@ def merge_cycles_to_ome_tiff(
                         None, None, None,
                         int(gy0), int(gy1), int(gx0), int(gx1),
                     )
-                # True-signal mask used for all correlation decisions (scoring the
-                # blank-inclusive solid island mask is what let empty tiles be gamed).
+                # Reference foreground gates tile eligibility only. Correlation decisions
+                # use the complete rectangular crop; the island mask still constrains Elastix.
                 _score_mask = _tile_signal_mask(gy0, gy1, gx0, gx1, _island_tile)
                 if int(_score_mask.sum()) < _min_signal_px:
                     return (
@@ -3575,7 +3788,7 @@ def merge_cycles_to_ome_tiff(
                         int(gy0), int(gy1), int(gx0), int(gx1),
                     )
                 _t = time.perf_counter()
-                _rdy, _rdx = _smooth_rigid_prior_for_tile(
+                _prior = _smooth_rigid_prior_for_tile(
                     rigid_tile,
                     rigid_tiles,
                     stride_y=float(_stride_h),
@@ -3594,8 +3807,8 @@ def merge_cycles_to_ome_tiff(
                         trim_right=(int(gx1) < int(island_x1) and int(gx1) < _canvas_w),
                     )
                     _tent *= _island_tile.astype(np.float32, copy=False)
-                    _edy_w = np.full((_th, _tw), np.float32(_rdy), dtype=np.float32) * _tent
-                    _edx_w = np.full((_th, _tw), np.float32(_rdx), dtype=np.float32) * _tent
+                    _edy_w = np.zeros((_th, _tw), dtype=np.float32)
+                    _edx_w = np.zeros((_th, _tw), dtype=np.float32)
                     _weight_s = time.perf_counter() - _t
                     return (
                         "prior_only_ok",
@@ -3603,8 +3816,8 @@ def merge_cycles_to_ome_tiff(
                             "total": time.perf_counter() - _t_total,
                             "mask": _mask_s,
                             "weight": _weight_s,
-                            "rigid_delta_y": float(_rdy),
-                            "rigid_delta_x": float(_rdx),
+                            "rigid_delta_y": 0.0,
+                            "rigid_delta_x": 0.0,
                             "rigid_rejected": 0.0,
                         },
                         _edy_w, _edx_w, _tent,
@@ -3615,6 +3828,8 @@ def merge_cycles_to_ome_tiff(
                 _t = time.perf_counter()
                 _mov_base = _translated_moving_tile(gy0, gy1, gx0, gx1, dy_fr, dx_fr)
                 _mov_s = time.perf_counter() - _t
+                _has_rigid = _mode in {"accepted", "borrowed"} and _prior is not None
+                _rdy, _rdx = _prior if _prior is not None else (0.0, 0.0)
 
                 def _tent_weighted() -> np.ndarray:
                     _tw_arr = _elastic_tile_trust_weight(
@@ -3630,9 +3845,8 @@ def merge_cycles_to_ome_tiff(
                     return _tw_arr
 
                 def _constant_result(_cdy: float, _cdx: float, _status: str, _extra: dict) -> tuple:
-                    # A tile with no accepted deformation still contributes its (possibly
-                    # zero) constant shift with tent weight, so a good tile next to a
-                    # corrected neighbour blends toward zero rather than leaving a hole.
+                    # Only trusted rigid endpoints use this path. Unresolved tiles
+                    # return no arrays and therefore contribute no denominator weight.
                     _tnt = _tent_weighted()
                     _cy = np.full((_th, _tw), np.float32(_cdy), dtype=np.float32) * _tnt
                     _cx = np.full((_th, _tw), np.float32(_cdx), dtype=np.float32) * _tnt
@@ -3648,31 +3862,38 @@ def merge_cycles_to_ome_tiff(
                 _min_improve = float(_ELASTIC_TOUCHUP_MIN_IMPROVEMENT)
                 _skip_thr = float(elastic_touchup_skip_corr)
 
-                # Stage 1 baseline: masked alignment after the island rigid shift.
-                _base_corr = _masked_corr_score(_ref_crop, _mov_base, _score_mask)
+                # Stage 1 baseline: full-field alignment after the island rigid shift.
+                _base_corr = _masked_corr_score(_ref_crop, _mov_base, None)
                 _best_corr = float(_base_corr)
                 _best_dy = 0.0
                 _best_dx = 0.0
                 _best_mov = _mov_base
                 _elastic_corr: float | None = None
 
-                # Stage 2: apply the (smoothed) rigid prior only if it measurably helps
-                # AND the result clears the absolute correlation floor.
-                _use_rigid = _mode in {"accepted", "borrowed"}
-                _rigid_applied = False
-                if _use_rigid and (abs(float(_rdy)) > 1e-6 or abs(float(_rdx)) > 1e-6):
-                    _mov_rigid = _apply_translation(_mov_base, _rdy, _rdx, order=1)
-                    _rigid_corr = _masked_corr_score(_ref_crop, _mov_rigid, _score_mask)
-                    if (np.isfinite(_rigid_corr) and _rigid_corr >= _best_corr + _min_improve
-                            and _rigid_corr >= _min_abs_corr):
-                        _best_corr = float(_rigid_corr)
-                        _best_dy, _best_dx = float(_rdy), float(_rdx)
-                        _best_mov = _mov_rigid
-                        _rigid_applied = True
+                # Accepted and borrowed priors are already trusted. In particular,
+                # do not re-reject a borrowed value using the failed tile's unreliable
+                # local score.
+                _rigid_applied = bool(_has_rigid)
+                if _has_rigid:
+                    _best_dy, _best_dx = float(_rdy), float(_rdx)
+                    if abs(_best_dy) > 1e-6 or abs(_best_dx) > 1e-6:
+                        _best_mov = _apply_translation(_mov_base, _best_dy, _best_dx, order=1)
+                    _best_corr = _masked_corr_score(_ref_crop, _best_mov, None)
 
                 # Stage 2 re-check: if the rigid stage already clears the threshold, stop
                 # here — do not run elastic on a tile that no longer needs it.
                 if _best_corr >= _skip_thr:
+                    if not _rigid_applied:
+                        return (
+                            "unresolved", {
+                                "total": time.perf_counter() - _t_total,
+                                "mask": _mask_s, "ref": _ref_s, "mov": _mov_s,
+                                "base_corr": float(_base_corr), "best_corr": float(_best_corr),
+                                "rigid_delta_y": 0.0, "rigid_delta_x": 0.0,
+                                "rigid_rejected": 1.0,
+                            }, None, None, None,
+                            int(gy0), int(gy1), int(gx0), int(gx1),
+                        )
                     return _constant_result(
                         _best_dy, _best_dx,
                         "rigid_only_ok" if _rigid_applied else "no_change_ok",
@@ -3695,7 +3916,7 @@ def merge_cycles_to_ome_tiff(
                 if _res is not None:
                     _edy_e, _edx_e = _res
                     _mov_elastic = _warp_plane_by_field(_best_mov, _edy_e, _edx_e, order=1)
-                    _elastic_corr = _masked_corr_score(_ref_crop, _mov_elastic, _score_mask)
+                    _elastic_corr = _masked_corr_score(_ref_crop, _mov_elastic, None)
                     if (np.isfinite(_elastic_corr) and _elastic_corr >= _best_corr + _min_improve
                             and _elastic_corr >= _min_abs_corr):
                         _t = time.perf_counter()
@@ -3724,13 +3945,25 @@ def merge_cycles_to_ome_tiff(
                             int(gy0), int(gy1), int(gx0), int(gx1),
                         )
 
-                # Elastic failed or did not help: keep the best (rigid-only or unchanged).
-                return _constant_result(
-                    _best_dy, _best_dx,
-                    "rigid_only_ok" if _rigid_applied else "no_change_ok",
-                    {"elastix": _elastix_s,
-                     "rigid_delta_y": float(_best_dy), "rigid_delta_x": float(_best_dx),
-                     "rigid_rejected": 0.0 if _rigid_applied else 1.0},
+                # Elastic failure falls back only to a trusted rigid endpoint.
+                if _rigid_applied:
+                    return _constant_result(
+                        _best_dy, _best_dx, "rigid_only_ok",
+                        {"elastix": _elastix_s,
+                         "rigid_delta_y": float(_best_dy), "rigid_delta_x": float(_best_dx),
+                         "rigid_rejected": 0.0},
+                    )
+                return (
+                    "unresolved", {
+                        "total": time.perf_counter() - _t_total,
+                        "mask": _mask_s, "ref": _ref_s, "mov": _mov_s,
+                        "elastix": _elastix_s, "base_corr": float(_base_corr),
+                        "best_corr": float(_best_corr),
+                        "elastic_corr": float(_elastic_corr) if _elastic_corr is not None else None,
+                        "rigid_delta_y": 0.0, "rigid_delta_x": 0.0,
+                        "rigid_rejected": 1.0,
+                    }, None, None, None,
+                    int(gy0), int(gy1), int(gx0), int(gx1),
                 )
 
             _n_islands_done = 0
@@ -3738,6 +3971,7 @@ def merge_cycles_to_ome_tiff(
             _n_tiles_completed = 0
             _n_tiles_ok = 0
             _n_tiles_failed = 0
+            _trusted_samples_by_island: dict[int, list[tuple[float, float, float, float]]] = {}
             _diagnostic_records: list[dict[str, Any]] = []
             _diagnostic_pending: dict[tuple[int, int, int, int], dict[str, Any]] = {}
             _island_index_by_label = {
@@ -3774,6 +4008,7 @@ def merge_cycles_to_ome_tiff(
                 "rigid_candidate_elastix_failed": 0,
                 "elastix_failed": 0,
                 "rigid_candidate_rejected": 0,
+                "unresolved": 0,
             }
 
             def _emit_elastic_tile_progress(detail: str = "") -> None:
@@ -3795,6 +4030,7 @@ def merge_cycles_to_ome_tiff(
                         f"rigid_rejected={_tile_status_counts['rigid_candidate_rejected']}  "
                         f"skip_corr={_tile_status_counts['skip_corr']}  "
                         f"empty={_tile_status_counts['empty']}  "
+                        f"unresolved={_tile_status_counts['unresolved']}  "
                         f"failed={_tile_status_counts['elastix_failed'] + _tile_status_counts['rigid_candidate_elastix_failed']}  "
                         f"running={_running}  elapsed={_elapsed}s{_detail}"
                     ),
@@ -3846,6 +4082,9 @@ def merge_cycles_to_ome_tiff(
                         _diag["usable_field"] = bool(
                             _edy_w is not None and _edx_w is not None and _wt is not None
                         )
+                        _diag["field_source"] = (
+                            "direct_trusted" if _diag["usable_field"] else "unsupported"
+                        )
                         _diag["resolved_dy"] = float(_timings.get("rigid_delta_y", 0.0))
                         _diag["resolved_dx"] = float(_timings.get("rigid_delta_x", 0.0))
                         _diagnostic_records.append(_diag)
@@ -3860,15 +4099,30 @@ def merge_cycles_to_ome_tiff(
                     _tile_status_counts[_status] = int(_tile_status_counts.get(_status, 0)) + 1
                     if float(_timings.get("rigid_rejected", 0.0)) > 0.5:
                         _tile_status_counts["rigid_candidate_rejected"] += 1
-                    # Accumulate any tile that returned a usable field (all "_ok" statuses,
-                    # including rigid_only_ok / no_change_ok which contribute a constant
-                    # or zero shift with weight). Only None-field results are failures.
+                    # Only trusted endpoints contribute to the numerator and
+                    # denominator. None-field results are explicit abstentions.
                     if _edy_w is None or _edx_w is None or _wt is None:
                         _n_tiles_failed += 1
                         _emit_elastic_tile_progress(
                             f"{_status} tile=({_gy0},{_gy1},{_gx0},{_gx1})"
                         )
                         continue
+                    _sample_support = _wt > float(_weight_eps)
+                    if np.any(_sample_support):
+                        _sample_dy = np.divide(
+                            _edy_w[_sample_support], _wt[_sample_support]
+                        )
+                        _sample_dx = np.divide(
+                            _edx_w[_sample_support], _wt[_sample_support]
+                        )
+                        _sample_label = int(_diag.get("island_label", 0)) if _diag is not None else 0
+                        if _sample_label > 0:
+                            _trusted_samples_by_island.setdefault(_sample_label, []).append((
+                                float(_gy0 + _gy1 - 1) / 2.0,
+                                float(_gx0 + _gx1 - 1) / 2.0,
+                                float(np.median(_sample_dy)),
+                                float(np.median(_sample_dx)),
+                            ))
                     _t_accum = time.perf_counter()
                     _ry0 = int(_gy0) - int(acc_y0)
                     _ry1 = int(_gy1) - int(acc_y0)
@@ -3925,6 +4179,90 @@ def merge_cycles_to_ome_tiff(
                             f"shift=({_dy_fr:.1f},{_dx_fr:.1f}) -> per-tile escalation",
                             flush=True,
                         )
+                    # Plan the complete island before executing any RAM window.
+                    # Only compact tile metadata survives this pass, allowing
+                    # rigid borrowing across window boundaries without retaining
+                    # reference or moving image crops.
+                    _island_tile_by_key: dict[tuple[int, int, int, int], _RigidTouchupTile] = {}
+                    for _plan_win_y0 in range(_iy0, _iy1, _chunk_y):
+                        _plan_win_y1 = min(_iy1, _plan_win_y0 + _chunk_y)
+                        for _gy0, _gy1, _gx0, _gx1 in _iter_tiles_by_start(
+                            _plan_win_y0, _plan_win_y1, _iy1, _ix0, _ix1, overlap=True,
+                            lattice_origin_y=_iy0,
+                        ):
+                            _check_cancel(cancel_cb)
+                            _status, _timings, _rigid_tile = _plan_elastic_tile_rigid(
+                                _gy0, _gy1, _gx0, _gx1,
+                                _dy_fr, _dx_fr, int(_ereg.label),
+                                _iy0, _iy1, _ix0, _ix1,
+                            )
+                            _timing_tile_mask_s += float(_timings.get("mask", 0.0))
+                            _timing_tile_ref_s += float(_timings.get("ref", 0.0))
+                            _timing_tile_mov_s += float(_timings.get("mov", 0.0))
+                            _timing_tile_corr_s += float(_timings.get("tile_corr", 0.0))
+                            _timing_tile_rigid_s += float(_timings.get("rigid", 0.0))
+                            _key = (int(_gy0), int(_gy1), int(_gx0), int(_gx1))
+                            _diag_base: dict[str, Any] = {
+                                "cycle": int(cycle),
+                                "island_index": int(_island_index_by_label.get(int(_ereg.label), 0)),
+                                "island_total": int(len(regs_ds)),
+                                "island_label": int(_ereg.label),
+                                "island_bbox_y0": int(_iy0), "island_bbox_y1": int(_iy1),
+                                "island_bbox_x0": int(_ix0), "island_bbox_x1": int(_ix1),
+                                "tile_y0": int(_gy0), "tile_y1": int(_gy1),
+                                "tile_x0": int(_gx0), "tile_x1": int(_gx1),
+                                "base_shift_y": float(_dy_fr), "base_shift_x": float(_dx_fr),
+                                "plan_status": str(_status), "plan_timings": dict(_timings),
+                            }
+                            if _rigid_tile is None:
+                                _diag_base.update({
+                                    "final_status": str(_status),
+                                    "completed_order": int(_n_tiles_completed + 1),
+                                    "usable_field": False,
+                                })
+                                _diagnostic_records.append(_diag_base)
+                                _n_tiles_completed += 1
+                            else:
+                                _diag_base.update({
+                                    "rigid_dy": float(_rigid_tile.rigid_dy),
+                                    "rigid_dx": float(_rigid_tile.rigid_dx),
+                                    "rigid_base_corr": float(_rigid_tile.base_corr),
+                                    "rigid_candidate_corr": float(_rigid_tile.candidate_corr),
+                                    "rigid_accepted": bool(_rigid_tile.accepted),
+                                    "prior_anchor": bool(_rigid_tile.prior_anchor),
+                                })
+                                _diagnostic_pending[_key] = _diag_base
+                                _island_tile_by_key[_key] = _rigid_tile
+                            if _status in {"empty", "blank", "skip_corr"}:
+                                _tile_status_counts[_status] = int(_tile_status_counts.get(_status, 0)) + 1
+
+                    _island_tiles = list(_island_tile_by_key.values())
+                    _rigid_counts = _resolve_borrowed_rigid_touchups(
+                        _island_tiles,
+                        stride_y=float(_stride_h), stride_x=float(_stride_w),
+                        max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
+                    )
+                    for _rigid_tile in _island_tiles:
+                        _key = (
+                            int(_rigid_tile.y0), int(_rigid_tile.y1),
+                            int(_rigid_tile.x0), int(_rigid_tile.x1),
+                        )
+                        _diag = _diagnostic_pending.get(_key)
+                        if _diag is not None:
+                            _diag.update({
+                                "rigid_mode": str(_rigid_tile.mode),
+                                "resolved_prior_dy": _rigid_tile.resolved_dy,
+                                "resolved_prior_dx": _rigid_tile.resolved_dx,
+                                "rigid_seed_accepted": bool(_rigid_tile.accepted),
+                            })
+                    if _island_tiles:
+                        _emit_elastic_tile_progress(
+                            "planned complete island rigid tiles "
+                            f"accepted={_rigid_counts['accepted']} "
+                            f"borrowed={_rigid_counts['borrowed']} "
+                            f"elastic_only={_rigid_counts['elastic_only']} "
+                            f"stable_zero={_rigid_counts['stable_zero']}"
+                        )
                     for _win_y0 in range(_iy0, _iy1, _chunk_y):
                         _check_cancel(cancel_cb)
                         _win_y1 = min(_iy1, _win_y0 + _chunk_y)
@@ -3940,91 +4278,10 @@ def merge_cycles_to_ome_tiff(
                             _win_y0, _win_y1, _iy1, _ix0, _ix1, overlap=True,
                             lattice_origin_y=_iy0,
                         ):
-                            _check_cancel(cancel_cb)
-                            _status, _timings, _rigid_tile = _plan_elastic_tile_rigid(
-                                _gy0, _gy1, _gx0, _gx1,
-                                _dy_fr, _dx_fr,
-                                int(_ereg.label),
-                                _iy0, _iy1, _ix0, _ix1,
-                            )
-                            _timing_tile_mask_s += float(_timings.get("mask", 0.0))
-                            _timing_tile_ref_s += float(_timings.get("ref", 0.0))
-                            _timing_tile_mov_s += float(_timings.get("mov", 0.0))
-                            _timing_tile_corr_s += float(_timings.get("tile_corr", 0.0))
-                            _timing_tile_rigid_s += float(_timings.get("rigid", 0.0))
-                            _diag_base: dict[str, Any] = {
-                                "cycle": int(cycle),
-                                "island_index": int(_island_index_by_label.get(int(_ereg.label), 0)),
-                                "island_total": int(len(regs_ds)),
-                                "island_label": int(_ereg.label),
-                                "island_bbox_y0": int(_iy0),
-                                "island_bbox_y1": int(_iy1),
-                                "island_bbox_x0": int(_ix0),
-                                "island_bbox_x1": int(_ix1),
-                                "tile_y0": int(_gy0),
-                                "tile_y1": int(_gy1),
-                                "tile_x0": int(_gx0),
-                                "tile_x1": int(_gx1),
-                                "base_shift_y": float(_dy_fr),
-                                "base_shift_x": float(_dx_fr),
-                                "plan_status": str(_status),
-                                "plan_timings": dict(_timings),
-                            }
+                            _key = (int(_gy0), int(_gy1), int(_gx0), int(_gx1))
+                            _rigid_tile = _island_tile_by_key.get(_key)
                             if _rigid_tile is not None:
-                                _diag_base.update({
-                                    "rigid_dy": float(_rigid_tile.rigid_dy),
-                                    "rigid_dx": float(_rigid_tile.rigid_dx),
-                                    "rigid_base_corr": float(_rigid_tile.base_corr),
-                                    "rigid_candidate_corr": float(_rigid_tile.candidate_corr),
-                                    "rigid_accepted": bool(_rigid_tile.accepted),
-                                    "prior_anchor": bool(_rigid_tile.prior_anchor),
-                                })
-                            else:
-                                _diag_base.update({
-                                    "final_status": str(_status),
-                                    "completed_order": int(_n_tiles_completed + 1),
-                                    "usable_field": False,
-                                })
-                                _diagnostic_records.append(_diag_base)
-                            if _status in {"empty", "blank", "skip_corr"}:
-                                _tile_status_counts[_status] = int(_tile_status_counts.get(_status, 0)) + 1
-                            if _rigid_tile is None:
-                                # This candidate was fully evaluated by the
-                                # pre-screen and will not become a worker task.
-                                _n_tiles_completed += 1
-                            if _rigid_tile is not None:
-                                _diagnostic_pending[
-                                    (int(_gy0), int(_gy1), int(_gx0), int(_gx1))
-                                ] = _diag_base
                                 _planned_tiles.append(_rigid_tile)
-                        _rigid_counts = _resolve_borrowed_rigid_touchups(
-                            _planned_tiles,
-                            stride_y=float(_stride_h),
-                            stride_x=float(_stride_w),
-                            max_shift=max(1.0, float(elastic_touchup_rigid_max_shift)),
-                        )
-                        for _rigid_tile in _planned_tiles:
-                            _diag = _diagnostic_pending.get(
-                                (
-                                    int(_rigid_tile.y0), int(_rigid_tile.y1),
-                                    int(_rigid_tile.x0), int(_rigid_tile.x1),
-                                )
-                            )
-                            if _diag is not None:
-                                _diag.update({
-                                    "rigid_mode": str(_rigid_tile.mode),
-                                    "resolved_prior_dy": float(_rigid_tile.resolved_dy),
-                                    "resolved_prior_dx": float(_rigid_tile.resolved_dx),
-                                    "rigid_seed_accepted": bool(_rigid_tile.accepted),
-                                })
-                        if _planned_tiles:
-                            _emit_elastic_tile_progress(
-                                "planned rigid tiles "
-                                f"accepted={_rigid_counts['accepted']} "
-                                f"borrowed={_rigid_counts['borrowed']} "
-                                f"elastic_only={_rigid_counts['elastic_only']} "
-                                f"stable_zero={_rigid_counts['stable_zero']}"
-                            )
                         for _rigid_tile in _planned_tiles:
                             _check_cancel(cancel_cb)
                             _pending.add(_pool.submit(
@@ -4032,7 +4289,7 @@ def merge_cycles_to_ome_tiff(
                                 _rigid_tile,
                                 _dy_fr, _dx_fr,
                                 _iy0, _iy1, _ix0, _ix1,
-                                _planned_tiles,
+                                _island_tiles,
                             ))
                             _n_tiles_submitted += 1
                             _emit_elastic_tile_progress("submitted tile")
@@ -4065,6 +4322,22 @@ def merge_cycles_to_ome_tiff(
                 raise
             else:
                 _pool.shutdown(wait=True, cancel_futures=False)
+
+            _fallback_models: dict[int, _HarmonicTileField] = {}
+            for _ereg in regs_ds:
+                _label = int(_ereg.label)
+                _samples = _trusted_samples_by_island.get(_label, [])
+                if not _samples:
+                    continue
+                _bounds = _island_bbox_fr(_ereg)
+                _model = _build_harmonic_tile_field(
+                    _samples,
+                    bounds=_bounds,
+                    stride_y=_stride_h,
+                    stride_x=_stride_w,
+                )
+                if _model is not None:
+                    _fallback_models[_label] = _model
 
             # Attach the final worker result to its planning record. Records
             # are written after the complete cycle so each line is a complete,
@@ -4100,6 +4373,7 @@ def merge_cycles_to_ome_tiff(
                     f"skip_corr={_tile_status_counts['skip_corr']} "
                     f"empty={_tile_status_counts['empty']} "
                     f"blank(abstained)={_tile_status_counts['blank']} "
+                    f"unresolved(abstained)={_tile_status_counts['unresolved']} "
                     f"elastix_failed={_tile_status_counts['elastix_failed']} "
                     f"rigid_candidate_elastix_failed={_tile_status_counts['rigid_candidate_elastix_failed']}",
                     flush=True,
@@ -4141,6 +4415,8 @@ def merge_cycles_to_ome_tiff(
                             _diag_fh.write(json.dumps(_record, sort_keys=True) + "\n")
                     _diag_summary = {
                         "schema_version": 1,
+                        "field_construction": "trusted_weighted_with_harmonic_fallback",
+                        "interpolated_islands": int(len(_fallback_models)),
                         "cycle": int(cycle),
                         "n_islands": int(len(regs_ds)),
                         "candidate_tiles": int(_n_tiles_total),
@@ -4209,15 +4485,32 @@ def merge_cycles_to_ome_tiff(
                 _t_read = time.perf_counter()
                 _wt_sl = np.asarray(_wt_sum[_out_y0:_out_y1, :], dtype=np.float32)
                 _nz = _wt_sl > float(_weight_eps)
-                if not _nz.any():
-                    _timing_provider_read_s += float(time.perf_counter() - _t_read)
-                    return None
                 _dy = np.asarray(_dy_sum[_out_y0:_out_y1, :], dtype=np.float32)
                 _dx = np.asarray(_dx_sum[_out_y0:_out_y1, :], dtype=np.float32)
-                _dy[_nz] /= _wt_sl[_nz]
-                _dx[_nz] /= _wt_sl[_nz]
+                np.divide(_dy, _wt_sl, out=_dy, where=_nz)
+                np.divide(_dx, _wt_sl, out=_dx, where=_nz)
+                _has_output = bool(np.any(_nz))
+                for _ereg in regs_ds:
+                    _label = int(_ereg.label)
+                    _model = _fallback_models.get(_label)
+                    if _model is None:
+                        continue
+                    _island_slice = _upsample_ds_mask_to_local(
+                        islands_ds,
+                        label=_label,
+                        y0_fr=_out_y0,
+                        y1_fr=_out_y1,
+                        x0_fr=0,
+                        x1_fr=_canvas_w,
+                        downsample=_ds,
+                    )
+                    _filled = _fill_missing_touchup_field(
+                        _dy, _dx, _nz, _island_slice, _model,
+                        bounds=(_out_y0, _out_y1, 0, _canvas_w),
+                    )
+                    _has_output = _has_output or _filled > 0
                 _timing_provider_read_s += float(time.perf_counter() - _t_read)
-                return _dy, _dx
+                return (_dy, _dx) if _has_output else None
 
             setattr(_provider, "cleanup", _cleanup)
             return _provider
@@ -4618,6 +4911,26 @@ def merge_cycles_to_ome_tiff(
                 islands = _identify_foreground_islands(moved_mask, _tile_sz, solid=True)
                 del moved_mask
                 n_islands = int(np.max(islands))
+                if debug_island_map:
+                    _map_dir = Path(debug_dir) if debug_dir else Path(output_path).parent
+                    _map_stem = Path(output_path).name
+                    for _ext in ('.ome.tiff', '.ome.tif', '.tiff', '.tif'):
+                        if _map_stem.lower().endswith(_ext):
+                            _map_stem = _map_stem[:-len(_ext)]
+                            break
+                    _map_path = _map_dir / f"{_map_stem}_island_map_cycle_{int(cycle)}.tiff"
+                    _map_scale, _ = _write_island_map_debug_tiff(
+                        islands,
+                        out_path=_map_path,
+                        cycle=int(cycle),
+                        source_downsample=(D if _strip_mode else 1),
+                    )
+                    print(
+                        f"[registration] cycle {int(cycle)}: wrote island map: "
+                        f"{n_islands} island(s), {tuple(int(v) for v in islands.shape)}, "
+                        f"1/{_map_scale} scale -> {_map_path}",
+                        flush=True,
+                    )
             else:
                 islands = None
                 n_islands = 0
