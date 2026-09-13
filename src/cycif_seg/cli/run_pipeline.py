@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import fnmatch
 import re
 import shutil
 import sys
@@ -30,6 +31,7 @@ from string import ascii_lowercase
 
 _CYCLE_DIR_RE = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
 _STITCH_SUFFIX = "cyseg-stitched"
+_DEFAULT_STITCHED_PATTERNS = (f"*_{_STITCH_SUFFIX}.ome.tiff",)
 _MERGE_SUFFIX = "cyseg-merged"
 
 
@@ -113,9 +115,64 @@ def _letter_suffix(idx: int) -> str:
     return result
 
 
+def _normalize_stitched_patterns(stitched_patterns: list[str] | tuple[str, ...] | None) -> list[str]:
+    patterns = [str(value).strip() for value in (stitched_patterns or _DEFAULT_STITCHED_PATTERNS)]
+    patterns = [value for value in patterns if value]
+    return patterns or list(_DEFAULT_STITCHED_PATTERNS)
+
+
+def _select_sample_stitched_files(
+    cycle_folders: list[Path],
+    *,
+    stitched_patterns: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, dict[Path, Path]]:
+    """Select one stitched naming pattern that covers every cycle folder.
+
+    Patterns are evaluated sample-wide in user-provided preference order. Files
+    from different patterns are never mixed within one sample.
+    """
+    patterns = _normalize_stitched_patterns(stitched_patterns)
+    coverage: list[tuple[str, list[str]]] = []
+
+    for pattern in patterns:
+        selected: dict[Path, Path] = {}
+        missing: list[str] = []
+        for folder in cycle_folders:
+            matches = [
+                path
+                for path in sorted(folder.iterdir(), key=lambda p: p.name.lower())
+                if path.is_file() and fnmatch.fnmatchcase(path.name.lower(), pattern.lower())
+            ]
+            if len(matches) > 1:
+                names = ", ".join(path.name for path in matches)
+                raise ValueError(
+                    f"Stitched pattern {pattern!r} is ambiguous in cycle directory "
+                    f"'{folder.name}': {names}"
+                )
+            if not matches:
+                missing.append(folder.name)
+                continue
+            selected[folder] = matches[0]
+
+        if not missing:
+            return pattern, selected
+        coverage.append((pattern, missing))
+
+    details = "; ".join(
+        f"{pattern!r} missing in: {', '.join(missing)}"
+        for pattern, missing in coverage
+    )
+    raise FileNotFoundError(
+        f"No stitched pattern has exactly one matching file in all "
+        f"{len(cycle_folders)} cycle directories. {details}"
+    )
+
+
 def discover_cycles(
     sample_dir: Path,
     tile_regex: str | None = None,
+    stitched_patterns: list[str] | tuple[str, ...] | None = None,
+    require_stitched: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """Scan sample_dir for cycle subdirectories.
 
@@ -153,6 +210,22 @@ def discover_cycles(
     if not raw:
         return [], errors
 
+    tiles_by_folder = {
+        folder: discover_cycle_tiles(folder, tile_filename_regex=tile_regex)
+        for _cycle_num, _suffix, folder in raw
+    }
+    use_stitched = bool(require_stitched) or any(not tiles for tiles in tiles_by_folder.values())
+    selected_stitched_pattern: str | None = None
+    selected_stitched_files: dict[Path, Path] = {}
+    if use_stitched:
+        try:
+            selected_stitched_pattern, selected_stitched_files = _select_sample_stitched_files(
+                [folder for _cycle_num, _suffix, folder in raw],
+                stitched_patterns=stitched_patterns,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            return [], [str(exc)]
+
     # Group by cycle_num to detect duplicates
     by_num: dict[int, list[tuple[str, Path]]] = {}
     for cycle_num, suffix, folder in raw:
@@ -179,16 +252,9 @@ def discover_cycles(
             cycle_int = cycle_int_counter
             cycle_int_counter += 1
 
-            # Count tiles
-            tiles = discover_cycle_tiles(folder, tile_filename_regex=tile_regex)
-            if not tiles:
-                expected_stitched = folder / f"{folder.name}_{_STITCH_SUFFIX}.ome.tiff"
-                if not expected_stitched.exists():
-                    errors.append(
-                        f"Cycle directory '{folder.name}' matches the C<N>_... pattern "
-                        f"but contains no tile files."
-                    )
-                    continue
+            tiles = tiles_by_folder[folder]
+            if use_stitched:
+                expected_stitched = selected_stitched_files[folder]
                 n_channels = _get_tile_channel_count(expected_stitched)
                 channel_markers, had_warning = _parse_channel_markers(suffix, n_channels)
                 if had_warning:
@@ -208,6 +274,8 @@ def discover_cycles(
                     "n_channels": n_channels,
                     "n_tiles": 0,
                     "pre_stitched": True,
+                    "stitched_path": expected_stitched,
+                    "stitched_pattern": selected_stitched_pattern,
                 })
                 continue
 
@@ -534,6 +602,18 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Parallel workers for stitching, registration writes, pyramid build, and elastic touch-up (default: 1)")
     stitch_grp.add_argument("--tile-regex", default=None, metavar="REGEX",
                              help="Override default tile filename regex pattern")
+    stitch_grp.add_argument(
+        "--stitched-pattern",
+        nargs="+",
+        default=None,
+        metavar="GLOB",
+        help=(
+            "One or more preferred filename patterns for existing stitched files. "
+            "The first pattern with exactly one match in every cycle directory is used "
+            "for the whole sample; patterns are never mixed. Default: "
+            "'*_cyseg-stitched.ome.tiff'. Quote patterns to prevent shell expansion."
+        ),
+    )
     stitch_grp.add_argument("--pyramid-chunk-size", type=int, default=512, metavar="INT",
                              help="Edge length (px) of chunks used to build pyramid levels; lower to reduce peak RAM (default: 512)")
     stitch_grp.add_argument("--pyramid-write-workers", type=int, default=None, metavar="INT",
@@ -642,7 +722,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- Discovery --------------------------------------------------------
     print(f"Scanning {sample_dir} for cycle directories...")
-    cycle_infos, errors = discover_cycles(sample_dir, tile_regex=args.tile_regex)
+    cycle_infos, errors = discover_cycles(
+        sample_dir,
+        tile_regex=args.tile_regex,
+        stitched_patterns=args.stitched_pattern,
+        require_stitched=bool(args.skip_stitch),
+    )
 
     if errors:
         for e in errors:
@@ -658,6 +743,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     cycle_infos = sorted(cycle_infos, key=lambda x: x["cycle_int"])
+
+    selected_stitched_pattern = next(
+        (str(ci["stitched_pattern"]) for ci in cycle_infos if ci.get("stitched_pattern")),
+        None,
+    )
+    if selected_stitched_pattern is not None:
+        print(
+            f"\nSelected stitched pattern for all {len(cycle_infos)} cycle(s): "
+            f"{selected_stitched_pattern}"
+        )
 
     print(f"\nFound {len(cycle_infos)} cycle(s):")
     for ci in cycle_infos:
@@ -682,7 +777,7 @@ def main(argv: list[str] | None = None) -> int:
     for ci in cycle_infos:
         try:
             if ci.get("pre_stitched"):
-                path = str(ci["folder"] / f"{ci['folder'].name}_{_STITCH_SUFFIX}.ome.tiff")
+                path = str(ci["stitched_path"])
                 if args.force_stitch:
                     print(
                         f"\n  [WARNING] --force-stitch ignored for cycle {ci['label']} "
@@ -691,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 else:
                     print(f"\n--- Cycle {ci['label']}: {ci['folder'].name} ---")
-                    print(f"  [pre-stitched] Using existing: {ci['folder'].name}_{_STITCH_SUFFIX}.ome.tiff")
+                    print(f"  [pre-stitched] Using existing: {Path(path).name}")
             elif args.skip_stitch:
                 path = _find_stitched_file(ci)
                 print(f"  [skip-stitch] Using existing: {path}")

@@ -71,6 +71,15 @@ DAPI, HSV1g, PDL1, CD8
 
 If the suffix has too few marker tokens, missing channel names are left blank and a warning is printed. Marker names should not contain underscores if you want automatic detection to work cleanly. Tile filenames inside each cycle directory must match the default tile-position pattern ending in underscore-separated integer coordinates, such as `area_*_<x>_<y>.ome.tiff` or `raw_*_<x>_<y>.ome.tiff`; use `--tile-regex` if your tile names differ.
 
+When registering existing stitched files, the default filename pattern is `*_cyseg-stitched.ome.tiff`. Use `--stitched-pattern` to provide one or more sample-wide alternatives in preference order:
+
+```powershell
+cycif-seg-run SAMPLE_DIR --skip-stitch `
+  --stitched-pattern '*_cyseg-stitched.ome.tiff' '*_evos.ome.tiff'
+```
+
+The first pattern having exactly one matching file in every cycle directory wins for the entire sample; files from different patterns are never mixed. If no pattern covers every cycle, registration does not start and the missing cycle directories are reported. The selected pattern is printed in the run log.
+
 For `cycif-seg-preprocess plan` and `resume-registration --sample-dir`, the expected layout is:
 
 ```text
