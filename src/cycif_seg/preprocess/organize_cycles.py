@@ -490,6 +490,52 @@ def _foreground_mask(img_yx: np.ndarray) -> np.ndarray:
     return mask.astype(bool, copy=False)
 
 
+def _registration_signal_status(
+    img_yx: np.ndarray,
+    *,
+    min_signal_pixels: int = 32,
+) -> tuple[bool, str]:
+    """Report whether an intensity plane can support phase correlation."""
+    arr = np.asarray(img_yx, dtype=np.float32)
+    required = max(1, int(min_signal_pixels))
+    if arr.ndim != 2:
+        return False, f"expected a 2D plane, got shape {arr.shape}"
+    if arr.size == 0:
+        return False, "image is empty"
+
+    finite = np.isfinite(arr)
+    finite_count = int(finite.sum())
+    if finite_count < required:
+        return False, f"only {finite_count} finite pixels; need at least {required}"
+
+    values = arr[finite]
+    value_min = float(np.min(values))
+    value_max = float(np.max(values))
+    value_range = float(value_max - value_min)
+    flat_tolerance = float(
+        8.0
+        * np.finfo(np.float32).eps
+        * max(1.0, abs(value_min), abs(value_max))
+    )
+    if not np.isfinite(value_range) or value_range <= flat_tolerance:
+        return False, (
+            "intensity is constant or numerically flat "
+            f"(min={value_min:.6g}, max={value_max:.6g})"
+        )
+
+    try:
+        signal_pixels = int(_foreground_mask(arr).sum())
+    except Exception as exc:
+        return False, f"foreground detection failed: {type(exc).__name__}: {exc}"
+    if signal_pixels < required:
+        return False, f"only {signal_pixels} foreground pixels; need at least {required}"
+
+    return True, (
+        f"finite_pixels={finite_count}, foreground_pixels={signal_pixels}, "
+        f"intensity_range={value_range:.6g}"
+    )
+
+
 def _tile_component_masks(
     mask: np.ndarray,
     tile_hw: tuple[int, int],
@@ -1167,6 +1213,10 @@ def _sample_tile_registration_worker(
 ) -> tuple[float, float, float, np.ndarray, np.ndarray, np.ndarray, tuple[int, int], tuple[int, int, int, int]] | None:
     base_dy, base_dx = float(base_shift[0]), float(base_shift[1])
     base_score = _masked_corr_score(fixed_crop, moving_base_crop, mask_crop)
+    fixed_usable, _fixed_reason = _registration_signal_status(fixed_crop)
+    moving_usable, _moving_reason = _registration_signal_status(moving_base_crop)
+    if not fixed_usable or not moving_usable:
+        return None
     try:
         resid_dy, resid_dx = estimate_translation(
             fixed_crop,
@@ -1401,6 +1451,32 @@ def _refine_region_transforms(
         moving_base_crop = _extract_translated_crop(moving_n, bbox, base_dy, base_dx, order=1)
         mask_crop = region_mask[y0:y1, x0:x1]
 
+        fixed_usable, fixed_reason = _registration_signal_status(fixed_crop)
+        moving_usable, moving_reason = _registration_signal_status(moving_base_crop)
+        if not fixed_usable or not moving_usable:
+            if _debug_preprocess:
+                reasons = []
+                if not fixed_usable:
+                    reasons.append(f"fixed: {fixed_reason}")
+                if not moving_usable:
+                    reasons.append(f"moving: {moving_reason}")
+                print(
+                    f"[preprocess] cycle {cycle}: island {lab} rigid refinement abstained; "
+                    f"retaining global shift ({base_dy:.2f}, {base_dx:.2f}); "
+                    + "; ".join(reasons),
+                    flush=True,
+                )
+            regions.append(
+                _RegionTransform(
+                    label=int(lab),
+                    bbox=bbox,
+                    shift_y=base_dy,
+                    shift_x=base_dx,
+                    pixels=pixels,
+                )
+            )
+            continue
+
         base_score = _masked_corr_score(fixed_crop, moving_base_crop, mask_crop)
         base_objective = float(base_score)
 
@@ -1571,6 +1647,12 @@ def _warp_strip_by_field(
     """
     arr = np.asarray(src_canvas_strip, dtype=np.float32)
     X = arr.shape[1]
+    # A sufficiently large (but finite) displacement can place this entire
+    # output strip outside the source canvas.  The clipped source interval is
+    # then empty, and constant-fill warping should produce an all-zero strip.
+    # scipy.ndimage.map_coordinates cannot sample an array with zero rows.
+    if arr.shape[0] == 0:
+        return np.zeros((strip_H, X), dtype=np.float32)
     out = np.empty((strip_H, X), dtype=np.float32)
     gy = np.arange(out_y0, out_y0 + strip_H, dtype=np.float32)
     gx = np.arange(X, dtype=np.float32)
@@ -1616,10 +1698,16 @@ def _strip_source_row_bounds_for_field(
     src_min = float(np.min(rows - fy_max))
     src_max = float(np.max(rows - fy_min))
     pad = max(0, int(safety_pad))
-    return (
-        max(0, int(math.floor(src_min)) - pad),
-        min(int(canvas_h), int(math.ceil(src_max)) + 1 + pad),
-    )
+    # Clamp both ends independently.  Clamping only the lower side of the
+    # start and upper side of the end can invert the interval when every
+    # requested source row lies above or below the canvas, yielding a negative
+    # height in the strip writer.  Equal bounds intentionally represent a
+    # zero-overlap source window.
+    raw_y0 = int(math.floor(src_min)) - pad
+    raw_y1 = int(math.ceil(src_max)) + 1 + pad
+    clamped_y0 = min(int(canvas_h), max(0, raw_y0))
+    clamped_y1 = min(int(canvas_h), max(0, raw_y1))
+    return clamped_y0, clamped_y1
 
 
 def _scale_region_transform(r: _RegionTransform, D: int) -> _RegionTransform:
@@ -3165,11 +3253,25 @@ def merge_cycles_to_ome_tiff(
         raise ValueError(f"Could not find registration marker {ref_marker!r} in reference cycle {int(ref_ci.cycle)}")
     if _strip_mode:
         _ref_ds = load_channel_downsampled(ref_ci.path, int(ref_ch_idx), D)
+        _ref_usable, _ref_reason = _registration_signal_status(_ref_ds)
+        if not _ref_usable:
+            raise ValueError(
+                "Cannot calculate global translation: unusable registration-marker "
+                f"signal in reference Cycle {int(ref_ci.cycle)}, marker {ref_marker!r}, "
+                f"file {ref_ci.path!r}: {_ref_reason}"
+            )
         _ref_yx_ds = _pad_plane_to_canvas(_ref_ds.astype(np.float32), _ds_canvas_yx, out_dtype=np.float32)
         ref_reg = _normalized_for_registration(_ref_yx_ds)
         del _ref_ds, _ref_yx_ds
     else:
         ref_plane_native = load_single_channel_tiff_native(ref_ci.path, int(ref_ch_idx))
+        _ref_usable, _ref_reason = _registration_signal_status(ref_plane_native)
+        if not _ref_usable:
+            raise ValueError(
+                "Cannot calculate global translation: unusable registration-marker "
+                f"signal in reference Cycle {int(ref_ci.cycle)}, marker {ref_marker!r}, "
+                f"file {ref_ci.path!r}: {_ref_reason}"
+            )
         ref_yx = _pad_plane_to_canvas(ref_plane_native, canvas_yx, out_dtype=np.float32)
         ref_reg = _normalized_for_registration(ref_yx)
         del ref_plane_native, ref_yx
@@ -4828,11 +4930,25 @@ def merge_cycles_to_ome_tiff(
             )
             if _strip_mode:
                 _mov_ds = load_channel_downsampled(ci.path, int(ch_idx), D)
+                _mov_usable, _mov_reason = _registration_signal_status(_mov_ds)
+                if not _mov_usable:
+                    raise ValueError(
+                        "Cannot calculate global translation: unusable registration-marker "
+                        f"signal in moving Cycle {cycle}, marker {marker!r}, "
+                        f"file {ci.path!r}: {_mov_reason}"
+                    )
                 _mov_yx_ds = _pad_plane_to_canvas(_mov_ds.astype(np.float32), _ds_canvas_yx, out_dtype=np.float32)
                 mov_reg = _normalized_for_registration(_mov_yx_ds)
                 del _mov_ds, _mov_yx_ds
             else:
                 mov_native = load_single_channel_tiff_native(ci.path, int(ch_idx))
+                _mov_usable, _mov_reason = _registration_signal_status(mov_native)
+                if not _mov_usable:
+                    raise ValueError(
+                        "Cannot calculate global translation: unusable registration-marker "
+                        f"signal in moving Cycle {cycle}, marker {marker!r}, "
+                        f"file {ci.path!r}: {_mov_reason}"
+                    )
                 mov_yx = _pad_plane_to_canvas(mov_native, canvas_yx, out_dtype=np.float32)
                 mov_reg = _normalized_for_registration(mov_yx)
                 del mov_native, mov_yx

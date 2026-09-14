@@ -15,11 +15,14 @@ from cycif_seg.preprocess.organize_cycles import (
     _apply_translation,
     _elastic_tile_trust_weight,
     _estimate_masked_rigid_touchup,
+    _refine_region_transforms,
+    _registration_signal_status,
     _resolve_borrowed_rigid_touchups,
     _RigidTouchupTile,
     _smooth_rigid_prior_for_tile,
     _run_elastix_bspline,
     _strip_source_row_bounds_for_field,
+    _warp_strip_by_field,
     merge_cycles_to_ome_tiff,
 )
 
@@ -195,6 +198,78 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
             candidate_corr=0.1 + gain,
             accepted=accepted,
         )
+
+    def test_registration_signal_status_rejects_empty_and_constant_planes(self) -> None:
+        empty_ok, empty_reason = _registration_signal_status(np.zeros((0, 12), dtype=np.float32))
+        constant_ok, constant_reason = _registration_signal_status(np.full((32, 32), 7.0, dtype=np.float32))
+
+        self.assertFalse(empty_ok)
+        self.assertIn("empty", empty_reason)
+        self.assertFalse(constant_ok)
+        self.assertIn("constant or numerically flat", constant_reason)
+
+    def test_step6_unusable_crops_abstain_and_retain_global_shift(self) -> None:
+        shape = (256, 256)
+        fixed = np.zeros(shape, dtype=np.float32)
+        yy, xx = np.indices(shape, dtype=np.float32)
+        moving = yy + xx
+        islands = np.ones(shape, dtype=np.int32)
+        base_shift = (13.0, -9.0)
+
+        with patch("cycif_seg.preprocess.organize_cycles.estimate_translation") as estimate:
+            regions = _refine_region_transforms(
+                fixed,
+                moving,
+                islands,
+                base_shift,
+                search_radius=8,
+                downsample=1,
+                penalty_lambda=0.0,
+                fast_large_island_refinement=True,
+                fast_large_island_sample_count=5,
+                fast_large_island_cell_size=64,
+                progress_cb=None,
+                progress_event_cb=None,
+                cancel_cb=None,
+                cycle=13,
+            )
+
+        estimate.assert_not_called()
+        self.assertEqual(len(regions), 1)
+        self.assertEqual((regions[0].shift_y, regions[0].shift_x), base_shift)
+
+    def test_global_translation_rejects_unusable_reference_or_moving_channel(self) -> None:
+        yy, xx = np.indices((64, 64), dtype=np.uint16)
+        signal = ((yy * 17 + xx * 29) % 4096).astype(np.uint16)
+        blank = np.zeros_like(signal)
+
+        for bad_side in ("reference", "moving"):
+            with self.subTest(bad_side=bad_side), tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                ref_path = tmp / "reference.ome.tiff"
+                mov_path = tmp / "moving.ome.tiff"
+                _write_single_channel_ome(ref_path, blank if bad_side == "reference" else signal)
+                _write_single_channel_ome(mov_path, blank if bad_side == "moving" else signal)
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    rf"unusable registration-marker signal in {bad_side} Cycle",
+                ):
+                    merge_cycles_to_ome_tiff(
+                        [
+                            CycleInput(str(ref_path), cycle=0, registration_marker="DAPI"),
+                            CycleInput(str(mov_path), cycle=1, registration_marker="DAPI"),
+                        ],
+                        str(tmp / "merged.ome.tiff"),
+                        reference_cycle=0,
+                        default_registration_marker="DAPI",
+                        registration_algorithm="translation",
+                        downsample_for_registration=1,
+                        low_mem=True,
+                        strip_height=32,
+                        elastic_touchup=False,
+                        pyramidal_output=False,
+                    )
 
     def test_borrowed_rigid_touchup_propagates_across_failed_chain(self) -> None:
         tiles = [
@@ -395,6 +470,55 @@ class ElasticTouchupRegressionTest(unittest.TestCase):
 
         self.assertLessEqual(src_y0, 96 - 19 - 4)
         self.assertGreaterEqual(src_y1, 160 - 3 + 4)
+
+    def test_strip_source_bounds_clamp_zero_overlap_above_canvas(self) -> None:
+        field_y = np.full((64, 48), 1000.0, dtype=np.float32)
+
+        src_y0, src_y1 = _strip_source_row_bounds_for_field(
+            0,
+            64,
+            256,
+            field_y,
+            fallback_pad=7,
+            safety_pad=4,
+        )
+
+        self.assertEqual((src_y0, src_y1), (0, 0))
+
+    def test_strip_source_bounds_clamp_zero_overlap_below_canvas(self) -> None:
+        field_y = np.full((64, 48), -1000.0, dtype=np.float32)
+
+        src_y0, src_y1 = _strip_source_row_bounds_for_field(
+            192,
+            256,
+            256,
+            field_y,
+            fallback_pad=7,
+            safety_pad=4,
+        )
+
+        self.assertEqual((src_y0, src_y1), (256, 256))
+
+    def test_warp_strip_with_empty_source_returns_constant_fill(self) -> None:
+        strip_h = 64
+        canvas_w = 48
+        empty_source = np.zeros((0, canvas_w), dtype=np.float32)
+        field_y = np.full((strip_h, canvas_w), 1000.0, dtype=np.float32)
+        field_x = np.zeros((strip_h, canvas_w), dtype=np.float32)
+
+        result = _warp_strip_by_field(
+            empty_source,
+            out_y0=0,
+            strip_H=strip_h,
+            src_canvas_y0=0,
+            field_y=field_y,
+            field_x=field_x,
+            order=1,
+        )
+
+        self.assertEqual(result.shape, (strip_h, canvas_w))
+        self.assertEqual(result.dtype, np.float32)
+        self.assertFalse(np.any(result))
 
     def test_elastix_touchup_does_not_write_transformix_scratch_to_cwd(self) -> None:
         yy, xx = np.indices((48, 48), dtype=np.float32)
