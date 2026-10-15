@@ -968,8 +968,16 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                             "n_cycles": int(rep.get("n_cycles") or len(cycles_in)),
                             "n_channels_total": int(rep.get("n_channels_total") or 0),
                             "cycle_global_shifts": dict(rep.get("cycle_global_shifts") or {}),
+                            "tissue": (s.tissue or None),
+                            "species": (s.species or None),
                             "inputs": [
-                                {"path": str(c.path), "cycle": int(c.cycle)}
+                                {
+                                    "path": str(c.path),
+                                    "cycle": int(c.cycle),
+                                    "registration_marker": str(c.registration_marker or ""),
+                                    "channel_markers": list(c.channel_markers or []),
+                                    "channel_antibodies": list(c.channel_antibodies or []),
+                                }
                                 for c in cycles_in
                             ],
                         }

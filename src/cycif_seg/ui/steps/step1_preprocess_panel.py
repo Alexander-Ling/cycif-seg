@@ -19,8 +19,12 @@ class Step1PreprocessPanel(QtWidgets.QWidget):
 
         self.btn_merge_cycles = QtWidgets.QPushButton("Single slide: Merge/Register cycles…")
         self.btn_batch_merge = QtWidgets.QPushButton("Batch slides…")
+        self.btn_cancel_merge = QtWidgets.QPushButton("Cancel")
+        self.btn_cancel_merge.setToolTip("Cancel the running single-slide merge/registration.")
+        self.btn_cancel_merge.setVisible(False)
 
         file_row.addWidget(self.btn_merge_cycles)
+        file_row.addWidget(self.btn_cancel_merge)
         file_row.addWidget(self.btn_batch_merge)
         file_row.addStretch(1)
         layout.addLayout(file_row)

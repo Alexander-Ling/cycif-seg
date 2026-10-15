@@ -154,6 +154,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         # This keeps the rest of the codebase unchanged while we incrementally refactor.
         self.btn_merge_cycles = self.step1_panel.btn_merge_cycles
         self.btn_batch_merge = self.step1_panel.btn_batch_merge
+        self.btn_cancel_merge = self.step1_panel.btn_cancel_merge
+        self._step1_cancel_requested = False
         self.tabs.addTab(self.step1_panel, "Step 1: Preprocess")
 
         # -----------------------------
@@ -271,6 +273,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         self.btn_batch_stitch.clicked.connect(self.on_batch_stitch_cycles)
         self.btn_merge_cycles.clicked.connect(self.on_merge_cycles)
         self.btn_batch_merge.clicked.connect(self.on_batch_merge_cycles)
+        self.btn_cancel_merge.clicked.connect(self.on_cancel_merge_cycles)
         self.tabs.currentChanged.connect(lambda _idx: self._mark_project_dirty())
         self.btn_all.clicked.connect(lambda: self.image_ctrl.set_all_channels(True))
         self.btn_none.clicked.connect(lambda: self.image_ctrl.set_all_channels(False))
@@ -424,10 +427,8 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         except Exception:
             self.prog.setRange(0, 0)
             self.prog.setValue(0)
-        try:
-            self.btn_merge_cycles.setEnabled(False)
-        except Exception:
-            pass
+        self._step1_cancel_requested = False
+        self._set_step1_running(True)
 
         @thread_worker
         def _merge_worker():
@@ -480,7 +481,9 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                 pyramidal_output=bool(cfg.get("pyramidal_output") or False),
                 progress_cb=_progress,
                 progress_event_cb=_progress_event,
-                low_mem=True,
+                cancel_cb=lambda: bool(self._step1_cancel_requested),
+                low_mem=bool(cfg.get("low_mem") if cfg.get("low_mem") is not None else True),
+                strip_height=(int(cfg["strip_height"]) if cfg.get("strip_height") else None),
             )
 
         worker = _merge_worker()
@@ -524,23 +527,32 @@ class CycIFMVPWidget(QtWidgets.QWidget):
 
             self.prog.setRange(0, 1)
             self.prog.setValue(1)
-            try:
-                self.btn_merge_cycles.setEnabled(True)
-            except Exception:
-                pass
+            self._set_step1_running(False)
 
         @worker.errored.connect
         def _err(e):
-            show_warning(f"Merge cycles failed: {e}")
-            self.set_status(f"Merge cycles failed: {e}")
+            if self._step1_cancel_requested:
+                self.set_status("Merge cycles cancelled.")
+            else:
+                show_warning(f"Merge cycles failed: {e}")
+                self.set_status(f"Merge cycles failed: {e}")
             self.prog.setRange(0, 1)
             self.prog.setValue(0)
-            try:
-                self.btn_merge_cycles.setEnabled(True)
-            except Exception:
-                pass
+            self._set_step1_running(False)
 
         worker.start()
+
+    def on_cancel_merge_cycles(self):
+        """Request cancellation of the running single-slide merge (takes effect at the next checkpoint)."""
+        self._step1_cancel_requested = True
+        self.btn_cancel_merge.setEnabled(False)
+        self.set_status("Cancelling merge/registration…")
+
+    def _set_step1_running(self, running: bool) -> None:
+        self.btn_merge_cycles.setEnabled(not running)
+        self.btn_batch_merge.setEnabled(not running)
+        self.btn_cancel_merge.setVisible(running)
+        self.btn_cancel_merge.setEnabled(running)
 
     def on_batch_stitch_cycles(self):
         """Step 0 batch mode: stitch tiled cycle folders for many samples."""
@@ -576,13 +588,21 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                     cycle_inputs = []
                     for ci in rep.get("inputs") or []:
                         p = Path(str(ci.get("path") or ""))
-                        cycle_inputs.append({"path": self.project.relpath(p), "cycle": int(ci.get("cycle") or 0)})
+                        cycle_inputs.append(
+                            {
+                                "path": self.project.relpath(p),
+                                "cycle": int(ci.get("cycle") or 0),
+                                "registration_marker": str(ci.get("registration_marker") or ""),
+                                "channel_markers": list(ci.get("channel_markers") or []),
+                                "channel_antibodies": list(ci.get("channel_antibodies") or []),
+                            }
+                        )
                     self.project.add_step1_slide(
                         sample_name=sample_name or out_p.stem,
                         out_path=out_p,
                         cycle_inputs=cycle_inputs,
-                        tissue=None,
-                        species=None,
+                        tissue=(str(rep.get("tissue") or "").strip() or None),
+                        species=(str(rep.get("species") or "").strip() or None),
                         canvas_yx=tuple(rep.get("canvas_yx") or ()),
                     )
                 except Exception:
