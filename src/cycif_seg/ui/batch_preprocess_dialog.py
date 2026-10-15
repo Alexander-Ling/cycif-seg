@@ -246,7 +246,19 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         try:
             has_root = bool(self.txt_root.text().strip())
             has_out = bool(self.txt_outdir.text().strip())
-            self.btn_scan.setEnabled((not self._running) and has_root and has_out)
+            scanning = bool(getattr(self, "_scanning", False))
+            self.btn_scan.setEnabled((not self._running) and (not scanning) and has_root and has_out)
+            # Tooltips still show on a disabled button, so say why it is greyed out.
+            missing = [name for name, ok in (("an input folder", has_root), ("an output folder", has_out)) if not ok]
+            if self._running:
+                tip = "Unavailable while the batch is running."
+            elif scanning:
+                tip = "Scanning…"
+            elif missing:
+                tip = "Select " + " and ".join(missing) + " before scanning."
+            else:
+                tip = "Find samples in the input folder and fill in each sample's cycle configuration."
+            self.btn_scan.setToolTip(tip)
         except Exception:
             pass
 
@@ -325,7 +337,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         prog.setMinimumDuration(0)
         cancel_flag = {"cancel": False}
         prog.canceled.connect(lambda: cancel_flag.__setitem__("cancel", True))
-        self.btn_scan.setEnabled(False)
+        self._scanning = True
+        self._update_scan_button_enabled()
 
         def _read_names(path: Path) -> list[str]:
             key = str(path)
@@ -354,7 +367,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
         def _done(result):
             prog.close()
-            self.btn_scan.setEnabled(True)
+            self._scanning = False
+            self._update_scan_button_enabled()
             scan, no_lists = result
             samples = scan.samples
             n_cycles = sum(sum(1 for x in (s.cycles_enabled or []) if x) for s in samples)
@@ -387,7 +401,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
         def _err(e):
             prog.close()
-            self.btn_scan.setEnabled(True)
+            self._scanning = False
+            self._update_scan_button_enabled()
             if "Cancelled" in str(e):
                 self._set_status("Scan cancelled.")
             else:
