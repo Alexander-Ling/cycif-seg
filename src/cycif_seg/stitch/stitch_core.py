@@ -26,11 +26,12 @@ from cycif_seg.io.ome_tiff import (
     load_physical_pixel_sizes,
     load_single_channel_tiff_native,
 )
+from cycif_seg.preprocess.naming import STITCH_OUTPUT_SUFFIX
 
 _DEFAULT_TILE_RE = re.compile(r"^(?:area|raw).*_(\d+)_(\d+)\.ome\.tiff?$", re.IGNORECASE)
 _DEFAULT_X_GROUP = 1
 _DEFAULT_Y_GROUP = 2
-DEFAULT_STITCH_OUTPUT_SUFFIX = 'cyseg-stitched'
+DEFAULT_STITCH_OUTPUT_SUFFIX = STITCH_OUTPUT_SUFFIX
 
 
 @dataclass(frozen=True)

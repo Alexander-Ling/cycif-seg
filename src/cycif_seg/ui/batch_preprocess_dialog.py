@@ -15,12 +15,14 @@ from cycif_seg.preprocess.organize_cycles import is_preprocess_debug, is_debug_e
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
 from cycif_seg.preprocess.batch_plan import (
     BatchSample,
+    autofill_cycle_config,
     cycle_inputs_from_sample,
     default_tiled_rigid_tile_size,
     default_tiled_rigid_search_factor,
     default_fast_large_island_refinement,
     default_fast_large_island_sample_count,
-    scan_root_for_samples,
+    sample_cycle_number,
+    scan_input_folder,
     validate_sample_cycle_numbers,
     sample_has_cycle_config,
     plan_to_dict,
@@ -28,7 +30,8 @@ from cycif_seg.preprocess.batch_plan import (
 )
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 from cycif_seg.ui.last_dir import last_dir, remember_dir
-from cycif_seg.ui.help_button import BATCH_PREPROCESS_HELP, make_help_button
+from cycif_seg.ui.help_button import BATCH_PREPROCESS_HELP, LEGACY_NAMES_HELP_HTML, make_help_button
+from cycif_seg.ui.merge_cycles_dialog import _legacy_names_session
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -71,6 +74,18 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         row.addWidget(self.btn_pick_out, 1, 2)
         row.addWidget(self.btn_scan, 0, 3, 2, 1)
         row.addWidget(make_help_button(self, "Batch preprocess", BATCH_PREPROCESS_HELP), 0, 4)
+        legacy_row = QtWidgets.QHBoxLayout()
+        self.chk_legacy_names = QtWidgets.QCheckBox("Legacy names")
+        self.chk_legacy_names.setToolTip(
+            "Applies when scanning: for folder names without a [..] marker list, assume channel 1 is DAPI and\n"
+            "read the other names from the last underscore-separated words of the cycle folder name. Click ? for details."
+        )
+        self.chk_legacy_names.setChecked(_legacy_names_session["on"])
+        self.chk_legacy_names.toggled.connect(lambda on: _legacy_names_session.update(on=bool(on)))
+        legacy_row.addWidget(self.chk_legacy_names)
+        legacy_row.addWidget(make_help_button(self, "Legacy names", LEGACY_NAMES_HELP_HTML))
+        legacy_row.addStretch(1)
+        row.addLayout(legacy_row, 1, 4)
         row.setColumnStretch(1, 1)
         root.addLayout(row)
 
@@ -294,23 +309,95 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         if not root_dir.is_dir():
             show_warning("Please select a valid batch input folder.")
             return
-        if not out_dir:
+        if not self.txt_outdir.text().strip():
             show_warning("Please select a batch output folder.")
             return
         out_dir.mkdir(parents=True, exist_ok=True)
+        tissue = self.txt_default_tissue.text().strip()
+        species = self.txt_default_species.text().strip()
+        legacy = self.chk_legacy_names.isChecked()
 
-        samples = scan_root_for_samples(
-            root_dir, out_dir,
-            tissue=self.txt_default_tissue.text().strip(),
-            species=self.txt_default_species.text().strip(),
-        )
-        n_cycle_files = sum(len(s.files) for s in samples)
-        self._samples = samples
-        self._refresh_table()
-        self._set_status(
-            f"Found {len(samples)} sample(s) with {n_cycle_files} stitched cycle file(s) "
-            f"under sample/cycle directories."
-        )
+        # Scanning reads every cycle image's channel names (OME-XML only), which can take a
+        # while on network drives, so run it in a worker with a progress dialog.
+        prog = QtWidgets.QProgressDialog("Scanning folders…", "Cancel", 0, 0, self)
+        prog.setWindowTitle("Scanning samples…")
+        prog.setWindowModality(QtCore.Qt.ApplicationModal)
+        prog.setMinimumDuration(0)
+        cancel_flag = {"cancel": False}
+        prog.canceled.connect(lambda: cancel_flag.__setitem__("cancel", True))
+        self.btn_scan.setEnabled(False)
+
+        def _read_names(path: Path) -> list[str]:
+            key = str(path)
+            if key not in self._channel_name_cache:
+                # Fast OME-XML-only path; see _configure_selected.
+                self._channel_name_cache[key] = list(load_channel_names_only_fast(key) or [])
+            return list(self._channel_name_cache[key])
+
+        @thread_worker
+        def _scan_worker():
+            scan = scan_input_folder(root_dir, out_dir, tissue=tissue, species=species)
+            n_files = max(1, sum(len(x.files) for x in scan.samples))
+            done = 0
+            no_lists = []
+            for x in scan.samples:
+                if cancel_flag["cancel"]:
+                    raise RuntimeError("Cancelled")
+                self.sig_set_status.emit(f"Reading channel names for {x.name}…")
+                res = autofill_cycle_config(x, _read_names, legacy_names=legacy)
+                x.scan_notes.extend(res.notes)
+                if not res.used_marker_list:
+                    no_lists.append(x.name)
+                done += len(x.files)
+                self.sig_set_cycle_progress.emit(int(done), int(n_files))
+            return scan, no_lists
+
+        def _done(result):
+            prog.close()
+            self.btn_scan.setEnabled(True)
+            scan, no_lists = result
+            samples = scan.samples
+            n_cycles = sum(sum(1 for x in (s.cycles_enabled or []) if x) for s in samples)
+            self._samples = samples
+            self._refresh_table()
+            what = "single sample" if scan.mode == "sample" else f"{len(samples)} sample(s)"
+            self._set_status(
+                f"Found {what} with {n_cycles} cycle image(s). Cycle configuration was filled in automatically. "
+                f"Review it with Configure cycles."
+            )
+            details = list(scan.notes)
+            details += [f"{s.name}: {note}" for s in samples for note in s.scan_notes]
+            if no_lists and samples:
+                details.append(
+                    f"{len(no_lists)} sample(s) have no [..] marker lists in their names, so channel names were taken "
+                    f"from the image metadata: {', '.join(no_lists)}."
+                    + ("" if legacy else " For older underscore-style names, tick Legacy names and scan again.")
+                )
+            if details or not samples:
+                header = (
+                    "No samples were found." if not samples
+                    else f"Found {what} and filled in each sample's cycle configuration. "
+                         f"Please review these notes (also shown as a tooltip on each sample name):"
+                )
+                QtWidgets.QMessageBox.information(
+                    self, "Scan results",
+                    header + ("\n\n• " + "\n• ".join(details) if details else "")
+                    + "\n\nClick ? next to Scan samples for the expected folder layout.",
+                )
+
+        def _err(e):
+            prog.close()
+            self.btn_scan.setEnabled(True)
+            if "Cancelled" in str(e):
+                self._set_status("Scan cancelled.")
+            else:
+                show_warning(f"Scan failed: {e}")
+                self._set_status(f"Scan failed: {e}")
+
+        w = _scan_worker()
+        w.returned.connect(_done)
+        w.errored.connect(_err)
+        w.start()
 
     def _refresh_table(self) -> None:
         self._refreshing_table = True
@@ -341,9 +428,15 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
 
                 it_name = QtWidgets.QTableWidgetItem(s.name)
                 it_name.setFlags(it_name.flags() & ~QtCore.Qt.ItemIsEditable)
+                if s.scan_notes:
+                    it_name.setIcon(warn_icon)
+                    it_name.setToolTip("\n".join(s.scan_notes))
                 self.tbl.setItem(r, 2, it_name)
 
-                it_n = QtWidgets.QTableWidgetItem(str(len(s.files)))
+                n_enabled = sum(1 for x in (s.cycles_enabled or [True] * len(s.files)) if x)
+                it_n = QtWidgets.QTableWidgetItem(
+                    str(n_enabled) if n_enabled == len(s.files) else f"{n_enabled} (+{len(s.files) - n_enabled} disabled)"
+                )
                 it_n.setFlags(it_n.flags() & ~QtCore.Qt.ItemIsEditable)
                 self.tbl.setItem(r, 3, it_n)
 
@@ -547,7 +640,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 cycles_out.append(
                     {
                         "path": str(p),
-                        "cycle": int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
+                        "cycle": sample_cycle_number(s, i),  # None = unknown; shown blank
                         "enabled": bool(s.cycles_enabled[i] if s.cycles_enabled and i < len(s.cycles_enabled) else True),
                         "registration_marker": str(reg_markers[i] if i < len(reg_markers) else ""),
                         "channel_markers": list(channel_markers[i] if i < len(channel_markers) else []),
@@ -651,21 +744,34 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         # application (e.g. loading a saved plan for the same sample), allow
         # matching by basename first and then fall back to order.
         by_base = {} if preserve_paths else {Path(d.get("path") or "").name: d for d in cycles_cfg}
+        # Template copies match rows by cycle number (samples may list extra, disabled images,
+        # so positions differ); each sample keeps its own cycle numbers and enabled flags.
+        by_cycle: dict[int, dict] = {}
+        if preserve_paths:
+            for d in cycles_cfg:
+                if d.get("cycle") is not None and (int(d["cycle"]) not in by_cycle or d.get("enabled", True)):
+                    by_cycle[int(d["cycle"])] = d
 
-        cycles: list[int] = []
+        cycles: list[int | None] = []
         enableds: list[bool] = []
         reg: list[str] = []
         chm: list[list[str]] = []
         cha: list[list[str]] = []
         for i, p in enumerate(s.files):
-            d = by_base.get(p.name) if by_base else None
-            if d is None and i < len(cycles_cfg):
-                d = cycles_cfg[i]
-            if d is None:
-                continue
-            # Note: cycle 0 is valid; only default when missing/None.
-            cycles.append(int(d.get("cycle") if d.get("cycle") is not None else i))
-            enableds.append(bool(d.get("enabled", True)))
+            own_cy = sample_cycle_number(s, i) if s.cycles else None
+            if preserve_paths and by_cycle and own_cy is not None:
+                d = by_cycle.get(own_cy) or {}  # no template row for this cycle: keep defaults
+                cycles.append(own_cy)
+                enableds.append(bool(s.cycles_enabled[i]) if s.cycles_enabled and i < len(s.cycles_enabled) else True)
+            else:
+                d = by_base.get(p.name) if by_base else None
+                if d is None and i < len(cycles_cfg):
+                    d = cycles_cfg[i]
+                if d is None:
+                    continue
+                # Note: cycle 0 is valid; None means unknown (left blank for the user).
+                cycles.append(None if d.get("cycle") is None else int(d.get("cycle")))
+                enableds.append(bool(d.get("enabled", True)))
             reg.append(str(d.get("registration_marker") or "").strip())
             chm.append(list(d.get("channel_markers") or []))
             cha.append(list(d.get("channel_antibodies") or []))
@@ -676,7 +782,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
             s.channel_markers = chm
             s.channel_antibodies = cha
             s.cycles_enabled = enableds
-            ok, msg = validate_sample_cycle_numbers(s)
+            # Blank cycle numbers are flagged in the table (and block running), not rejected here.
+            ok, msg = validate_sample_cycle_numbers(s, allow_missing=True)
             if not ok:
                 raise ValueError(msg)
 

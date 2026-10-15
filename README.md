@@ -152,20 +152,21 @@ To uninstall, remove the shortcuts, then `py -3.13 -m pip uninstall cycif-seg` o
 
 ### Input folder structure and naming
 
-**Read [docs/FILE_NAMING.md](docs/FILE_NAMING.md) before running Step 0 or Step 1.** Samples, cycles, and channel names are all found from folder and file names, and badly named folders are silently skipped. In brief:
+**Read [docs/FILE_NAMING.md](docs/FILE_NAMING.md) before running Step 0 or Step 1.** Samples, cycles, and channel names are found from folder and file names. The recommended layout:
 
 ```text
-MyExperiment/                               <- batch input folder
-  Patient01/                                <- one folder per sample (any name)
-    C0_Patient01_CD3_CD8_PDL1/              <- one folder per cycle: C<number>_..._<markers>
-      area_001_0_0.ome.tiff ...             <- raw tiles (Step 0 input)
-      C0_Patient01_CD3_CD8_PDL1_cyseg-stitched.ome.tiff   <- Step 0 output / Step 1 input
+MyExperiment/                                  <- batch input folder
+  Patient01/                                   <- one folder per sample (any name)
+    C0_Patient01_[DAPI,CD3,CD8,PDL1]/          <- one folder per cycle: C<number>_..._[markers]
+      area_001_0_0.ome.tiff ...                <- raw tiles (Step 0 input)
+      C0_..._cyseg-stitched.ome.tiff           <- Step 0 output / Step 1 input
 ```
 
-- The lowest cycle number is the reference cycle every other cycle is aligned to.
-- Channel names come from the image metadata, or from the cycle folder name: channel 1 is `DAPI`, and the rest are the last N−1 underscore-separated words. Marker names must not contain underscores.
-- The same cycle number in two different cycle folders (a re-imaged cycle) is kept and labelled `1a`, `1b`. Two stitched files in one cycle folder is an error.
-- The app and `cycif-seg-preprocess` take each cycle's number from the stitched **file** name. `cycif-seg-run` takes it from the cycle **folder** name. Step 0 output satisfies both.
+- **Cycle numbers** come from the image file name, else its folder name: `C<number>_...` at the start, or `cycle<number>` anywhere. The lowest number is the reference cycle every other cycle is aligned to.
+- **Marker names** go in square brackets, separated by commas. With N image channels: N markers name every channel; N−1 markers means channel 1 is assumed to be DAPI (and you're told); any other count assigns no names, with a warning.
+- **Older datasets** with underscore-separated markers and no brackets (`C1_Patient01_CD3_CD8_PDL1`): turn on **Legacy names** (GUI checkbox next to Scan samples and in Configure cycles) or `--legacy-names` (`cycif-seg-run`, `cycif-seg-preprocess plan`). This assumes channel 1 is DAPI and reads the rest from the last N−1 words of the cycle folder name. See the guide for the caveats.
+- **Images stitched by other software** work too, as do cycle images placed directly in the sample folder, and selecting a single sample folder instead of the experiment folder. Scanning fills in every sample's cycle configuration automatically (marker names, DAPI registration channel), and lists anything skipped or guessed.
+- **A re-imaged cycle** (the same cycle number in two folders) is kept and labelled `1a`, `1b`.
 
 ### CLI Commands
 
@@ -185,7 +186,7 @@ cycif-seg-run --help
 
 ### Batch preprocessing
 
-When registering existing stitched files, the default filename pattern is `*_cyseg-stitched.ome.tiff`. Use `--stitched-pattern` to provide one or more sample-wide alternatives in preference order:
+When registering existing stitched files, `cycif-seg-run` uses `*_cyseg-stitched.ome.tiff` if every cycle folder has one. Otherwise it picks one image per cycle folder the same way the app does (cycif-seg output, then a `C<number>_` file, then another OME-TIFF), and prints a note when a folder held more than one. Use `--stitched-pattern` to choose explicitly with one or more sample-wide patterns in preference order:
 
 ```powershell
 cycif-seg-run SAMPLE_DIR --skip-stitch `
@@ -267,7 +268,7 @@ This command uses a sidecar file named `<output>.cyseg-registration-progress.jso
 
 ### Single-sample pipeline
 
-Use `cycif-seg-run` when a sample directory contains cycle subdirectories named `C<N>_...`:
+Use `cycif-seg-run` when a sample directory contains one sub-folder per cycle, named with a cycle number (`C<N>...` or `cycle<N>`, as in the app):
 
 ```powershell
 cycif-seg-run SAMPLE_DIR --registration-marker DAPI --strip-height 1000
@@ -280,4 +281,5 @@ Useful options include:
 - Output: `--output-dir PATH`, `--output-name NAME`.
 - Stitching: `--stitch-channel INT`, `--n-workers INT`, `--tile-regex REGEX`.
 - Registration: `--registration-marker STR`, `--registration-algorithm tiled_rigid|translation`, `--strip-height INT`.
+- Naming: `--legacy-names` (read older `C1_Patient01_CD3_CD8_PDL1`-style folder names; channel 1 assumed DAPI).
 - Modes: `--stitch-only`, `--skip-stitch`, `--force-stitch`, `--force-register`, `--no-pyramidal`, `--dry-run`.

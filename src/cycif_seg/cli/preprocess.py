@@ -23,17 +23,19 @@ from pathlib import Path
 
 from cycif_seg.preprocess.batch_plan import (
     BatchSample,
+    autofill_cycle_config,
     cycle_inputs_from_sample,
     default_tiled_rigid_tile_size,
     default_tiled_rigid_search_factor,
-    enabled_cycle_numbers,
-    find_stitched_cycle_files_in_sample_dir,
+    enabled_cycle_entries,
+    scan_input_folder,
+    scan_sample_dir,
     plan_from_dict,
     plan_to_dict,
     sample_has_cycle_config,
-    scan_root_for_samples,
     validate_samples_ready,
 )
+from cycif_seg.preprocess.naming import LEGACY_NAMES_HELP
 from cycif_seg.preprocess.organize_cycles import (
     CycleInput,
     inspect_registration_flat_resume_state,
@@ -96,13 +98,19 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         return 1
 
     print(f"Scanning {root_dir} for samples...")
-    samples = scan_root_for_samples(root_dir, output_dir, tissue=args.tissue, species=args.species)
+    scan = scan_input_folder(root_dir, output_dir, tissue=args.tissue, species=args.species)
+    samples = scan.samples
+    for note in scan.notes:
+        print(f"  ! {note}")
+    for s in samples:
+        for note in s.scan_notes:
+            print(f"  ! {s.name}: {note}")
 
     if not samples:
         print(
             "No samples found.\n"
-            "Expected layout: {root}/{sample_dir}/{cycle_dir}/C#_*.ome.tiff\n"
-            "Cycle files must be named with a C<number>_ prefix (e.g. C1_sample.ome.tiff).",
+            "Expected layout: {root}/{sample}/{cycle folder C<number>_...}/<image>.ome.tiff\n"
+            "See docs/FILE_NAMING.md for the supported layouts.",
             file=sys.stderr,
         )
         return 1
@@ -113,28 +121,13 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     warnings: list[str] = []
     for si, s in enumerate(samples, 1):
         print(f"  [{si}/{len(samples)}] {s.name}: reading channel names from {len(s.files)} cycle file(s)...")
-        registration_markers: list[str] = []
-        channel_markers: list[list[str]] = []
-        channel_antibodies: list[list[str]] = []
-
-        for p in s.files:
-            try:
-                ch_names = list(load_channel_names_only_fast(str(p)) or [])
-            except Exception as e:
-                ch_names = []
-                warnings.append(f"{s.name}/{p.name}: could not read channel names ({e})")
-
-            reg = next(
-                (nm for nm in ch_names if nm.strip().upper() == reg_marker.upper()),
-                ch_names[0] if ch_names else reg_marker,
-            )
-            registration_markers.append(reg)
-            channel_markers.append(ch_names)
-            channel_antibodies.append([""] * len(ch_names))
-
-        s.registration_markers = registration_markers
-        s.channel_markers = channel_markers
-        s.channel_antibodies = channel_antibodies
+        res = autofill_cycle_config(
+            s,
+            lambda path: list(load_channel_names_only_fast(str(path)) or []),
+            registration_marker=reg_marker,
+            legacy_names=bool(getattr(args, "legacy_names", False)),
+        )
+        warnings.extend(f"{s.name}: {n}" for n in res.notes)
         s.tiled_rigid_tile_size = max(128, int(args.tile_size))
         s.tiled_rigid_search_factor = max(1.0, float(args.search_factor))
         s.pyramidal_output = pyramidal
@@ -206,7 +199,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(f"Dry run: plan is valid. {n_samp} sample(s) would be processed:")
         for s in enabled:
-            n_cy = len(enabled_cycle_numbers(s))
+            n_cy = len(enabled_cycle_entries(s))
             print(f"  {s.name}: {n_cy} cycle(s) -> {s.output_path}")
         return 0
 
@@ -471,11 +464,14 @@ def _sample_from_sample_dir(args: argparse.Namespace) -> BatchSample:
     sample_dir = Path(args.sample_dir).expanduser().resolve()
     if not sample_dir.is_dir():
         raise FileNotFoundError(f"sample directory does not exist: {sample_dir}")
-    stitched = find_stitched_cycle_files_in_sample_dir(sample_dir)
-    if not stitched:
-        raise ValueError(f"No stitched cycle OME-TIFFs found in sample directory: {sample_dir}")
-    files = [p for p, _cy in stitched]
-    cycles = [int(cy) for _p, cy in stitched]
+    entries, notes = scan_sample_dir(sample_dir)
+    for note in notes:
+        print(f"  ! {note}")
+    entries = [e for e in entries if e.enabled]
+    if not entries:
+        raise ValueError(f"No cycle images with a cycle number found in sample directory: {sample_dir}")
+    files = [e.path for e in entries]
+    cycles = [int(e.cycle) for e in entries]
     reg_marker = str(args.registration_marker or "DAPI").strip() or "DAPI"
     channel_markers: list[list[str]] = []
     registration_markers: list[str] = []
@@ -689,6 +685,8 @@ def main() -> None:
                         help="Default tissue label (applied to all samples)")
     p_plan.add_argument("--species", default="", metavar="TEXT",
                         help="Default species label")
+    p_plan.add_argument("--legacy-names", "--legacy_names", dest="legacy_names", action="store_true",
+                        help=LEGACY_NAMES_HELP.replace("%", "%%"))
     p_plan.add_argument("--registration-marker", default="DAPI", metavar="NAME",
                         help="Default registration channel name (default: DAPI)")
     p_plan.add_argument("--tile-size", type=int, default=default_tiled_rigid_tile_size,

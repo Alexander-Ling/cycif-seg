@@ -7,13 +7,14 @@ Usage:
 Discovers cycle subdirectories (named C<N>_...) inside SAMPLE_DIR, stitches
 tiles in each, then co-registers the stitched cycles into one merged OME-TIFF.
 
-Channel names are parsed from the folder name: the last (n_channels - 1) tokens
-(split on '_') are the non-DAPI channel markers; DAPI is always prepended as
-channel 0.
+Channel names come from a bracketed, comma-separated marker list in the stitched
+file name or the cycle folder name (see cycif_seg.preprocess.naming):
 
-Example:
-    Folder: C1_BTC_MSK1_2_HSV1g_PDL1_CD8  (4-channel tiles)
-    Channels: DAPI, HSV1g, PDL1, CD8
+    C1_Patient01_[DAPI,CD3,CD8,PDL1]   4 markers, 4 channels -> used as-is
+    C1_Patient01_[CD3,CD8,PDL1]        3 markers, 4 channels -> channel 1 assumed DAPI
+    any other count                    -> no names assigned, with a warning
+
+Folders without a marker list fall back to DAPI + the last N-1 underscore words, with a warning.
 """
 from __future__ import annotations
 
@@ -27,12 +28,13 @@ import time
 import traceback
 from pathlib import Path
 
-from cycif_seg.preprocess.batch_plan import letter_suffix as _letter_suffix
+from cycif_seg.preprocess.batch_plan import choose_cycle_image, letter_suffix as _letter_suffix
+from cycif_seg.preprocess.naming import LEGACY_NAMES_HELP, STITCH_OUTPUT_SUFFIX, cycle_number_from_name, detect_markers
 
 
-_CYCLE_DIR_RE = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
-_STITCH_SUFFIX = "cyseg-stitched"
+_STITCH_SUFFIX = STITCH_OUTPUT_SUFFIX
 _DEFAULT_STITCHED_PATTERNS = (f"*_{_STITCH_SUFFIX}.ome.tiff",)
+_AUTO_STITCHED_PATTERN = "automatic (cycif-seg stitched file, else a C<number>_ file, else another OME-TIFF)"
 _MERGE_SUFFIX = "cyseg-merged"
 
 
@@ -88,22 +90,19 @@ def _get_tile_channel_count(tile_path: Path) -> int:
         return 1
 
 
-def _parse_channel_markers(name_suffix: str, n_channels: int) -> tuple[list[str], bool]:
-    """Return (channel_markers, had_warning).
+def _markers_for_cycle(
+    file_name: str | None, folder_name: str, n_channels: int, *, legacy_names: bool = False
+) -> list[str] | None:
+    """Marker names from the [..] list in the file or folder name; prints what was assumed.
 
-    Takes the last n_channels-1 underscore-split tokens from name_suffix and
-    prepends "DAPI".  Returns had_warning=True if the suffix had too few tokens.
+    Returns None when no names could be assigned (the merged file then uses the image's own channel names).
     """
-    if n_channels <= 1:
-        return ["DAPI"], False
-    tokens = name_suffix.split("_")
-    needed = n_channels - 1
-    had_warning = len(tokens) < needed
-    markers = tokens[-needed:] if len(tokens) >= needed else tokens
-    # pad with empty strings if too few
-    while len(markers) < needed:
-        markers.append("")
-    return ["DAPI"] + markers, had_warning
+    res = detect_markers(file_name, folder_name, n_channels, legacy_names=legacy_names)
+    if res.message:
+        tag = "WARNING" if res.is_warning else ("NOTE" if res.dapi_assumed else "")
+        if tag:
+            print(f"  [{tag}] {res.message}", file=sys.stderr)
+    return res.markers
 
 
 def _normalize_stitched_patterns(stitched_patterns: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -149,6 +148,28 @@ def _select_sample_stitched_files(
             return pattern, selected
         coverage.append((pattern, missing))
 
+    if not stitched_patterns:
+        # No patterns given: pick per folder the same way the GUI scanner does
+        # (cycif-seg stitched output, then a C<number>_... file, then the only other image).
+        selected = {}
+        missing = []
+        for folder in cycle_folders:
+            best, others = choose_cycle_image(folder)
+            if best is None:
+                missing.append(folder.name)
+                continue
+            selected[folder] = best
+            if others:
+                print(
+                    f"  [NOTE] '{folder.name}': using {best.name} "
+                    f"(also found: {', '.join(p.name for p in others)}). "
+                    f"Use --stitched-pattern to choose explicitly.",
+                    file=sys.stderr,
+                )
+        if not missing:
+            return _AUTO_STITCHED_PATTERN, selected
+        coverage.append((_AUTO_STITCHED_PATTERN, missing))
+
     details = "; ".join(
         f"{pattern!r} missing in: {', '.join(missing)}"
         for pattern, missing in coverage
@@ -164,6 +185,7 @@ def discover_cycles(
     tile_regex: str | None = None,
     stitched_patterns: list[str] | tuple[str, ...] | None = None,
     require_stitched: bool = False,
+    legacy_names: bool = False,
 ) -> tuple[list[dict], list[str]]:
     """Scan sample_dir for cycle subdirectories.
 
@@ -182,18 +204,18 @@ def discover_cycles(
     raw: list[tuple[int, str, Path]] = []  # (cycle_num, name_suffix, folder)
     skipped: list[str] = []
     for entry in sorted(sample_dir.iterdir()):
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name.lower().startswith((".", "cycif_pyramid_work")):
             continue
-        m = _CYCLE_DIR_RE.match(entry.name)
-        if not m:
+        cycle_num = cycle_number_from_name(entry.name)  # same rule as the GUI scanner
+        if cycle_num is None:
             skipped.append(entry.name)
             continue
-        raw.append((int(m.group(1)), m.group(2), entry))
+        raw.append((cycle_num, entry.name, entry))
 
     if skipped:
         print(
             f"  [SKIP] {len(skipped)} subdirector{'y' if len(skipped)==1 else 'ies'} "
-            f"do not match the C<N>_... pattern and will be ignored: "
+            f"have no cycle number (C<N>... or cycle<N>) in their name and will be ignored: "
             + ", ".join(skipped),
             file=sys.stderr,
         )
@@ -247,14 +269,7 @@ def discover_cycles(
             if use_stitched:
                 expected_stitched = selected_stitched_files[folder]
                 n_channels = _get_tile_channel_count(expected_stitched)
-                channel_markers, had_warning = _parse_channel_markers(suffix, n_channels)
-                if had_warning:
-                    print(
-                        f"  [WARNING] '{folder.name}': folder name has fewer tokens than "
-                        f"expected for {n_channels} channels. Missing channel names filled "
-                        f"with empty strings.",
-                        file=sys.stderr,
-                    )
+                channel_markers = _markers_for_cycle(expected_stitched.name, folder.name, n_channels, legacy_names=legacy_names)
                 cycle_infos.append({
                     "folder": folder,
                     "cycle_num": cycle_num,
@@ -273,15 +288,7 @@ def discover_cycles(
             # Get channel count from one tile
             sample_tile = next(iter(tiles.values()))
             n_channels = _get_tile_channel_count(sample_tile)
-            channel_markers, had_warning = _parse_channel_markers(suffix, n_channels)
-
-            if had_warning:
-                print(
-                    f"  [WARNING] '{folder.name}': folder name has fewer tokens than "
-                    f"expected for {n_channels} channels. Missing channel names filled "
-                    f"with empty strings.",
-                    file=sys.stderr,
-                )
+            channel_markers = _markers_for_cycle(None, folder.name, n_channels, legacy_names=legacy_names)
 
             cycle_infos.append({
                 "folder": folder,
@@ -573,9 +580,9 @@ def _build_parser() -> argparse.ArgumentParser:
         description=(
             "Stitch tile files in a CycIF sample directory, then co-register "
             "all cycles into a single merged OME-TIFF. Cycle subdirectories must "
-            "be named C<N>_<rest> (e.g. C1_BTC_MSK1_2_HSV1g_PDL1_CD8). The first "
-            "channel of each cycle is always DAPI; remaining channel names are taken "
-            "from the last tokens of the folder name."
+            "be named C<N>_<rest>. Channel names come from a marker list in square "
+            "brackets, e.g. C1_Patient01_[DAPI,CD3,CD8,PDL1]; with one marker fewer than "
+            "channels, channel 1 is assumed to be DAPI."
         ),
     )
     p.add_argument("sample_dir", help="Path to sample directory containing C<N>_... subdirectories")
@@ -593,6 +600,12 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Parallel workers for stitching, registration writes, pyramid build, and elastic touch-up (default: 1)")
     stitch_grp.add_argument("--tile-regex", default=None, metavar="REGEX",
                              help="Override default tile filename regex pattern")
+    p.add_argument(
+        "--legacy-names", "--legacy_names",
+        dest="legacy_names",
+        action="store_true",
+        help=LEGACY_NAMES_HELP.replace("%", "%%"),
+    )
     stitch_grp.add_argument(
         "--stitched-pattern",
         nargs="+",
@@ -718,6 +731,7 @@ def main(argv: list[str] | None = None) -> int:
         tile_regex=args.tile_regex,
         stitched_patterns=args.stitched_pattern,
         require_stitched=bool(args.skip_stitch),
+        legacy_names=bool(args.legacy_names),
     )
 
     if errors:
@@ -751,7 +765,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  Cycle {ci['label']:>4}  {ci['folder'].name}"
             f"  [{tile_info}, {ci['n_channels']} ch]"
-            f"  channels: {', '.join(ci['channel_markers'])}"
+            f"  channels: {', '.join(ci['channel_markers']) if ci['channel_markers'] else '(names from image metadata)'}"
         )
 
     if not args.stitch_only:

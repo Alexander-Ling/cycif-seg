@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,33 +7,17 @@ from qtpy import QtCore, QtWidgets
 
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
 from cycif_seg.preprocess.batch_plan import resolve_cycle_labels
+from cycif_seg.preprocess.naming import detect_markers
+from cycif_seg.ui.help_button import LEGACY_NAMES_HELP_HTML, make_help_button
 from cycif_seg.ui.last_dir import last_dir, remember_dir
 
-_CYCLE_DIR_RE_UI = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
-
-
-def _detect_channel_markers_from_path(path: str, n_channels: int) -> list[str] | None:
-    try:
-        m = _CYCLE_DIR_RE_UI.match(Path(path).parent.name)
-        if not m:
-            return None
-        suffix = m.group(2)
-        if n_channels <= 1:
-            return ["DAPI"]
-        tokens = suffix.split("_")
-        needed = n_channels - 1
-        markers = tokens[-needed:] if len(tokens) >= needed else list(tokens)
-        while len(markers) < needed:
-            markers.append("")
-        return ["DAPI"] + markers
-    except Exception:
-        return None
-
+# "Legacy names" checkbox state, remembered for the rest of the session.
+_legacy_names_session = {"on": False}
 
 @dataclass
 class CycleUIConfig:
     path: str
-    cycle: int
+    cycle: int | None  # None = unknown (shown blank; must be set if the cycle is used)
     channel_names: list[str]
     marker_names: list[str]
     antibody_names: list[str]
@@ -276,8 +259,19 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         self.btn_autodetect_help = QtWidgets.QToolButton()
         self.btn_autodetect_help.setText("?")
         self.btn_autodetect_help.setToolTip("How auto-detection works")
+        self.chk_legacy_names = QtWidgets.QCheckBox("Legacy names")
+        self.chk_legacy_names.setToolTip(
+            "For older folder names without a [..] marker list: assume channel 1 is DAPI and read the\n"
+            "other names from the last underscore-separated words of the cycle folder name. Click ? for details."
+        )
+        self.chk_legacy_names.setChecked(_legacy_names_session["on"])
+        self.chk_legacy_names.toggled.connect(lambda on: _legacy_names_session.update(on=bool(on)))
+        self.btn_legacy_help = make_help_button(self, "Legacy names", LEGACY_NAMES_HELP_HTML)
         _ch_btn_row.addWidget(self.btn_autodetect_channels)
         _ch_btn_row.addWidget(self.btn_autodetect_help)
+        _ch_btn_row.addSpacing(12)
+        _ch_btn_row.addWidget(self.chk_legacy_names)
+        _ch_btn_row.addWidget(self.btn_legacy_help)
         _ch_btn_row.addStretch()
         _ch_layout.addLayout(_ch_btn_row)
         _ch_layout.addWidget(self.tbl_channels, 1)
@@ -314,12 +308,20 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
 
     def _on_autodetect_channels(self) -> None:
         tbl = self.tbl_channels
-        any_matched = False
+        applied: list[str] = []
+        notes: list[str] = []
         for cycle_idx, cfg in enumerate(self._cycles):
-            detected = _detect_channel_markers_from_path(cfg.path, len(cfg.channel_names))
-            if detected is None:
+            p = Path(cfg.path)
+            res = detect_markers(
+                p.name, p.parent.name, len(cfg.channel_names), legacy_names=self.chk_legacy_names.isChecked()
+            )
+            cy_txt = f"Cycle {cfg.cycle if cfg.cycle is not None else '?'}"
+            if res.markers is None:
+                notes.append(f"{cy_txt}: {res.message}")  # message names the file/folder it read
                 continue
-            any_matched = True
+            applied.append(f"{cy_txt} ({p.name}): {', '.join(res.markers)}")
+            if res.is_warning or res.dapi_assumed:
+                notes.append(f"{cy_txt}: {res.message}")
             for r in range(tbl.rowCount()):
                 cy_item = tbl.item(r, 0)
                 if cy_item is None or int(cy_item.data(QtCore.Qt.UserRole)) != cycle_idx:
@@ -328,35 +330,35 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
                 if ch_idx_item is None:
                     continue
                 ch_idx = int(ch_idx_item.text())
-                if ch_idx < len(detected):
+                if ch_idx < len(res.markers):
                     marker_item = tbl.item(r, 4)
                     if marker_item is not None:
-                        marker_item.setText(detected[ch_idx])
+                        marker_item.setText(res.markers[ch_idx])
                     else:
-                        tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(detected[ch_idx]))
-        if not any_matched:
-            QtWidgets.QMessageBox.information(
-                self, "Auto-detect channel names",
-                "No cycle folders matched the expected naming convention.\n"
-                "Click ? for details on how to name your folders.",
-            )
+                        tbl.setItem(r, 4, QtWidgets.QTableWidgetItem(res.markers[ch_idx]))
+        parts = []
+        if applied:
+            parts.append("Marker names applied:\n" + "\n".join(f"• {x}" for x in applied))
+        if notes:
+            parts.append("Please check:\n" + "\n".join(f"• {x}" for x in notes))
+        parts.append("Click ? for how to name files and folders.")
+        box = QtWidgets.QMessageBox.warning if notes else QtWidgets.QMessageBox.information
+        box(self, "Auto-detect channel names", "\n\n".join(parts))
 
     def _on_autodetect_help(self) -> None:
         QtWidgets.QMessageBox.information(
             self,
             "Auto-detect channel names — how it works",
-            "Channel names are inferred from the cycle folder name.\n\n"
-            "Expected folder naming convention:\n"
-            "  C<N>_<token1>_<token2>_..._<markerA>_<markerB>_<markerC>\n\n"
-            "Rules:\n"
-            "• The folder must start with C followed by a number, then an underscore.\n"
-            "• Channel 0 is always named DAPI.\n"
-            "• The remaining channel names come from the last (N−1) underscore-separated\n"
-            "  tokens in the folder name, where N is the number of channels in the file.\n\n"
-            "Example:\n"
-            "  Folder:   C1_BTC_MSK1_2_HSV1g_PDL1_CD8   (4-channel file)\n"
-            "  Channels: DAPI, HSV1g, PDL1, CD8\n\n"
-            "If a folder does not match this pattern, its channel names are left unchanged.",
+            "Marker names are read from a list in square brackets, separated by commas, in the\n"
+            "image's file name or (if the file name has none) its cycle folder name:\n\n"
+            "  C1_Patient01_[DAPI,CD3,CD8,PDL1]\n\n"
+            "With N channels in the image:\n"
+            "• N markers listed: one name per channel, in order.\n"
+            "• N−1 markers listed: channel 1 is assumed to be DAPI (you'll be told).\n"
+            "• Any other number: no names are assigned, and you'll see a warning.\n\n"
+            "Marker names can contain hyphens (PD-L1) but not commas or brackets.\n\n"
+            "Older folder names without a [...] list (e.g. C1_Patient01_CD3_CD8_PDL1) are only read\n"
+            "when the Legacy names box is ticked. Click the ? next to it for what that does.",
         )
 
     def _on_browse_out(self):
@@ -397,12 +399,12 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
 
             # If we have a prior config for this file, prefer it.
             prior = init_by_path.get(p) or init_by_name.get(Path(p).name)
-            # Note: cycle 0 is valid. Only treat as missing if key is absent/None.
-            cycle_idx = (
-                int(prior.get("cycle"))
-                if isinstance(prior, dict) and (prior.get("cycle") is not None)
-                else i
-            )
+            # Note: cycle 0 is valid. A prior config with cycle None means "unknown" (shown blank);
+            # with no prior config, number cycles in the order given.
+            if isinstance(prior, dict) and "cycle" in prior:
+                cycle_idx = None if prior.get("cycle") is None else int(prior.get("cycle"))
+            else:
+                cycle_idx = i
 
             # default registration channel: use prior if available, else DAPI if present.
             reg_default = ""
@@ -479,7 +481,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             use_item.setToolTip("Uncheck to skip this cycle during merge/registration.")
             tbl.setItem(r, 0, use_item)
 
-            cy_item = QtWidgets.QTableWidgetItem(str(int(cfg.cycle)))
+            cy_item = QtWidgets.QTableWidgetItem("" if cfg.cycle is None else str(int(cfg.cycle)))
             cy_item.setToolTip("Cycle index used in output channel naming. Must be unique among enabled cycles.")
             tbl.setItem(r, 1, cy_item)
 
@@ -529,7 +531,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         row = 0
         for cycle_idx, cfg in enumerate(self._cycles):
             for ch_idx, nm in enumerate(cfg.channel_names):
-                cy_item = self._readonly_item(str(int(cfg.cycle)))
+                cy_item = self._readonly_item("" if cfg.cycle is None else str(int(cfg.cycle)))
                 cy_item.setData(QtCore.Qt.UserRole, int(cycle_idx))
                 tbl.setItem(row, 0, cy_item)
 
@@ -573,8 +575,16 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             cy_item = tbl.item(r, 1)
             reg_item = tbl.item(r, 3)
             enabled = (use_item.checkState() == QtCore.Qt.Checked) if use_item is not None else True
+            cy_text = (cy_item.text() if cy_item else "").strip()
+            if not cy_text:
+                if enabled:
+                    raise ValueError(
+                        f"No cycle number for {Path(cfg.path).name}. Enter one in the Cycle column, or untick Use."
+                    )
+                rows.append({"enabled": False, "cycle": None, "registration_marker": (reg_item.text() if reg_item else "").strip()})
+                continue
             try:
-                cy = int((cy_item.text() if cy_item else "").strip())
+                cy = int(cy_text)
             except Exception:
                 raise ValueError(f"Invalid cycle number for {Path(cfg.path).name}. Cycle numbers must be integers.")
             if cy < 0:
@@ -630,7 +640,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         )
         for idx, cfg in enumerate(self._cycles):
             rr = reg_rows[idx]
-            cy = int(rr["cycle"])
+            cy = rr["cycle"]  # None only for disabled rows left blank
             enabled = bool(rr["enabled"])
             reg_marker = str(rr["registration_marker"] or "").strip()
             if enabled:
@@ -647,7 +657,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             cycles_out.append(
                 {
                     "path": cfg.path,
-                    "cycle": int(cy),
+                    "cycle": cy,
                     "enabled": bool(enabled),
                     "registration_marker": reg_marker,
                     "channel_markers": list(markers),

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from cycif_seg.preprocess.naming import STITCH_OUTPUT_SUFFIX, cycle_number_from_name, detect_markers, strip_ome_tiff_ext
 
 PLAN_SCHEMA_VERSION = 1
 
@@ -11,58 +12,6 @@ default_tiled_rigid_tile_size: int = 2000
 default_tiled_rigid_search_factor: float = 3.0
 default_fast_large_island_refinement: bool = False
 default_fast_large_island_sample_count: int = 5
-
-
-def parse_cycle_number_from_filename(name: str) -> int | None:
-    """Parse cycle number from stitched file names like ``C3_sample_...ome.tiff``."""
-    try:
-        m = re.match(r"^c(\d+)_", str(name or "").strip(), flags=re.IGNORECASE)
-        if not m:
-            return None
-        return int(m.group(1))
-    except Exception:
-        return None
-
-
-def find_stitched_cycle_files_in_sample_dir(sample_dir: Path) -> list[tuple[Path, int]]:
-    """
-    Discover stitched cycle OME-TIFFs using the expected layout::
-
-        {input}/{sample_dir}/{cycle_dir}/C#_{stuff}.ome.tiff
-
-    Rules:
-    - only inspect immediate subdirectories of ``sample_dir`` as cycle dirs
-    - ignore any OME-TIFF directly under ``sample_dir``
-    - ignore tile files such as ``area_*.ome.tiff``
-    - infer cycle number from the stitched filename prefix ``C#_``
-    """
-    out: list[tuple[Path, int]] = []
-    try:
-        cycle_dirs = [p for p in sorted(sample_dir.iterdir()) if p.is_dir()]
-    except Exception:
-        return out
-
-    for cycle_dir in cycle_dirs:
-        try:
-            files = [p for p in sorted(cycle_dir.iterdir()) if p.is_file()]
-        except Exception:
-            continue
-        for p in files:
-            nm = p.name
-            low = nm.lower()
-            if ".ome." not in low:
-                continue
-            if not (low.endswith('.ome.tif') or low.endswith('.ome.tiff')):
-                continue
-            if low.startswith('area_'):
-                continue
-            cy = parse_cycle_number_from_filename(nm)
-            if cy is None:
-                continue
-            out.append((p, int(cy)))
-
-    out.sort(key=lambda t: (int(t[1]), str(t[0]).lower()))
-    return out
 
 
 @dataclass
@@ -76,7 +25,7 @@ class BatchSample:
     enabled: bool = True
 
     # Per-file config (same order as files)
-    cycles: list[int] | None = None
+    cycles: list[int | None] | None = None  # None = cycle number unknown; must be set before running
     registration_markers: list[str] | None = None
     channel_markers: list[list[str]] | None = None
     channel_antibodies: list[list[str]] | None = None
@@ -102,51 +51,217 @@ class BatchSample:
     elastic_touchup_rigid_max_shift: float = 512.0
     debug_elastic_touchup: bool = False
     debug_dir: str | None = None
+    # Messages from folder scanning, shown in the batch table (not saved in plans).
+    scan_notes: list[str] = field(default_factory=list)
 
 
-def scan_root_for_samples(
+# ---------------------------------------------------------------------------
+# Folder discovery
+# ---------------------------------------------------------------------------
+_TILE_PREFIXES = ("area", "raw")
+_SKIP_DIR_PREFIXES = (".", "cycif_pyramid_work")
+
+
+def _list_dir(d: Path) -> list[Path]:
+    try:
+        return sorted(d.iterdir(), key=lambda p: p.name.lower())
+    except Exception:
+        return []
+
+
+def _is_ome_tiff(p: Path) -> bool:
+    return p.name.lower().endswith((".ome.tif", ".ome.tiff")) and p.is_file()
+
+
+def _is_tile(p: Path) -> bool:
+    return p.name.lower().startswith(_TILE_PREFIXES)
+
+
+def _is_work_file(p: Path) -> bool:
+    low = p.name.lower()
+    return low.startswith(".") or "__pyramid_tmp__" in low or ".flat_tmp" in low
+
+
+def _subdirs(d: Path) -> list[Path]:
+    return [p for p in _list_dir(d) if p.is_dir() and not p.name.lower().startswith(_SKIP_DIR_PREFIXES)]
+
+
+def _images_and_tiles(folder: Path) -> tuple[list[Path], int]:
+    """Candidate cycle images (non-tile OME-TIFFs) in ``folder`` and the number of raw tiles."""
+    files = [p for p in _list_dir(folder) if _is_ome_tiff(p)]
+    tiles = [p for p in files if _is_tile(p)]
+    images = [p for p in files if not _is_tile(p) and not _is_work_file(p)]
+    return images, len(tiles)
+
+
+def _image_preference(p: Path) -> tuple[int, str]:
+    """Lower is preferred: cycif-seg stitched output, then files named C<number>_..., then anything else."""
+    stem = strip_ome_tiff_ext(p.name).lower()
+    if stem.endswith("_" + STITCH_OUTPUT_SUFFIX):
+        tier = 0
+    elif cycle_number_from_name(p.name) is not None:
+        tier = 1
+    else:
+        tier = 2
+    return tier, p.name.lower()
+
+
+def choose_cycle_image(folder: Path) -> tuple[Path | None, list[Path]]:
+    """The image to use for a cycle folder, plus the other candidates it was chosen over."""
+    ranked = sorted(_images_and_tiles(folder)[0], key=_image_preference)
+    return (ranked[0], ranked[1:]) if ranked else (None, [])
+
+
+@dataclass
+class CycleEntry:
+    path: Path
+    cycle: int | None
+    enabled: bool = True
+
+
+def scan_sample_dir(sample_dir: Path) -> tuple[list[CycleEntry], list[str]]:
+    """Find cycle images for one sample.
+
+    Accepts both layouts::
+
+        sample/C1_.../<image>.ome.tiff     (one sub-folder per cycle)
+        sample/C1_....ome.tiff             (cycle images directly in the sample folder)
+
+    In a cycle folder, one image is chosen (cycif-seg stitched output first, then a file named
+    ``C<number>_...``); any other images are listed but disabled. The cycle number comes from the
+    file name, else the folder name. Images with no cycle number are listed, disabled, with a blank
+    number for the user to fill in.
+    """
+    entries: list[CycleEntry] = []
+    notes: list[str] = []
+    tile_only: list[str] = []
+
+    for sub in _subdirs(sample_dir):
+        best, others = choose_cycle_image(sub)
+        if best is None:
+            if _images_and_tiles(sub)[1]:
+                tile_only.append(sub.name)
+            continue
+        folder_cy = cycle_number_from_name(sub.name)
+        ranked = [best] + others
+        for k, p in enumerate(ranked):
+            cy = cycle_number_from_name(p.name)
+            if cy is None:
+                cy = folder_cy
+            entries.append(CycleEntry(p, cy, enabled=(k == 0 and cy is not None)))
+        if len(ranked) > 1:
+            notes.append(
+                f"{sub.name}: {len(ranked)} images found; using {best.name}. "
+                f"The others are listed but disabled. Switch them in Configure cycles if needed."
+            )
+        if entries[-len(ranked)].cycle is None:
+            notes.append(
+                f"{sub.name}: no cycle number in the folder or file name ({best.name}). "
+                f"Left disabled. Set its cycle number in Configure cycles."
+            )
+
+    unnumbered_direct: list[str] = []
+    for p in _images_and_tiles(sample_dir)[0]:
+        cy = cycle_number_from_name(p.name)
+        entries.append(CycleEntry(p, cy, enabled=cy is not None))
+        if cy is None:
+            unnumbered_direct.append(p.name)
+    if unnumbered_direct and any(e.cycle is not None for e in entries):
+        notes.append(
+            f"{len(unnumbered_direct)} image(s) without a cycle number were left disabled: "
+            + ", ".join(unnumbered_direct)
+        )
+
+    if tile_only:
+        notes.append(
+            f"{len(tile_only)} cycle folder(s) contain raw tiles but no stitched image "
+            f"({', '.join(tile_only)}). Run Step 0 (stitching) first."
+        )
+
+    entries.sort(key=lambda e: (e.cycle is None, e.cycle if e.cycle is not None else 0, str(e.path).lower()))
+    return entries, notes
+
+
+def looks_like_sample_dir(d: Path) -> bool:
+    """True if ``d`` holds cycle folders or numbered cycle images itself (i.e. it is a sample, not an experiment)."""
+    for sub in _subdirs(d):
+        if cycle_number_from_name(sub.name) is not None:
+            images, n_tiles = _images_and_tiles(sub)
+            if images or n_tiles:
+                return True
+    return any(cycle_number_from_name(p.name) is not None for p in _images_and_tiles(d)[0])
+
+
+@dataclass
+class ScanResult:
+    samples: list[BatchSample]
+    notes: list[str]
+    mode: str  # "experiment" or "sample"
+
+
+def scan_input_folder(
     root_dir: Path,
     output_dir: Path,
     tissue: str = "",
     species: str = "",
-) -> list[BatchSample]:
-    """Scan ``root_dir`` for sample subdirectories, returning a list of BatchSample."""
+) -> ScanResult:
+    """Scan the folder the user selected: an experiment folder (one sub-folder per sample) or a single sample folder."""
+    root_dir = Path(root_dir)
+    notes: list[str] = []
+    if looks_like_sample_dir(root_dir):
+        mode = "sample"
+        candidates = [root_dir]
+        notes.append(
+            f"'{root_dir.name}' contains cycle folders or cycle images, so it was scanned as a single sample."
+        )
+    else:
+        mode = "experiment"
+        candidates = _subdirs(root_dir)
+
     samples: list[BatchSample] = []
-    try:
-        subdirs = sorted(root_dir.iterdir())
-    except Exception:
-        return samples
-    for sub in subdirs:
-        if not sub.is_dir():
+    empty: list[str] = []
+    for d in candidates:
+        entries, sample_notes = scan_sample_dir(d)
+        if not any(e.enabled for e in entries):
+            if sample_notes or entries:
+                reason = " ".join(sample_notes) or "no image has a cycle number"
+                notes.append(f"Skipped '{d.name}': {reason}")
+            else:
+                empty.append(d.name)
             continue
-        stitched = find_stitched_cycle_files_in_sample_dir(sub)
-        if not stitched:
-            continue
-        files = [p for (p, _cy) in stitched]
-        cycles = [int(cy) for (_p, cy) in stitched]
+        n_enabled = sum(1 for e in entries if e.enabled)
+        if n_enabled == 1:
+            sample_notes.append(
+                "Only one cycle was found. If you selected a cycle folder, select the sample or experiment folder instead."
+            )
         samples.append(
             BatchSample(
-                name=sub.name,
-                input_dir=sub,
-                files=files,
+                name=d.name,
+                input_dir=d,
+                files=[e.path for e in entries],
                 tissue=tissue,
                 species=species,
-                output_path=(output_dir / f"{sub.name}.ome.tiff"),
+                output_path=(Path(output_dir) / f"{d.name}.ome.tiff"),
                 enabled=True,
-                cycles=cycles,
+                cycles=[e.cycle for e in entries],
+                cycles_enabled=[bool(e.enabled) for e in entries],
                 registration_algorithm="tiled_rigid",
                 global_translation_only=False,
+                scan_notes=sample_notes,
             )
         )
-    return samples
+    if empty and mode == "experiment":
+        notes.append(f"Skipped {len(empty)} folder(s) with no cycle images: {', '.join(empty)}")
+    if not samples and mode == "experiment" and not candidates:
+        notes.append(f"'{root_dir.name}' has no sub-folders. Select the experiment folder (one sub-folder per sample).")
+    return ScanResult(samples=samples, notes=notes, mode=mode)
 
 
-def enabled_cycle_numbers(s: BatchSample) -> list[int]:
-    return [
-        int(s.cycles[i] if s.cycles and i < len(s.cycles) else i)
-        for i, _ in enumerate(s.files or [])
-        if bool(s.cycles_enabled[i] if s.cycles_enabled and i < len(s.cycles_enabled) else True)
-    ]
+def sample_cycle_number(s: BatchSample, i: int) -> int | None:
+    """Cycle number of file ``i`` (``None`` if unknown). Plans without a cycles list number files in order."""
+    if s.cycles and i < len(s.cycles):
+        return None if s.cycles[i] is None else int(s.cycles[i])
+    return i
 
 
 def letter_suffix(idx: int) -> str:
@@ -212,13 +327,21 @@ def enabled_cycle_entries(s: BatchSample) -> list[int]:
     ]
 
 
-def validate_sample_cycle_numbers(s: BatchSample) -> tuple[bool, str]:
+def _missing_cycle_numbers(s: BatchSample, idx: list[int]) -> list[str]:
+    return [Path(str(s.files[i])).name for i in idx if sample_cycle_number(s, i) is None]
+
+
+def validate_sample_cycle_numbers(s: BatchSample, *, allow_missing: bool = False) -> tuple[bool, str]:
     idx = enabled_cycle_entries(s)
-    try:
-        resolve_cycle_labels(
-            [int(s.cycles[i] if s.cycles and i < len(s.cycles) else i) for i in idx],
-            [s.files[i] for i in idx],
+    missing = _missing_cycle_numbers(s, idx)
+    if missing and not allow_missing:
+        return False, (
+            f"Sample '{s.name}': no cycle number for {', '.join(missing)}. "
+            f"Set it in Configure cycles, or disable that file."
         )
+    idx = [i for i in idx if sample_cycle_number(s, i) is not None]
+    try:
+        resolve_cycle_labels([sample_cycle_number(s, i) for i in idx], [s.files[i] for i in idx])
     except ValueError as e:
         return False, f"Sample '{s.name}': {e} Reconfigure this sample before running batch preprocessing."
     return True, ""
@@ -232,7 +355,10 @@ def cycle_inputs_from_sample(s: BatchSample) -> list:
         return values[i] if values and i < len(values) else None
 
     idx = enabled_cycle_entries(s)
-    numbers = [int(s.cycles[i] if s.cycles and i < len(s.cycles) else i) for i in idx]
+    missing = _missing_cycle_numbers(s, idx)
+    if missing:
+        raise ValueError(f"No cycle number for {', '.join(missing)}. Set it in Configure cycles, or disable that file.")
+    numbers = [int(sample_cycle_number(s, i)) for i in idx]
     ints, labels = resolve_cycle_labels(numbers, [s.files[i] for i in idx])
     return [
         CycleInput(
@@ -247,6 +373,86 @@ def cycle_inputs_from_sample(s: BatchSample) -> list:
         )
         for i, cy, label in zip(idx, ints, labels)
     ]
+
+
+def _find_name(names: list[str], target: str) -> int | None:
+    """Index of ``target`` in ``names``: exact (case-insensitive) match first, then substring."""
+    t = target.strip().lower()
+    for i, nm in enumerate(names):
+        if (nm or "").strip().lower() == t:
+            return i
+    for i, nm in enumerate(names):
+        if t and t in (nm or "").strip().lower():
+            return i
+    return None
+
+
+@dataclass
+class AutofillResult:
+    notes: list[str]  # things the user should check, per sample
+    used_marker_list: bool  # at least one cycle's names came from a [..] list (or legacy names)
+
+
+def autofill_cycle_config(
+    s: BatchSample,
+    read_channel_names: Callable[[Path], list[str]],
+    *,
+    registration_marker: str = "DAPI",
+    legacy_names: bool = False,
+) -> AutofillResult:
+    """Fill a sample's per-cycle config (what Configure cycles would default to).
+
+    For each cycle image: channel names are read from the image metadata; marker names come
+    from the ``[..]`` marker list in the file/folder name when it matches the channel count
+    (or legacy names, if enabled), else the metadata names. The registration channel is the
+    ``registration_marker`` (DAPI) channel, matched by metadata name, then by marker name;
+    if neither has it, channel 1 is used and a note is added.
+    """
+    notes: list[str] = []
+    used_list = False
+    reg_markers: list[str] = []
+    ch_markers: list[list[str]] = []
+    antibodies: list[list[str]] = []
+    for p in s.files:
+        p = Path(p)
+        try:
+            names = [str(x) for x in (read_channel_names(p) or [])]
+        except Exception as e:
+            names = []
+            notes.append(f"{p.name}: could not read channel names ({e}). Configure this sample manually.")
+        res = detect_markers(p.name, p.parent.name, len(names), legacy_names=legacy_names) if names else None
+        if res is not None and res.markers is not None:
+            markers = list(res.markers)
+            used_list = True
+            if res.dapi_assumed or res.is_warning:
+                notes.append(res.message)
+        else:
+            markers = list(names)
+            if res is not None and res.source:  # a [..] list was present but unusable
+                notes.append(res.message + " Using the image's own channel names.")
+        idx = _find_name(names, registration_marker)
+        if idx is None:
+            idx = _find_name(markers, registration_marker)
+        if idx is not None and idx < len(names):
+            reg = names[idx]
+        else:
+            reg = names[0] if names else registration_marker
+            if names:
+                notes.append(
+                    f"{p.name}: no {registration_marker} channel found; registering on channel 1 ({reg}). "
+                    f"Change it in Configure cycles if that's wrong."
+                )
+        reg_markers.append(reg)
+        ch_markers.append(markers)
+        antibodies.append([""] * len(markers))
+    s.registration_markers = reg_markers
+    s.channel_markers = ch_markers
+    s.channel_antibodies = antibodies
+    if s.cycles is None:
+        s.cycles = [None] * len(s.files)
+    if s.cycles_enabled is None:
+        s.cycles_enabled = [True] * len(s.files)
+    return AutofillResult(notes=notes, used_marker_list=used_list)
 
 
 def sample_has_cycle_config(s: BatchSample) -> bool:
@@ -404,7 +610,8 @@ def plan_from_dict(d: dict) -> dict[str, Any]:
         s.channel_antibodies = list(rec.get("channel_antibodies") or []) or None
         s.cycles_enabled = list(rec.get("cycles_enabled") or []) or None
 
-        ok, msg = validate_sample_cycle_numbers(s)
+        # Blank cycle numbers are allowed in a saved plan; they are caught before running.
+        ok, msg = validate_sample_cycle_numbers(s, allow_missing=True)
         if not ok:
             raise ValueError(msg)
         samples.append(s)
