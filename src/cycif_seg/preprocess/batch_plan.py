@@ -149,26 +149,104 @@ def enabled_cycle_numbers(s: BatchSample) -> list[int]:
     ]
 
 
-def duplicate_cycle_numbers(s: BatchSample) -> list[int]:
-    seen: set[int] = set()
-    dupes: set[int] = set()
-    for cy in enabled_cycle_numbers(s):
-        if cy in seen:
-            dupes.add(cy)
-        seen.add(cy)
-    return sorted(dupes)
+def letter_suffix(idx: int) -> str:
+    """0 → 'a', 1 → 'b', …, 25 → 'z', 26 → 'aa', …"""
+    result = ""
+    idx += 1
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(ord("a") + rem) + result
+    return result
+
+
+def resolve_cycle_labels(numbers: list[int], paths: list[str | Path]) -> tuple[list[int], list[str]]:
+    """Make cycle numbers unique the same way ``cycif-seg-run`` does.
+
+    The same cycle number in *different* cycle folders (e.g. a re-imaged cycle) is kept,
+    labelled ``1a``, ``1b``, … in folder-name order. Two files with the same cycle number
+    in the *same* folder are ambiguous and raise ``ValueError``.
+
+    Returns ``(cycle_ints, labels)`` aligned with the inputs. Labels name the output channels
+    (``<marker>_cy<label>``) and are always set, matching ``cycif-seg-run`` so resume
+    fingerprints agree. Without duplicates the numbers are returned unchanged; with
+    duplicates every cycle gets a unique rank-ordered int (lowest cycle number first, so it
+    stays the reference cycle).
+    """
+    numbers = [int(n) for n in numbers]
+    paths = [Path(str(p)) for p in paths]
+    groups: dict[int, list[int]] = {}
+    for i, n in enumerate(numbers):
+        groups.setdefault(n, []).append(i)
+    if all(len(g) == 1 for g in groups.values()):
+        return list(numbers), [str(n) for n in numbers]
+
+    def _key(i: int) -> tuple:
+        return (numbers[i], paths[i].parent.name.lower(), paths[i].name.lower())
+
+    for n, g in groups.items():
+        by_folder: dict[Path, list[str]] = {}
+        for i in g:
+            by_folder.setdefault(paths[i].parent, []).append(paths[i].name)
+        for folder, names in by_folder.items():
+            if len(names) > 1:
+                raise ValueError(
+                    f"Cycle {n} has more than one file in folder '{folder.name}': {', '.join(sorted(names))}. "
+                    f"Disable all but one of them."
+                )
+
+    ints = [0] * len(numbers)
+    labels = [""] * len(numbers)
+    for rank, i in enumerate(sorted(range(len(numbers)), key=_key)):
+        ints[i] = rank
+        g = sorted(groups[numbers[i]], key=_key)
+        labels[i] = f"{numbers[i]}{letter_suffix(g.index(i))}" if len(g) > 1 else str(numbers[i])
+    return ints, labels
+
+
+def enabled_cycle_entries(s: BatchSample) -> list[int]:
+    """Indices into ``s.files`` of the enabled cycles."""
+    return [
+        i
+        for i, _ in enumerate(s.files or [])
+        if bool(s.cycles_enabled[i] if s.cycles_enabled and i < len(s.cycles_enabled) else True)
+    ]
 
 
 def validate_sample_cycle_numbers(s: BatchSample) -> tuple[bool, str]:
-    dupes = duplicate_cycle_numbers(s)
-    if dupes:
-        return (
-            False,
-            f"Sample '{s.name}' has duplicate enabled cycle number(s): {dupes}. "
-            f"Enabled cycle numbers are: {enabled_cycle_numbers(s)}. "
-            f"Reconfigure this sample before running batch preprocessing.",
+    idx = enabled_cycle_entries(s)
+    try:
+        resolve_cycle_labels(
+            [int(s.cycles[i] if s.cycles and i < len(s.cycles) else i) for i in idx],
+            [s.files[i] for i in idx],
         )
+    except ValueError as e:
+        return False, f"Sample '{s.name}': {e} Reconfigure this sample before running batch preprocessing."
     return True, ""
+
+
+def cycle_inputs_from_sample(s: BatchSample) -> list:
+    """Build the enabled ``CycleInput`` list for a sample (raises ``ValueError`` on ambiguous cycles)."""
+    from cycif_seg.preprocess.organize_cycles import CycleInput
+
+    def _at(values, i):
+        return values[i] if values and i < len(values) else None
+
+    idx = enabled_cycle_entries(s)
+    numbers = [int(s.cycles[i] if s.cycles and i < len(s.cycles) else i) for i in idx]
+    ints, labels = resolve_cycle_labels(numbers, [s.files[i] for i in idx])
+    return [
+        CycleInput(
+            path=str(s.files[i]),
+            cycle=int(cy),
+            label=label,
+            tissue=(s.tissue or None),
+            species=(s.species or None),
+            registration_marker=_at(s.registration_markers, i),
+            channel_markers=_at(s.channel_markers, i),
+            channel_antibodies=_at(s.channel_antibodies, i),
+        )
+        for i, cy, label in zip(idx, ints, labels)
+    ]
 
 
 def sample_has_cycle_config(s: BatchSample) -> bool:

@@ -23,6 +23,7 @@ from pathlib import Path
 
 from cycif_seg.preprocess.batch_plan import (
     BatchSample,
+    cycle_inputs_from_sample,
     default_tiled_rigid_tile_size,
     default_tiled_rigid_search_factor,
     enabled_cycle_numbers,
@@ -219,34 +220,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         out_path = Path(str(s.output_path)).expanduser()
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cycles_in: list[CycleInput] = []
         try:
-            for i, p in enumerate(s.files):
-                if s.cycles_enabled and i < len(s.cycles_enabled) and not bool(s.cycles_enabled[i]):
-                    continue
-                cycles_in.append(
-                    CycleInput(
-                        path=str(p),
-                        cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
-                        tissue=s.tissue or None,
-                        species=s.species or None,
-                        registration_marker=(
-                            s.registration_markers[i]
-                            if s.registration_markers and i < len(s.registration_markers)
-                            else None
-                        ),
-                        channel_markers=(
-                            s.channel_markers[i]
-                            if s.channel_markers and i < len(s.channel_markers)
-                            else None
-                        ),
-                        channel_antibodies=(
-                            s.channel_antibodies[i]
-                            if s.channel_antibodies and i < len(s.channel_antibodies)
-                            else None
-                        ),
-                    )
-                )
+            cycles_in = cycle_inputs_from_sample(s)
         except Exception as e:
             print(f"  ERROR building cycle inputs: {e}", file=sys.stderr)
             failures.append({"sample_name": s.name, "error": str(e)})
@@ -487,36 +462,7 @@ def _cmd_pyramid(args: argparse.Namespace) -> int:
 
 
 def _cycles_from_sample(sample: BatchSample) -> list[CycleInput]:
-    cycles_in: list[CycleInput] = []
-    for i, p in enumerate(sample.files):
-        if sample.cycles_enabled and i < len(sample.cycles_enabled) and not bool(sample.cycles_enabled[i]):
-            continue
-        cy = int(sample.cycles[i] if sample.cycles and i < len(sample.cycles) else i)
-        cycles_in.append(
-            CycleInput(
-                path=str(p),
-                cycle=cy,
-                label=str(cy),
-                tissue=sample.tissue or None,
-                species=sample.species or None,
-                registration_marker=(
-                    sample.registration_markers[i]
-                    if sample.registration_markers and i < len(sample.registration_markers)
-                    else None
-                ),
-                channel_markers=(
-                    sample.channel_markers[i]
-                    if sample.channel_markers and i < len(sample.channel_markers)
-                    else None
-                ),
-                channel_antibodies=(
-                    sample.channel_antibodies[i]
-                    if sample.channel_antibodies and i < len(sample.channel_antibodies)
-                    else None
-                ),
-            )
-        )
-    return cycles_in
+    return cycle_inputs_from_sample(sample)
 
 
 def _sample_from_sample_dir(args: argparse.Namespace) -> BatchSample:

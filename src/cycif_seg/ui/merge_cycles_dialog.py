@@ -7,6 +7,7 @@ from pathlib import Path
 from qtpy import QtCore, QtWidgets
 
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
+from cycif_seg.preprocess.batch_plan import resolve_cycle_labels
 from cycif_seg.ui.last_dir import last_dir, remember_dir
 
 _CYCLE_DIR_RE_UI = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
@@ -619,17 +620,18 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             raise ValueError("Output path is required")
 
         cycles_out: list[dict] = []
-        seen_cycles: set[int] = set()
         reg_rows = self._registration_rows()
         channel_rows = self._channel_rows_by_cycle_index()
+        # Same cycle number in different folders is allowed (labelled 1a, 1b, …); in one folder it is ambiguous.
+        _enabled_idx = [i for i, rr in enumerate(reg_rows) if bool(rr["enabled"])]
+        resolve_cycle_labels(
+            [int(reg_rows[i]["cycle"]) for i in _enabled_idx],
+            [self._cycles[i].path for i in _enabled_idx],
+        )
         for idx, cfg in enumerate(self._cycles):
             rr = reg_rows[idx]
             cy = int(rr["cycle"])
             enabled = bool(rr["enabled"])
-            if enabled:
-                if cy in seen_cycles:
-                    raise ValueError(f"Duplicate cycle number: {cy}. Cycle numbers must be unique among enabled cycles.")
-                seen_cycles.add(cy)
             reg_marker = str(rr["registration_marker"] or "").strip()
             if enabled:
                 if not reg_marker:

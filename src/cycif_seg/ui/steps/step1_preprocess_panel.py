@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from qtpy import QtWidgets
 
+from cycif_seg.ui.help_button import BATCH_PREPROCESS_HELP, SINGLE_SLIDE_HELP, make_help_button
+
 
 class Step1PreprocessPanel(QtWidgets.QWidget):
     """UI panel for Step 1 (Preprocess).
@@ -24,8 +26,10 @@ class Step1PreprocessPanel(QtWidgets.QWidget):
         self.btn_cancel_merge.setVisible(False)
 
         file_row.addWidget(self.btn_merge_cycles)
+        file_row.addWidget(make_help_button(self, "Single slide", SINGLE_SLIDE_HELP))
         file_row.addWidget(self.btn_cancel_merge)
         file_row.addWidget(self.btn_batch_merge)
+        file_row.addWidget(make_help_button(self, "Batch slides", BATCH_PREPROCESS_HELP))
         file_row.addStretch(1)
         layout.addLayout(file_row)
 

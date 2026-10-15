@@ -150,6 +150,23 @@ py -3.13 -m cycif_seg --create-shortcut                  # Windows
 
 To uninstall, remove the shortcuts, then `py -3.13 -m pip uninstall cycif-seg` on Windows, or delete the `~/cycif-seg-env` folder on Ubuntu/macOS.
 
+### Input folder structure and naming
+
+**Read [docs/FILE_NAMING.md](docs/FILE_NAMING.md) before running Step 0 or Step 1.** Samples, cycles, and channel names are all found from folder and file names, and badly named folders are silently skipped. In brief:
+
+```text
+MyExperiment/                               <- batch input folder
+  Patient01/                                <- one folder per sample (any name)
+    C0_Patient01_CD3_CD8_PDL1/              <- one folder per cycle: C<number>_..._<markers>
+      area_001_0_0.ome.tiff ...             <- raw tiles (Step 0 input)
+      C0_Patient01_CD3_CD8_PDL1_cyseg-stitched.ome.tiff   <- Step 0 output / Step 1 input
+```
+
+- The lowest cycle number is the reference cycle every other cycle is aligned to.
+- Channel names come from the image metadata, or from the cycle folder name: channel 1 is `DAPI`, and the rest are the last N−1 underscore-separated words. Marker names must not contain underscores.
+- The same cycle number in two different cycle folders (a re-imaged cycle) is kept and labelled `1a`, `1b`. Two stitched files in one cycle folder is an error.
+- The app and `cycif-seg-preprocess` take each cycle's number from the stitched **file** name. `cycif-seg-run` takes it from the cycle **folder** name. Step 0 output satisfies both.
+
 ### CLI Commands
 
 The package installs these commands:
@@ -168,32 +185,6 @@ cycif-seg-run --help
 
 ### Batch preprocessing
 
-### Input naming and automatic channel marker detection
-
-The CLI uses two related but different naming rules, depending on which pipeline you run.
-
-For `cycif-seg-run`, channel marker names are inferred from cycle directory names. Cycle directories must be immediate children of `SAMPLE_DIR` and must match:
-
-```text
-C<N>_<sample_or_description>_<marker1>_<marker2>_...
-```
-
-The cycle number comes from the leading `C<N>_`. The first image channel is always treated as `DAPI`. The remaining channel marker names are taken from the last `n_channels - 1` underscore-separated tokens in the directory name, where `n_channels` is read from a representative tile OME-TIFF.
-
-Example for a 4-channel cycle:
-
-```text
-C1_Arbitrary_Information_Here_HSV1g_PDL1_CD8
-```
-
-is interpreted as:
-
-```text
-DAPI, HSV1g, PDL1, CD8
-```
-
-If the suffix has too few marker tokens, missing channel names are left blank and a warning is printed. Marker names should not contain underscores if you want automatic detection to work cleanly. Tile filenames inside each cycle directory must match the default tile-position pattern ending in underscore-separated integer coordinates, such as `area_*_<x>_<y>.ome.tiff` or `raw_*_<x>_<y>.ome.tiff`; use `--tile-regex` if your tile names differ.
-
 When registering existing stitched files, the default filename pattern is `*_cyseg-stitched.ome.tiff`. Use `--stitched-pattern` to provide one or more sample-wide alternatives in preference order:
 
 ```powershell
@@ -202,19 +193,6 @@ cycif-seg-run SAMPLE_DIR --skip-stitch `
 ```
 
 The first pattern having exactly one matching file in every cycle directory wins for the entire sample; files from different patterns are never mixed. If no pattern covers every cycle, registration does not start and the missing cycle directories are reported. The selected pattern is printed in the run log.
-
-For `cycif-seg-preprocess plan` and `resume-registration --sample-dir`, the expected layout is:
-
-```text
-ROOT/
-  SAMPLE_NAME/
-    C0_some_cycle_dir/
-      C0_sample_or_cycle_name.ome.tiff
-    C1_some_cycle_dir/
-      C1_sample_or_cycle_name.ome.tiff
-```
-
-In this mode, the cycle number is inferred from the stitched OME-TIFF filename prefix `C<N>_`, and files such as `area_*.ome.tiff` are ignored. Channel marker names are read from OME-XML channel metadata in each OME-TIFF, not parsed from the filename or directory name. If channel names cannot be read, edit the generated plan JSON fields `registration_markers` and `channel_markers` before running.
 
 Use `cycif-seg-preprocess plan` to scan a root directory, read cycle channel names, and write a plan JSON for review:
 

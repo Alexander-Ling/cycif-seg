@@ -26,7 +26,8 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from string import ascii_lowercase
+
+from cycif_seg.preprocess.batch_plan import letter_suffix as _letter_suffix
 
 
 _CYCLE_DIR_RE = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
@@ -103,16 +104,6 @@ def _parse_channel_markers(name_suffix: str, n_channels: int) -> tuple[list[str]
     while len(markers) < needed:
         markers.append("")
     return ["DAPI"] + markers, had_warning
-
-
-def _letter_suffix(idx: int) -> str:
-    """0 → 'a', 1 → 'b', …, 25 → 'z', 26 → 'aa', …"""
-    result = ""
-    idx += 1
-    while idx > 0:
-        idx, rem = divmod(idx - 1, 26)
-        result = ascii_lowercase[rem] + result
-    return result
 
 
 def _normalize_stitched_patterns(stitched_patterns: list[str] | tuple[str, ...] | None) -> list[str]:

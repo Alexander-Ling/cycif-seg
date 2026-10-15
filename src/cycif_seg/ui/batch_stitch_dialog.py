@@ -11,6 +11,7 @@ from napari.utils.notifications import show_warning
 
 from cycif_seg.io.ome_tiff import load_channel_names_only
 from cycif_seg.ui.last_dir import last_dir, remember_dir
+from cycif_seg.ui.help_button import STITCH_HELP, make_help_button
 from cycif_seg.stitch.stitch_core import (
     DEFAULT_STITCH_OUTPUT_SUFFIX,
     _DEFAULT_TILE_RE,
@@ -63,6 +64,7 @@ class BatchStitchDialog(QtWidgets.QDialog):
         row.addWidget(self.txt_root, 0, 1)
         row.addWidget(self.btn_pick_root, 0, 2)
         row.addWidget(self.btn_scan, 0, 3)
+        row.addWidget(make_help_button(self, 'Batch stitch', STITCH_HELP), 0, 4)
         row.setColumnStretch(1, 1)
         root.addLayout(row)
 

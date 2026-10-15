@@ -32,6 +32,7 @@ from cycif_seg.project import CycIFProject, create_project, open_project, is_pro
 from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 from cycif_seg.ui.last_dir import remember_dir
+from cycif_seg.preprocess.batch_plan import resolve_cycle_labels
 from cycif_seg.ui.nuclei_edit_controller import NucleiEditController
 from cycif_seg.ui.layer_manager import LayerManager
 from cycif_seg.ui.project_controller import ProjectController
@@ -395,15 +396,22 @@ class CycIFMVPWidget(QtWidgets.QWidget):
             show_warning("No cycles were configured.")
             return
 
-        # Treat selection order as cycle order 1..N.
+        enabled_cfg = [d for d in cycles_cfg if bool(d.get("enabled", True))]
+        try:
+            cycle_ints, cycle_labels = resolve_cycle_labels(
+                [int(d.get("cycle")) for d in enabled_cfg],
+                [str(d.get("path")) for d in enabled_cfg],
+            )
+        except ValueError as e:
+            show_warning(str(e))
+            return
         cycles: list[CycleInput] = []
-        for d in cycles_cfg:
-            if bool(d.get("enabled", True)) is False:
-                continue
+        for d, cy_int, cy_label in zip(enabled_cfg, cycle_ints, cycle_labels):
             cycles.append(
                 CycleInput(
                     path=str(d.get("path")),
-                    cycle=int(d.get("cycle")),
+                    cycle=int(cy_int),
+                    label=cy_label,
                     tissue=tissue,
                     species=species,
                     registration_marker=str(d.get("registration_marker") or "").strip() or None,
@@ -507,6 +515,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                             {
                                 "path": self.project.relpath(Path(cy.path)),
                                 "cycle": int(cy.cycle),
+                                "label": cy.label,
                                 "registration_marker": str(cy.registration_marker or ""),
                                 "channel_markers": list(cy.channel_markers or []),
                                 "channel_antibodies": list(cy.channel_antibodies or []),
@@ -592,6 +601,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
                             {
                                 "path": self.project.relpath(p),
                                 "cycle": int(ci.get("cycle") or 0),
+                                "label": ci.get("label"),
                                 "registration_marker": str(ci.get("registration_marker") or ""),
                                 "channel_markers": list(ci.get("channel_markers") or []),
                                 "channel_antibodies": list(ci.get("channel_antibodies") or []),

@@ -11,10 +11,11 @@ from qtpy import QtCore, QtWidgets
 from napari.utils.notifications import show_info, show_warning
 from napari.qt.threading import thread_worker
 
-from cycif_seg.preprocess.organize_cycles import CycleInput, is_preprocess_debug, is_debug_elastic_touchup, merge_cycles_to_ome_tiff
+from cycif_seg.preprocess.organize_cycles import is_preprocess_debug, is_debug_elastic_touchup, merge_cycles_to_ome_tiff
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
 from cycif_seg.preprocess.batch_plan import (
     BatchSample,
+    cycle_inputs_from_sample,
     default_tiled_rigid_tile_size,
     default_tiled_rigid_search_factor,
     default_fast_large_island_refinement,
@@ -27,6 +28,7 @@ from cycif_seg.preprocess.batch_plan import (
 )
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
 from cycif_seg.ui.last_dir import last_dir, remember_dir
+from cycif_seg.ui.help_button import BATCH_PREPROCESS_HELP, make_help_button
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -68,6 +70,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         row.addWidget(self.txt_outdir, 1, 1)
         row.addWidget(self.btn_pick_out, 1, 2)
         row.addWidget(self.btn_scan, 0, 3, 2, 1)
+        row.addWidget(make_help_button(self, "Batch preprocess", BATCH_PREPROCESS_HELP), 0, 4)
         row.setColumnStretch(1, 1)
         root.addLayout(row)
 
@@ -832,25 +835,8 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                 out_path.parent.mkdir(parents=True, exist_ok=True)
 
                 # Build CycleInput list
-                cycles_in: list[CycleInput] = []
                 try:
-                    ok, msg = validate_sample_cycle_numbers(s)
-                    if not ok:
-                        raise ValueError(msg)
-                    for i, p in enumerate(s.files):
-                        if s.cycles_enabled and i < len(s.cycles_enabled) and (not bool(s.cycles_enabled[i])):
-                            continue
-                        cycles_in.append(
-                            CycleInput(
-                                path=str(p),
-                                cycle=int(s.cycles[i] if s.cycles and i < len(s.cycles) else i),
-                                tissue=(s.tissue or None),
-                                species=(s.species or None),
-                                registration_marker=(s.registration_markers[i] if s.registration_markers and i < len(s.registration_markers) else None),
-                                channel_markers=(s.channel_markers[i] if s.channel_markers and i < len(s.channel_markers) else None),
-                                channel_antibodies=(s.channel_antibodies[i] if s.channel_antibodies and i < len(s.channel_antibodies) else None),
-                            )
-                        )
+                    cycles_in = cycle_inputs_from_sample(s)
                 except Exception as e:
                     failures.append({"sample_name": str(s.name), "error": str(e)})
                     self.sig_set_status.emit(f"[{si}/{n_samp}] {s.name}: failed: {e}")
@@ -979,6 +965,7 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
                                 {
                                     "path": str(c.path),
                                     "cycle": int(c.cycle),
+                                    "label": c.label,
                                     "registration_marker": str(c.registration_marker or ""),
                                     "channel_markers": list(c.channel_markers or []),
                                     "channel_antibodies": list(c.channel_antibodies or []),
