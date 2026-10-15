@@ -10,6 +10,7 @@ from napari.qt.threading import thread_worker
 from napari.utils.notifications import show_warning
 
 from cycif_seg.io.ome_tiff import load_channel_names_only
+from cycif_seg.ui.last_dir import last_dir, remember_dir
 from cycif_seg.stitch.stitch_core import (
     DEFAULT_STITCH_OUTPUT_SUFFIX,
     _DEFAULT_TILE_RE,
@@ -226,8 +227,9 @@ class BatchStitchDialog(QtWidgets.QDialog):
         self._set_status('Cancel requested… finishing current step.')
 
     def _pick_root(self) -> None:
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, 'Select batch input folder', self.txt_root.text() or str(Path.cwd()))
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, 'Select batch input folder', self.txt_root.text() or last_dir())
         if d:
+            remember_dir(d)
             self.txt_root.setText(d)
 
     def _scan(self) -> None:
@@ -418,18 +420,20 @@ class BatchStitchDialog(QtWidgets.QDialog):
 
     def _save_plan(self) -> None:
         self._sync_table_to_models()
-        start = self.txt_root.text().strip() or str(Path.cwd())
+        start = self.txt_root.text().strip() or last_dir()
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save stitch plan JSON', os.path.join(start, 'stitch_plan.json'), 'JSON files (*.json);;All files (*.*)')
         if not path:
             return
+        remember_dir(path)
         Path(path).write_text(json.dumps(self._plan_dict(), indent=2), encoding='utf-8')
         self._set_status(f'Saved plan: {path}')
 
     def _load_plan(self) -> None:
-        start = self.txt_root.text().strip() or str(Path.cwd())
+        start = self.txt_root.text().strip() or last_dir()
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Load stitch plan JSON', start, 'JSON files (*.json);;All files (*.*)')
         if not path:
             return
+        remember_dir(path)
         d = json.loads(Path(path).read_text(encoding='utf-8'))
         schema_version = int(d.get('schema_version') or 0)
         if schema_version not in {1, PLAN_SCHEMA_VERSION}:

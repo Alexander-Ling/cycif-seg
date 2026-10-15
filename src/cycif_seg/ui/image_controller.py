@@ -10,6 +10,8 @@ from napari.qt.threading import thread_worker
 from napari.settings import get_settings
 from napari.utils.notifications import show_warning
 
+from cycif_seg.ui.last_dir import remember_dir
+
 from cycif_seg.io.ome_tiff import (
     LazyChannelImage,
     inspect_tiff_pyramid,
@@ -696,4 +698,5 @@ class ImageController:
         )
         if not path:
             return
+        remember_dir(path)
         self._load_image_from_path(path, record_input=True)

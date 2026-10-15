@@ -7,6 +7,7 @@ from pathlib import Path
 from qtpy import QtCore, QtWidgets
 
 from cycif_seg.io.ome_tiff import load_channel_names_only_fast
+from cycif_seg.ui.last_dir import last_dir, remember_dir
 
 _CYCLE_DIR_RE_UI = re.compile(r"^C(\d+)_(.+)$", re.IGNORECASE)
 
@@ -358,7 +359,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
         )
 
     def _on_browse_out(self):
-        start = str(Path(self.txt_output.text()).parent) if self.txt_output.text() else str(Path.cwd())
+        start = self.txt_output.text() or last_dir()
         out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save merged OME-TIFF",
@@ -366,6 +367,7 @@ class MergeRegisterCyclesDialog(QtWidgets.QDialog):
             "TIFF files (*.tif *.tiff);;All files (*.*)",
         )
         if out_path:
+            remember_dir(out_path)
             self.txt_output.setText(out_path)
 
     def _build_cycle_tables(self):

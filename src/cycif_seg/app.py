@@ -1,10 +1,31 @@
-import napari
-from qtpy import QtWidgets, QtCore
-from cycif_seg.ui.main_widget import CycIFMVPWidget
+import argparse
+
+from cycif_seg import shortcut
 
 
-def main():
-    viewer = napari.Viewer()
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="cycif-seg", description="Launch the cycif-seg GUI.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--create-shortcut", action="store_true", help="Create desktop/app-menu shortcuts, then exit.")
+    group.add_argument("--remove-shortcut", action="store_true", help="Remove desktop/app-menu shortcuts, then exit.")
+    args = parser.parse_args(argv)
+
+    if args.create_shortcut:
+        for p in shortcut.create_shortcuts():
+            print(f"Created: {p}")
+        return
+    if args.remove_shortcut:
+        removed = shortcut.remove_shortcuts()
+        print("\n".join(f"Removed: {p}" for p in removed) or "No shortcuts found.")
+        return
+
+    shortcut.ensure_shortcuts_once()
+
+    import napari
+    from qtpy import QtWidgets, QtCore
+    from cycif_seg.ui.main_widget import CycIFMVPWidget
+
+    viewer = napari.Viewer(title="cycif-seg (built on napari)")
     w = CycIFMVPWidget(viewer)
     dock = viewer.window.add_dock_widget(w, area="right")
     # Allow the right-hand controls dock to be shrunk narrower than the

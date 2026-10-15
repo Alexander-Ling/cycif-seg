@@ -31,6 +31,7 @@ from cycif_seg.io.ome_tiff import load_multichannel_tiff, load_multichannel_tiff
 from cycif_seg.project import CycIFProject, create_project, open_project, is_project_dir
 from cycif_seg.preprocess.organize_cycles import CycleInput, merge_cycles_to_ome_tiff
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
+from cycif_seg.ui.last_dir import remember_dir
 from cycif_seg.ui.nuclei_edit_controller import NucleiEditController
 from cycif_seg.ui.layer_manager import LayerManager
 from cycif_seg.ui.project_controller import ProjectController
@@ -360,8 +361,7 @@ class CycIFMVPWidget(QtWidgets.QWidget):
         )
         if not paths:
             return
-        if len(paths) < 1:
-            return
+        remember_dir(paths[0])
 
         dlg = MergeRegisterCyclesDialog(self, paths=list(paths))
 

@@ -8,31 +8,154 @@
 - E. Antonio Chiocca
 - Mass General Brigham
 ### Installation Requirements:
-- Python 3.11
+- Python 3.11 or newer (tested on 3.11 and 3.13)
+- git
 ### Description:
 cycif-seg is a simple tool for co-registration, segmentation, and marker quantification of CycIF images. It was made in a few days to accomplish a very specific task, so it isn't polished and likely has many bugs.
 Still incomplete -- in active development.
 
 ### Installation Instructions
 
+The first time cycif-seg opens, it adds a **cycif-seg** icon to your Desktop and app menu, so after installing you can start it without the command line. (pip can't run setup code during install, so the icon appears on the first launch at the end of these steps.)
+
+#### Windows (10 or 11)
+
+1. **Install PowerShell.** Open the Microsoft Store, search for **PowerShell**, and install it. (The built-in "Windows PowerShell" also works for every step below.) Open PowerShell from the Start menu.
+
+2. **Install Python 3.13:**
+
+   ```powershell
+   winget install -e --id Python.Python.3.13
+   ```
+
+3. **Install git:**
+
+   ```powershell
+   winget install -e --id Git.Git
+   ```
+
+   **Close PowerShell and open a new window** so it picks up the newly installed programs.
+
+4. **Install cycif-seg:**
+
+   ```powershell
+   py -3.13 -m pip install "git+https://github.com/Alexander-Ling/cycif-seg.git"
+   ```
+
+   This takes several minutes. A warning that some scripts are "installed in a directory which is not on PATH" is harmless.
+
+5. **Launch cycif-seg once** (this also creates the Desktop and Start-menu icons):
+
+   ```powershell
+   py -3.13 -m cycif_seg
+   ```
+
+   From now on, double-click the **cycif-seg** icon on your Desktop or Start menu.
+
+If `winget` isn't recognized, install **App Installer** from the Microsoft Store, or download the installers manually: [Python](https://www.python.org/downloads/) (3.11 or newer) and [git](https://git-scm.com/download/win). If `py` isn't recognized, use `python` in its place. If you installed a Python version other than 3.13, change `-3.13` to match (e.g. `py -3.11`).
+
+#### Ubuntu (22.04 or newer)
+
+1. **Install git, Python, and the system libraries the viewer window needs.** Open a Terminal and run:
+
+   ```bash
+   sudo apt update
+   sudo apt install -y git python3 python3-venv python3-pip libgl1 libxkbcommon-x11-0 \
+       libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+       libxcb-xinerama0 libxcb-xfixes0 libxcb-shape0 libxcb-cursor0
+   python3 --version
+   ```
+
+   If `python3 --version` reports **3.10 or lower** (Ubuntu 22.04), install a newer Python and use `python3.13` in place of `python3` in step 2:
+
+   ```bash
+   sudo add-apt-repository -y ppa:deadsnakes/ppa
+   sudo apt update
+   sudo apt install -y python3.13 python3.13-venv
+   ```
+
+2. **Install cycif-seg into its own environment** (Ubuntu doesn't allow pip to install into the system Python):
+
+   ```bash
+   python3 -m venv ~/cycif-seg-env
+   ~/cycif-seg-env/bin/python -m pip install --upgrade pip
+   ~/cycif-seg-env/bin/python -m pip install "git+https://github.com/Alexander-Ling/cycif-seg.git"
+   ```
+
+3. **Launch cycif-seg once** (this also adds it to the app menu and Desktop):
+
+   ```bash
+   ~/cycif-seg-env/bin/python -m cycif_seg
+   ```
+
+   From now on, open **cycif-seg** from the app menu or the Desktop icon. If the Desktop icon says it isn't trusted, right-click it and choose **Allow Launching**.
+
+#### macOS
+
+1. **Install the Xcode command line tools** (this provides git). Open Terminal and run:
+
+   ```bash
+   xcode-select --install
+   ```
+
+2. **Install Homebrew** (skip if `brew --version` already works), then Python 3.13:
+
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   brew install python@3.13
+   ```
+
+   Follow the "Next steps" Homebrew prints at the end of its install to add `brew` to your PATH, then open a new Terminal window.
+
+3. **Install cycif-seg into its own environment:**
+
+   ```bash
+   python3.13 -m venv ~/cycif-seg-env
+   ~/cycif-seg-env/bin/python -m pip install --upgrade pip
+   ~/cycif-seg-env/bin/python -m pip install "git+https://github.com/Alexander-Ling/cycif-seg.git"
+   ```
+
+4. **Launch cycif-seg once** (this also creates `~/Applications/cycif-seg.app`):
+
+   ```bash
+   ~/cycif-seg-env/bin/python -m cycif_seg
+   ```
+
+   From now on, open **cycif-seg** from Launchpad or Spotlight, or drag it from `~/Applications` to the Dock.
+
+#### Updating
+
+**Close cycif-seg first** (Windows can't replace files that are in use), then re-run the install command with `--upgrade --force-reinstall --no-deps` added:
+
+```powershell
+# Windows
+py -3.13 -m pip install --upgrade --force-reinstall --no-deps "git+https://github.com/Alexander-Ling/cycif-seg.git"
 ```
-[Windows Powershell]:
-#Please ensure you have installed python 3.11 (https://www.python.org/downloads/release/python-3110/) and git (https://git-scm.com/download/win) before running these commands
 
-py -3.11 -m venv {path_to_save_environment_in}
-
-{path_to_save_environment_in}\Scripts\activate
-
-py -m pip install git+https://github.com/Alexander-Ling/cycif-seg.git
-
-cycif-seg
+```bash
+# Ubuntu / macOS
+~/cycif-seg-env/bin/python -m pip install --upgrade --force-reinstall --no-deps "git+https://github.com/Alexander-Ling/cycif-seg.git"
 ```
+
+Drop `--no-deps` if an update adds new dependencies.
+
+#### Shortcuts and uninstalling
+
+The icons point at the Python cycif-seg was installed into. If you move or reinstall Python, or delete an icon and want it back, recreate them with `--create-shortcut` (and remove them with `--remove-shortcut`):
+
+```powershell
+py -3.13 -m cycif_seg --create-shortcut                  # Windows
+~/cycif-seg-env/bin/python -m cycif_seg --create-shortcut  # Ubuntu / macOS
+```
+
+To uninstall, remove the shortcuts, then `py -3.13 -m pip uninstall cycif-seg` on Windows, or delete the `~/cycif-seg-env` folder on Ubuntu/macOS.
 
 ### CLI Commands
 
-The package installs three console commands:
+The package installs these commands:
 
-- `cycif-seg`: launch the graphical napari app.
+- `cycif-seg`: launch the graphical napari app (same as `python -m cycif_seg`). `--create-shortcut` / `--remove-shortcut` manage the Desktop and app-menu icons.
+- `cycif-seg-gui`: launch the app without a console window (Windows).
 - `cycif-seg-preprocess`: headless batch preprocessing and recovery utilities.
 - `cycif-seg-run`: single-sample stitch-and-register pipeline.
 

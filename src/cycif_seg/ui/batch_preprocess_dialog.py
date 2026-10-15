@@ -26,6 +26,7 @@ from cycif_seg.preprocess.batch_plan import (
     plan_from_dict,
 )
 from cycif_seg.ui.merge_cycles_dialog import MergeRegisterCyclesDialog
+from cycif_seg.ui.last_dir import last_dir, remember_dir
 
 
 class BatchPreprocessDialog(QtWidgets.QDialog):
@@ -212,13 +213,15 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
         self._set_status("Cancel requested… stopping queued preprocessing work.")
 
     def _pick_root(self) -> None:
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select batch input folder", self.txt_root.text() or str(Path.cwd()))
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select batch input folder", self.txt_root.text() or last_dir())
         if d:
+            remember_dir(d)
             self.txt_root.setText(d)
 
     def _pick_outdir(self) -> None:
-        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select batch output folder", self.txt_outdir.text() or str(Path.cwd()))
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Select batch output folder", self.txt_outdir.text() or last_dir())
         if d:
+            remember_dir(d)
             self.txt_outdir.setText(d)
 
     def _update_scan_button_enabled(self) -> None:
@@ -714,19 +717,21 @@ class BatchPreprocessDialog(QtWidgets.QDialog):
     def _save_plan(self) -> None:
         # Ensure any table edits are captured before writing JSON.
         self._sync_table_to_models()
-        start = self.txt_outdir.text().strip() or self.txt_root.text().strip() or str(Path.cwd())
+        start = self.txt_outdir.text().strip() or self.txt_root.text().strip() or last_dir()
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save batch plan JSON", os.path.join(start, "batch_plan.json"), "JSON files (*.json);;All files (*.*)")
         if not path:
             return
+        remember_dir(path)
         d = self._plan_dict()
         Path(path).write_text(json.dumps(d, indent=2), encoding="utf-8")
         self._set_status(f"Saved plan: {path}")
 
     def _load_plan(self) -> None:
-        start = self.txt_root.text().strip() or str(Path.cwd())
+        start = self.txt_root.text().strip() or last_dir()
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load batch plan JSON", start, "JSON files (*.json);;All files (*.*)")
         if not path:
             return
+        remember_dir(path)
         try:
             d = json.loads(Path(path).read_text(encoding="utf-8"))
             result = plan_from_dict(d)

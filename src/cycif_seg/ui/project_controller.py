@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime
-import os
 import pickle
 from pathlib import Path
 from typing import Any
@@ -10,6 +9,7 @@ import numpy as np
 from qtpy import QtCore, QtWidgets
 
 from cycif_seg.project import CycIFProject, create_project, open_project
+from cycif_seg.ui.last_dir import last_dir, remember_dir
 from napari.utils.notifications import show_info, show_warning
 
 
@@ -30,9 +30,7 @@ class ProjectController:
     # ----------------------------
     def dialog_start_dir(self) -> str:
         prj = getattr(self.w, "project", None)
-        if prj is not None:
-            return str(prj.root)
-        return os.getcwd()
+        return last_dir(prj.root if prj is not None else None)
 
     # ----------------------------
     # Project lifecycle
@@ -580,6 +578,7 @@ class ProjectController:
         )
         if not root:
             return
+        remember_dir(root)
         try:
             prj = create_project(Path(root))
         except Exception as e:
@@ -601,6 +600,7 @@ class ProjectController:
             if not path:
                 return
             root = path
+        remember_dir(root)
 
         try:
             prj = open_project(Path(root))
